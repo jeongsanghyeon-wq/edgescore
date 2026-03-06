@@ -1,21 +1,10 @@
 """
-Edge Score v39.4 — Dashboard API Server v1.4
+Edge Score v39.6 — Dashboard API Server v1.5
 =============================================================
-v1.0 → v1.1 변경사항:
+v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
   [2] 스레드 안전성 — _monitor 접근 시 Lock + 스냅샷(deepcopy)
   [3] 텔레그램 알림 — 캐시 히트율 이상 시 알림
-
-v1.1 → v1.2 변경사항:
-  [1] hold_days 계산 — positions.json stale 값 대신 entry_date 기반 실시간 계산
-      (portfolio / defense / sell_opinion 3곳 통일)
-  [2] 버그수정 — sell_opinion 타임스탑 기준 하드코딩 7일 → config TIME_STOP_DAYS 연동
-  [3] 버그수정 — ts_candidates ret 필드 없을 때 fallback 처리
-  [4] 최적화 — _calc_hold_days 헬퍼 모듈레벨 이동, 중복 호출 제거
-
-v1.2 → v1.4 변경사항:
-  [1] /api/today_trades — SQLite trade_history.db 기반 오늘 체결내역 API 추가
-      (매수/매도 건수, 체결가, 실현손익, 승률 포함)
 
 사용법: rt.py main에서
   from dashboard_api import start_dashboard
@@ -28,19 +17,11 @@ import logging
 import calendar
 import math
 import copy
-import os
 import time as _time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 from functools import wraps
-
-# ── .env 로드 ──────────────────────────────────────
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 try:
     from flask import Flask, jsonify, request
@@ -124,7 +105,7 @@ def start_dashboard(monitor, port=5000):
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API v1.2 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API v1.5 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -134,27 +115,20 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.2",
+        return jsonify({"status": "ok", "version": "v1.5",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
     @_cached("status")
     def api_status():
         C = _rt_module.C
-        wt_cache = _safe_attr("_weekly_trend_cache", {})
-        # 현재 활성 데이터 소스
-        _ds = getattr(_rt_module, "_data_source_status", {})
         return {
-            "version": "v39.4", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.6", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
             "total_capital": C.get("TOTAL_CAPITAL", 10_000_000),
             "capital_floor_ratio": C.get("CAPITAL_FLOOR_RATIO", 0.70),
-            "weekly_trend_up": sum(1 for v in wt_cache.values() if v),
-            "weekly_trend_total": len(wt_cache),
-            "data_source": _ds.get("source", "확인중"),
-            "data_source_ok": _ds.get("ok", False),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -188,19 +162,13 @@ def _create_app():
                 if df_sl is not None:
                     price_history = df_sl["종가"].tail(30).tolist()
                 sector = info.get("sector", _get_sector(ticker))
-                # hold_days: positions.json 저장값 대신 entry_date 기반 실시간 계산
-                entry_date = info.get("entry_date", "")
-                try:
-                    hold_days = (date.today() - date.fromisoformat(entry_date)).days if entry_date else 0
-                except Exception:
-                    hold_days = int(info.get("hold_days", 0))
                 holdings.append({
                     "ticker": ticker, "name": name, "sector": sector,
                     "buy_price": buy_p, "current_price": round(cp), "shares": shares,
                     "ret": round(ret, 4), "pnl": round(pnl),
                     "edge": round(edge * 100), "sl_price": sl_price,
                     "trail_active": bool(info.get("trail_active", False)),
-                    "hold_days": hold_days,
+                    "hold_days": int(info.get("hold_days", 0)),
                     "atr_alerted": bool(info.get("atr_alerted", False)),
                     "price_history": price_history,
                 })
@@ -218,7 +186,6 @@ def _create_app():
                 "total_pnl": round(total_eval - total_inv),
                 "total_ret": round((total_eval - total_inv) / total_inv, 4) if total_inv > 0 else 0,
                 "capital": capital, "floor": floor,
-                "available_cash": round(max(0, capital - total_inv)),
                 "floor_remaining": round(max(0, total_eval - floor)),
                 "count": len(holdings),
                 "trail_active_count": sum(1 for h in holdings if h["trail_active"]),
@@ -337,62 +304,13 @@ def _create_app():
         last_fri = date(today.year, today.month, last_day)
         while last_fri.weekday() != 4:
             last_fri -= timedelta(days=1)
-
-        # ── ㊳ 타임스탑 현황 ─────────────────────────────────────────────
-        ts_days = C.get("TIME_STOP_DAYS", 15)
-        ts_thr  = C.get("TIME_STOP_THRESHOLD", 0.02)
-        ts_items = [(tk, v, _calc_hold_days(v), float(v.get("ret", 0))) for tk, v in positions.items()]
-        ts_candidates = [
-            {"ticker": tk, "name": v.get("name", tk),
-             "hold_days": hd, "ret": round(ret, 4)}
-            for tk, v, hd, ret in ts_items
-            if C.get("TIME_STOP_ENABLED", True)
-               and hd >= ts_days
-               and abs(ret) <= ts_thr
-        ]
-
-        # ── ㊴ 섹터 집중도 현황 ──────────────────────────────────────────
-        sector_max = C.get("SECTOR_MAX_POSITIONS", 2)
-        sector_counts: dict = {}
-        for tk, v in positions.items():
-            sec = _get_sector(tk)
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        sector_overload = [
-            {"sector": sec, "count": cnt, "limit": sector_max}
-            for sec, cnt in sector_counts.items()
-            if cnt > sector_max
-        ]
-
-        # ── ㉟ 주봉 추세 필터 현황 ───────────────────────────────────────
-        wt_cache = _safe_attr("_weekly_trend_cache", {})
-        wt_total  = len(wt_cache)
-        wt_up     = sum(1 for v in wt_cache.values() if v)
-        wt_blocked = sum(1 for v in wt_cache.values() if not v)
-
-        # ── ㊶ 경제 이벤트 캘린더 ───────────────────────────────────────
-        econ_list = C.get("ECON_EVENTS_2025_2026", [])
-        tomorrow  = today + timedelta(days=1)
-        econ_tomorrow = any(
-            e[0] == tomorrow.month and e[1] == tomorrow.day
-            for e in econ_list if isinstance(e, (list, tuple)) and len(e) >= 2
-        )
-        econ_today = any(
-            e[0] == today.month and e[1] == today.day
-            for e in econ_list if isinstance(e, (list, tuple)) and len(e) >= 2
-        )
-
         return {
-            "circuit_breaker":    {"active": _safe_attr("_circuit_active", False), "threshold": C.get("DAILY_DRAWDOWN_LIMIT", -0.05)},
+            "circuit_breaker": {"active": _safe_attr("_circuit_active", False), "threshold": C.get("DAILY_DRAWDOWN_LIMIT", -0.05)},
             "capital_protection": {"floor": C.get("TOTAL_CAPITAL", 10_000_000) * C.get("CAPITAL_FLOOR_RATIO", 0.70), "ok": True},
             "friday_liquidation": {"days_left": max(0, 4 - wd), "is_friday": wd == 4},
-            "atr_stop":           {"interval": "1분", "active": True},
-            "trailing":           {"active_count": sum(1 for v in positions.values() if v.get("trail_active")), "threshold": C.get("TRAIL_ACTIVATE", 0.07)},
-            "monthly_optimization":{"next_date": last_fri.isoformat(), "days_left": (last_fri - today).days},
-            # ── v28.0 신규 ──────────────────────────────────────────────
-            "time_stop":          {"enabled": C.get("TIME_STOP_ENABLED", True), "days": ts_days, "threshold_pct": ts_thr, "candidates": ts_candidates},
-            "sector_limit":       {"enabled": C.get("SECTOR_LIMIT_ENABLED", True), "max_positions": sector_max, "counts": sector_counts, "overloaded": sector_overload},
-            "weekly_trend":       {"enabled": C.get("WEEKLY_TREND_REQUIRED", True), "total": wt_total, "up": wt_up, "blocked": wt_blocked},
-            "econ_event":         {"enabled": bool(econ_list), "today": econ_today, "tomorrow": econ_tomorrow, "uplift": C.get("ECON_EVENT_EDGE_UPLIFT", 0.10), "count": len(econ_list)},
+            "atr_stop": {"interval": "1분", "active": True},
+            "trailing": {"active_count": sum(1 for v in positions.values() if v.get("trail_active")), "threshold": C.get("TRAIL_ACTIVATE", 0.07)},
+            "monthly_optimization": {"next_date": last_fri.isoformat(), "days_left": (last_fri - today).days},
         }
 
     @app.route("/api/sell_opinion/<ticker>")
@@ -413,17 +331,15 @@ def _create_app():
                 edge = rt.calculate_edge_v27(df, kind_adj, ticker)
             atr = rt.calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = rt.calc_dynamic_sl(atr, cp, ticker, _safe_attr("regime", "SIDE"))
-            hold_days = (date.today() - date.fromisoformat(info["entry_date"])).days \
-                        if info.get("entry_date") else int(info.get("hold_days", 0))
+            hold_days = int(info.get("hold_days", 0))
             trail = bool(info.get("trail_active", False))
             reasons = []
             action = "보유유지"
             if ret <= dyn_sl:
                 action = "매도 권고"
                 reasons.append(f"손절선({dyn_sl*100:.1f}%) 도달")
-            ts_days_so = C.get("TIME_STOP_DAYS", 15)
-            if hold_days >= ts_days_so:
-                reasons.append(f"보유 {hold_days}일 — 타임스탑 구간 ({ts_days_so}일 기준)")
+            if hold_days >= 7:
+                reasons.append(f"보유 {hold_days}일 — 타임스탑 구간")
                 if ret < 0:
                     action = "매도 권고"
             if edge < 0.40:
@@ -683,88 +599,25 @@ def _create_app():
         rt = _rt_module
         sources = []
         test_tk = "005930"
-
-        # 현재 활성 데이터 소스 (rt.py _data_source_status)
-        _ds = getattr(rt, "_data_source_status", {})
-        active_source = _ds.get("source", "확인중")
-
-        # ① 키움 (최우선)
         try:
-            kw = rt.kiwoom() if hasattr(rt, "kiwoom") else None
-            if kw:
-                kp = kw.get_price(test_tk)
-                kiwoom_ok = kp and kp > 0
-                sources.append({
-                    "name": "키움 실시간",
-                    "status": "ok" if kiwoom_ok else "no_data",
-                    "icon": "✅" if kiwoom_ok else "⚠️",
-                    "last_price": kp if kiwoom_ok else 0,
-                    "active": active_source == "키움(실시간)",
-                    "priority": 1,
-                })
+            if hasattr(rt, "FDR_OK") and rt.FDR_OK:
+                sources.append({"name": "FDR (일봉)", "status": "ok", "icon": "✅"})
             else:
-                sources.append({"name": "키움 실시간", "status": "unavailable",
-                                 "icon": "❌", "active": False, "priority": 1})
-        except Exception:
-            sources.append({"name": "키움 실시간", "status": "error",
-                             "icon": "❌", "active": False, "priority": 1})
-
-        # ② 네이버 크롤링
+                sources.append({"name": "FDR", "status": "unavailable", "icon": "❌"})
+        except:
+            sources.append({"name": "FDR", "status": "error", "icon": "❌"})
         try:
-            p = rt._fetch_naver_realtime(test_tk) if hasattr(rt, "_fetch_naver_realtime") else 0
-            sources.append({
-                "name": "네이버 실시간",
-                "status": "ok" if p > 0 else "no_data",
-                "icon": "✅" if p > 0 else "⚠️",
-                "last_price": round(p) if p > 0 else 0,
-                "active": active_source == "네이버(실시간)",
-                "priority": 2,
-            })
-        except Exception:
-            sources.append({"name": "네이버 실시간", "status": "error",
-                             "icon": "❌", "active": False, "priority": 2})
-
-        # ③ FDR
+            p = rt.get_current_price(test_tk)
+            sources.append({"name": "네이버 실시간", "status": "ok" if p > 0 else "no_data", "icon": "✅" if p > 0 else "⚠️", "last_price": round(p) if p > 0 else 0})
+        except:
+            sources.append({"name": "네이버 실시간", "status": "error", "icon": "❌"})
         try:
-            fdr_ok = hasattr(rt, "FDR_OK") and rt.FDR_OK
-            sources.append({
-                "name": "FDR (일봉)",
-                "status": "ok" if fdr_ok else "unavailable",
-                "icon": "✅" if fdr_ok else "❌",
-                "active": active_source == "FDR(일봉)",
-                "priority": 3,
-            })
-        except Exception:
-            sources.append({"name": "FDR (일봉)", "status": "error",
-                             "icon": "❌", "active": False, "priority": 3})
-
-        # ④ pykrx
-        try:
-            pykrx_ok = hasattr(rt, "PYKRX_OK") and rt.PYKRX_OK
-            sources.append({
-                "name": "pykrx (폴백)",
-                "status": "ok" if pykrx_ok else "unavailable",
-                "icon": "✅" if pykrx_ok else "⚠️",
-                "active": False,
-                "priority": 4,
-            })
-        except Exception:
-            sources.append({"name": "pykrx (폴백)", "status": "unknown",
-                             "icon": "⚠️", "active": False, "priority": 4})
-
-        # ⑤ yfinance
-        try:
-            yf_ok = hasattr(rt, "YF_OK") and rt.YF_OK
-            sources.append({
-                "name": "yfinance (최종폴백)",
-                "status": "ok" if yf_ok else "unavailable",
-                "icon": "✅" if yf_ok else "⚠️",
-                "active": False,
-                "priority": 5,
-            })
-        except Exception:
-            sources.append({"name": "yfinance (최종폴백)", "status": "unknown",
-                             "icon": "⚠️", "active": False, "priority": 5})
+            if hasattr(rt, "PYKRX_OK") and rt.PYKRX_OK:
+                sources.append({"name": "pykrx (폴백)", "status": "ok", "icon": "✅"})
+            else:
+                sources.append({"name": "pykrx", "status": "unavailable", "icon": "⚠️"})
+        except:
+            sources.append({"name": "pykrx", "status": "unknown", "icon": "⚠️"})
 
         param_log_file = Path("param_changes.json")
         param_history = []
@@ -776,25 +629,13 @@ def _create_app():
 
         C = rt.C
         params = {
-            # ── 진입/청산 기준 ─────────────────────────
-            "SELL_EDGE_THRESHOLD":    C.get("SELL_EDGE_THRESHOLD"),
-            "TRAIL_ACTIVATE":         C.get("TRAIL_ACTIVATE"),
-            "TAKE_PROFIT_FIXED":      C.get("TAKE_PROFIT_FIXED"),
-            "DAILY_DRAWDOWN_LIMIT":   C.get("DAILY_DRAWDOWN_LIMIT"),
-            # ── ATR 손절 ────────────────────────────────
-            "ATR_MULT_LARGE":         C.get("ATR_MULT_LARGE"),
-            "ATR_MULT_SMALL":         C.get("ATR_MULT_SMALL"),
-            "ATR_STOP_MAX":           C.get("ATR_STOP_MAX"),
-            # ── v28.0 신규 파라미터 ─────────────────────
-            "RSI_DIVERGENCE_PENALTY": C.get("RSI_DIVERGENCE_PENALTY"),
-            "TIME_STOP_DAYS":         C.get("TIME_STOP_DAYS"),
-            "TIME_STOP_THRESHOLD":    C.get("TIME_STOP_THRESHOLD"),
-            "SECTOR_MAX_POSITIONS":   C.get("SECTOR_MAX_POSITIONS"),
-            "VOL_TARGET_DAILY":       C.get("VOL_TARGET_DAILY"),
-            "ECON_EVENT_EDGE_UPLIFT": C.get("ECON_EVENT_EDGE_UPLIFT"),
-            # ── 자본 보호 ───────────────────────────────
-            "CAPITAL_FLOOR_RATIO":    C.get("CAPITAL_FLOOR_RATIO"),
-            "KELLY_MAX_FRACTION":     C.get("KELLY_MAX_FRACTION"),
+            "EDGE_BUY_THRESHOLD": C.get("EDGE_BUY_THRESHOLD"),
+            "ATR_SL_MULTIPLIER": C.get("ATR_SL_MULTIPLIER"),
+            "TRAIL_ACTIVATE": C.get("TRAIL_ACTIVATE"),
+            "TRAIL_STEP": C.get("TRAIL_STEP"),
+            "DAILY_DRAWDOWN_LIMIT": C.get("DAILY_DRAWDOWN_LIMIT"),
+            "MAX_SECTOR_PCT": C.get("MAX_SECTOR_PCT"),
+            "TIMESTOP_DAYS": C.get("TIMESTOP_DAYS"),
         }
 
         cache_info = {
@@ -805,55 +646,121 @@ def _create_app():
 
         return {
             "data_sources": sources,
-            "active_source": active_source,
             "param_history": param_history[-20:],
             "current_params": params,
             "cache_info": cache_info,
             "uptime": datetime.now().isoformat(),
         }
 
+
+    # ── ⑤ 체결/주문 내역 (trade_history.db) ─────────────
+    @app.route("/api/trades")
+    @_cached("trades")
+    def api_trades():
+        rt = _rt_module
+        today = date.today().isoformat()
+        trades = []
+        try:
+            db_path = Path("trade_history.db")
+            if db_path.exists():
+                import sqlite3 as _sq
+                conn = _sq.connect(str(db_path))
+                conn.row_factory = _sq.Row
+                cur = conn.execute(
+                    "SELECT * FROM trade_log ORDER BY timestamp DESC LIMIT 100"
+                )
+                for row in cur.fetchall():
+                    trades.append(dict(row))
+                conn.close()
+        except Exception as e:
+            pass
+        return {"trades": trades, "today": today}
+
     @app.route("/api/today_trades")
     def api_today_trades():
-        """오늘 체결내역 — SQLite trade_history.db 기반 (캐시 제외, 항상 최신)"""
+        """오늘 체결 내역 요약 — Dashboard todayTrades 패널용"""
+        today = date.today().isoformat()
+        buy_count = sell_count = 0
+        total_pnl = 0.0
+        wins = 0
+        sells = []
         try:
-            rt = _rt_module
-            rows = rt.db_query_today()
-            summary = rt.db_daily_summary()
-            buys  = [r for r in rows if r.get("action") == "buy"]
-            sells = [r for r in rows if r.get("action") == "sell"]
-            return {
-                "date":       str(date.today()),
-                "buy_count":  summary["buy_count"],
-                "sell_count": summary["sell_count"],
-                "total_pnl":  round(summary["total_pnl"]),
-                "win_rate":   round(summary["win_rate"], 4),
-                "buys":  [{"ticker": r["ticker"], "name": r["name"],
-                           "price": r["price"], "shares": r["shares"],
-                           "reason": r["reason"]} for r in buys],
-                "sells": [{"ticker": r["ticker"], "name": r["name"],
-                           "price": r["price"], "shares": r["shares"],
-                           "pnl": round(r["pnl"]), "ret": round(r["ret"], 4),
-                           "reason": r["reason"]} for r in sells],
-            }
+            db_path = Path("trade_history.db")
+            if db_path.exists():
+                import sqlite3 as _sq
+                conn = _sq.connect(str(db_path))
+                conn.row_factory = _sq.Row
+                cur = conn.execute(
+                    "SELECT * FROM trade_log WHERE date = ? ORDER BY timestamp DESC",
+                    (today,)
+                )
+                for row in cur.fetchall():
+                    r = dict(row)
+                    if r.get("action") == "buy":
+                        buy_count += 1
+                    elif r.get("action") == "sell":
+                        sell_count += 1
+                        pnl = float(r.get("pnl") or 0)
+                        total_pnl += pnl
+                        if pnl > 0:
+                            wins += 1
+                        sells.append({
+                            "ticker": r.get("ticker", ""),
+                            "name":   r.get("name", ""),
+                            "ret":    float(r.get("ret") or 0),
+                            "pnl":    pnl,
+                            "reason": r.get("reason", ""),
+                        })
+                conn.close()
+        except Exception:
+            pass
+        win_rate = wins / sell_count if sell_count > 0 else 0.0
+        return {
+            "date":        today,
+            "buy_count":   buy_count,
+            "sell_count":  sell_count,
+            "total_pnl":   round(total_pnl, 0),
+            "win_rate":    round(win_rate, 4),
+            "sells":       sells,
+        }
+
+    # ── ⑥⑦ 투자 모드 + 예수금 ────────────────────────────
+    @app.route("/api/account")
+    def api_account():
+        rt = _rt_module
+        result = {
+            "mode":      "unknown",
+            "mode_icon": "❓",
+            "host":      "",
+            "deposit":   0,
+            "deposit_str": "조회 중",
+            "balance":   [],
+        }
+        try:
+            kw = rt.kiwoom() if hasattr(rt, "kiwoom") else None
+            if kw:
+                result["mode"]      = "모의투자" if kw._mock else "실제투자"
+                result["mode_icon"] = "🔵" if kw._mock else "🟢"
+                result["host"]      = kw._host
+                try:
+                    dep = kw.get_deposit()
+                    result["deposit"]     = dep
+                    result["deposit_str"] = f"{dep:,}원"
+                except Exception:
+                    result["deposit_str"] = "조회 실패"
+                try:
+                    bal = kw.get_balance()
+                    result["balance"] = bal or []
+                except Exception:
+                    pass
         except Exception as e:
-            return {"error": str(e), "buy_count": 0, "sell_count": 0,
-                    "total_pnl": 0, "win_rate": 0, "buys": [], "sells": []}
+            pass
+        return result
 
     return app
 
 
 # ── 유틸 ────────────────────────────────────
-def _calc_hold_days(v: dict) -> int:
-    """entry_date 기반 보유일수 실시간 계산 (positions.json hold_days 필드 무시)"""
-    ed = v.get("entry_date", "")
-    if ed:
-        try:
-            return (date.today() - date.fromisoformat(ed)).days
-        except ValueError:
-            pass
-    return int(v.get("hold_days", 0))
-
-
 def _get_sector(ticker):
     SECTOR_MAP = {
         "005930": "반도체", "000660": "반도체", "042700": "반도체",

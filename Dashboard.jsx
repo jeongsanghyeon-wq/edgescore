@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 
 // ── CONFIG (자동 감지) ──
 // Tailscale IP를 여기에 한 번만 입력하세요 (맥미니에서 tailscale ip -4 로 확인)
-const TAILSCALE_IP = "100.64.0.2"; // ← 본인 맥미니 Tailscale IP로 변경
+const TAILSCALE_IP = "100.84.228.61"; // ← 본인 맥미니 Tailscale IP로 변경
 const RT_PORT = 5000;
 
 // 자동 감지: localhost/127.0.0.1/맥미니LAN IP → 로컬, 그 외 → Tailscale
@@ -184,12 +184,12 @@ export default function Dashboard(){
     [def,setDef]=useState(null),[kospi,setKospi]=useState(null),[risk,setRisk]=useState(null),
     [market,setMarket]=useState(null),[sentiment,setSentiment]=useState(null),[system,setSystem]=useState(null),
     [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null),
-    [todayTrades,setTodayTrades]=useState(null);
+    [todayTrades,setTodayTrades]=useState(null),[account,setAccount]=useState(null),[trades,setTrades]=useState([]);
 
   const fetchAll=useCallback(async(signal)=>{
     const s=await api("/status",signal);if(!s){setConn(false);return;}setConn(true);setSt(s);
-    const [p,w,a,pf,d,k,r,m,se,sy,tt]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal),api("/today_trades",signal)]);
-    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);if(tt)setTodayTrades(tt);
+    const [p,w,a,pf,d,k,r,m,se,sy,tt,ac,tr]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal),api("/today_trades",signal),api("/account",signal),api("/trades",signal)]);
+    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);if(tt)setTodayTrades(tt);if(ac)setAccount(ac);if(tr)setTrades(tr.trades||[]);
   },[]);
 
   useEffect(()=>{const ac=new AbortController();fetchAll(ac.signal);const iv=setInterval(()=>{fetchAll(ac.signal);setTime(new Date())},TICK);return()=>{ac.abort();clearInterval(iv)}},[fetchAll]);
@@ -239,6 +239,8 @@ export default function Dashboard(){
         <div style={{display:"flex",alignItems:"center",gap:mobile?8:14,fontSize:mobile?10:11,color:"#64748b"}}>
           {kospi&&<span style={{color:kospi.change>=0?"#22c55e":"#ef4444",fontWeight:600}}>{fmt(kospi.price)} {pct(kospi.change)}</span>}
           {emo&&<span style={{color:emo.score>50?"#ef4444":"#22c55e",fontWeight:600}}>{emo.emoji}{emo.score}°</span>}
+          {account&&<span style={{background:account.mode==="모의투자"?"#1e3a5f":"#14532d",color:account.mode==="모의투자"?"#60a5fa":"#4ade80",padding:"2px 7px",borderRadius:8,fontSize:10,fontWeight:700}}>{account.mode_icon} {account.mode}</span>}
+          {account&&account.deposit>0&&<span style={{color:"#fbbf24",fontWeight:600,fontSize:11}}>💰 {fmt(account.deposit)}원</span>}
           <span>{time.toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}</span>
           <div style={{width:7,height:7,borderRadius:"50%",background:conn?"#22c55e":"#ef4444",animation:"pulse 1.5s infinite"}}/>
         </div>
@@ -247,7 +249,7 @@ export default function Dashboard(){
 
     {/* ── 탭 (모바일: 스크롤) ── */}
     <div style={{display:"flex",borderBottom:"1px solid #1e293b",background:"#0f172a",overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
-      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"}].map(t=>
+      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"},{k:"trades",l:mobile?"📋":"📋 체결내역"}].map(t=>
         <button key={t.k} onClick={()=>setTab(t.k)} style={{padding:mobile?"8px 12px":"9px 16px",background:tab===t.k?"#1e293b":"transparent",border:"none",borderBottom:tab===t.k?"2px solid #3b82f6":"2px solid transparent",color:tab===t.k?"#e2e8f0":"#64748b",cursor:"pointer",fontSize:mobile?12:11,fontWeight:600,fontFamily:"inherit",whiteSpace:"nowrap",minWidth:mobile?40:"auto"}}>{t.l}</button>)}
     </div>
 
@@ -409,6 +411,50 @@ export default function Dashboard(){
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>⚙️ 파라미터</div>
             {system.current_params&&Object.entries(system.current_params).map(([k,v],i)=>v!=null&&<div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e293b",fontSize:10}}>
               <span style={{color:"#94a3b8"}}>{k}</span><span style={{fontWeight:600}}>{typeof v==="number"?v.toFixed?.(4)??v:String(v)}</span></div>)}</div></div></>}
+
+        {/* ═══ 체결내역 ═══ */}
+        {tab==="trades"&&<>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📋 체결내역</div>
+          {account&&<div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"1fr 1fr 1fr",gap:8,marginBottom:12}}>
+            <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:10,textAlign:"center"}}>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>투자 모드</div>
+              <div style={{fontSize:14,fontWeight:700,color:account.mode==="모의투자"?"#60a5fa":"#4ade80"}}>{account.mode_icon} {account.mode}</div>
+            </div>
+            <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:10,textAlign:"center"}}>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>주문가능 예수금</div>
+              <div style={{fontSize:14,fontWeight:700,color:"#fbbf24"}}>💰 {fmt(account.deposit)}원</div>
+            </div>
+            <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:10,textAlign:"center"}}>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>연결 서버</div>
+              <div style={{fontSize:10,fontWeight:600,color:"#94a3b8",wordBreak:"break-all"}}>{account.host}</div>
+            </div>
+          </div>}
+          {trades.length===0?<div style={{textAlign:"center",color:"#64748b",padding:30}}>오늘 체결 내역이 없어요</div>:
+          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead><tr style={{borderBottom:"1px solid #1e293b",color:"#64748b",fontSize:10}}>
+              <th style={{padding:"6px 4px",textAlign:"left"}}>시간</th>
+              <th style={{padding:"6px 4px",textAlign:"left"}}>종목</th>
+              <th style={{padding:"6px 4px",textAlign:"center"}}>구분</th>
+              <th style={{padding:"6px 4px",textAlign:"right"}}>수량</th>
+              <th style={{padding:"6px 4px",textAlign:"right"}}>단가</th>
+              <th style={{padding:"6px 4px",textAlign:"right"}}>금액</th>
+              <th style={{padding:"6px 4px",textAlign:"right"}}>손익</th>
+            </tr></thead>
+            <tbody>{trades.slice(0,50).map((t,i)=>{
+              const isBuy=t.action==="BUY";
+              const pnl=t.pnl||0;
+              return <tr key={i} style={{borderBottom:"1px solid #1e293b11",background:i%2?"#0f172a33":"transparent"}}>
+                <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.timestamp||"").slice(11,16)}</td>
+                <td style={{padding:"5px 4px",fontWeight:600}}>{t.name||t.ticker}</td>
+                <td style={{padding:"5px 4px",textAlign:"center"}}><span style={{background:isBuy?"#22c55e22":"#ef444422",color:isBuy?"#22c55e":"#ef4444",padding:"2px 6px",borderRadius:4,fontWeight:700,fontSize:10}}>{isBuy?"매수":"매도"}</span></td>
+                <td style={{padding:"5px 4px",textAlign:"right"}}>{fmt(t.shares)}주</td>
+                <td style={{padding:"5px 4px",textAlign:"right"}}>{fmt(t.price)}원</td>
+                <td style={{padding:"5px 4px",textAlign:"right"}}>{fmt((t.shares||0)*(t.price||0))}원</td>
+                <td style={{padding:"5px 4px",textAlign:"right",color:pnl>=0?"#22c55e":"#ef4444",fontWeight:600}}>{pnl!==0?(pnl>=0?"+":"")+fmt(pnl)+"원":"-"}</td>
+              </tr>;
+            })}</tbody>
+          </table></div>}
+        </>}
 
       </div>
 

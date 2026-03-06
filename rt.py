@@ -1,5 +1,5 @@
 """
-Edge Score v39.5 — 완전 통합 엔진
+Edge Score v39.6 — 완전 통합 엔진
 =====================================================
 v37.1 패치:
 
@@ -67,7 +67,7 @@ v36.0 기능 전체 유지. 원래 v34 → v36 변경사항:
                  requests schedule beautifulsoup4
 """
 
-import json, time, logging, hashlib, threading, sqlite3
+import json, time, logging, hashlib, threading, sqlite3, re
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -250,6 +250,48 @@ DEFAULT_CONFIG = {
     # ── 네트워크 체크 ─────────────────────────
     "NET_CHECK_URL":      "https://api.telegram.org",
     "NET_CHECK_INTERVAL": 60,   # 초
+
+    # ── 경제 이벤트 캘린더 (2025~2026) ───────────
+    # scan_universe / close_report 에서 참조
+    "ECON_EVENTS_2025_2026": [
+        # ── 2025년 ─────────────────────────────
+        {"date": "2025-01-15", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-01-29", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-02-07", "event": "고용지표(미국)", "impact": "high"},
+        {"date": "2025-02-12", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-03-19", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-04-10", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-04-30", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-05-02", "event": "고용지표(미국)", "impact": "high"},
+        {"date": "2025-06-11", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-06-18", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-07-11", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-07-30", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-08-13", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-09-17", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-10-09", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-10-29", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2025-11-13", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-12-10", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2025-12-17", "event": "FOMC(금리결정)", "impact": "high"},
+        # ── 2026년 ─────────────────────────────
+        {"date": "2026-01-14", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-01-28", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-02-06", "event": "고용지표(미국)", "impact": "high"},
+        {"date": "2026-02-11", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-03-11", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-03-18", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-04-08", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-04-29", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-05-13", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-06-10", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-06-17", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-07-08", "event": "CPI(미국)", "impact": "high"},
+        {"date": "2026-07-29", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-09-16", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-11-04", "event": "FOMC(금리결정)", "impact": "high"},
+        {"date": "2026-12-16", "event": "FOMC(금리결정)", "impact": "high"},
+    ],
 }
 
 _ENV_ONLY_KEYS = {"TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"}  # .env 전용 — config.json 불저장
@@ -1832,9 +1874,17 @@ def _db_init():
                 pnl         REAL,
                 ret         REAL,
                 reason      TEXT,
+                mode        TEXT DEFAULT 'unknown',
                 created_at  TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # 기존 DB 마이그레이션: mode 컬럼 없으면 추가
+        try:
+            con.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'unknown'")
+            con.commit()
+            log.info("[DB] mode 컬럼 마이그레이션 완료")
+        except Exception:
+            pass  # 이미 있으면 무시
         con.commit()
         con.close()
     except Exception as e:
@@ -1856,9 +1906,17 @@ def _db_insert(entry: dict):
         else:
             _price = float(entry.get("buy_price") or 0)
         con = sqlite3.connect(TRADE_DB_FILE)
+        # mode 결정: entry에 명시 → kiwoom 상태 → 'unknown'
+        _mode = entry.get("mode", None)
+        if _mode is None:
+            try:
+                _kw = kiwoom()
+                _mode = "mock" if (_kw and _kw._mock) else "real"
+            except Exception:
+                _mode = "unknown"
         con.execute("""
-            INSERT INTO trades (date, ticker, name, action, price, shares, pnl, ret, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (date, ticker, name, action, price, shares, pnl, ret, reason, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             _date,
             entry.get("ticker", ""),
@@ -1869,6 +1927,7 @@ def _db_insert(entry: dict):
             float(entry.get("pnl", 0)),
             float(entry.get("ret", 0)),
             entry.get("reason", ""),
+            _mode,
         ))
         con.commit()
         con.close()
@@ -2060,12 +2119,38 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
             except Exception as e:
                 log.warning(f"[키움] 체결 확인 오류: {e}")
 
-        # 60초 후에도 미체결 → 미체결 알림
+        # 60초 후에도 미체결 → 1차 미체결 알림
         tg(
-            f"⚠️ <b>[{_mode}] {_action} 미체결</b>\n"
-            f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
-            f"직접 확인이 필요해요."
+            f"⏳ <b>{_action} 주문이 아직 체결되지 않았어요</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 종목: {name} ({ticker})\n"
+            f"🔖 주문번호: {order_no}\n"
+            f"💡 주문이 들어갔지만 아직 거래가 성사되지 않았어요\n\n"
+            f"⚠️ <b>직접 확인이 필요해요</b>\n"
+            f"   키움증권 앱 → 주문/잔고 → 미체결 내역\n"
+            f"   취소하거나 기다리실 수 있어요"
         )
+        # 5분 후에도 보유 여부 그대로면 재알림
+        def _refill_recheck():
+            time.sleep(300)
+            kw2 = kiwoom()
+            if not kw2:
+                return
+            try:
+                fill2 = kw2.get_order_fill(order_no, ticker)
+                if fill2 and fill2.get("filled"):
+                    return  # 이미 체결됨 — 추가 알림 불필요
+            except Exception:
+                pass
+            tg(
+                f"🔴 <b>{_action} 주문이 5분째 체결 안 됐어요</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📌 종목: {name} ({ticker})\n\n"
+                f"📱 지금 키움증권 앱에서 확인해주세요\n"
+                f"   취소 후 재주문하거나 기다리셔도 됩니다\n"
+                f"   (시장가 주문은 보통 즉시 체결돼요)"
+            )
+        threading.Thread(target=_refill_recheck, daemon=True).start()
 
     threading.Thread(target=_wait_and_notify, daemon=True).start()
 
@@ -2207,10 +2292,14 @@ def tg(text: str, silent: bool = False):
     if len(TELEGRAM["token"]) < 20 or "여기에" in TELEGRAM["token"]:
         log.warning("[TG 미설정] " + text[:60]); return
     try:
+        # 모든 일반 메시지 하단에 [📋 메인메뉴] 버튼 자동 추가
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage",
             json={"chat_id": TELEGRAM["chat_id"], "text": text + _ds_footer(),
-                  "parse_mode": "HTML", "disable_notification": silent},
+                  "parse_mode": "HTML", "disable_notification": silent,
+                  "reply_markup": {"inline_keyboard": [
+                      [{"text": "📋 메인메뉴", "callback_data": "menu"}]
+                  ]}},
             timeout=10,
         )
         err_tracker.record_ok("텔레그램")
@@ -4120,6 +4209,14 @@ class EdgeMonitor:
                         )
                     else:
                         tg(f"⚠️ [{_mode}] 자동매도 실패: {_res.get('error','')}\n종목: {_name}")
+
+
+    def check_holdings(self):
+        """보유 종목 ATR손절·트레일링·수익알림 1분 체크 (스케줄에서 직접 호출)
+        _log_exit 와 완전히 분리 — 순환참조 없음
+        """
+        if not is_market_hour():
+            return
         alerts = []
         for ticker, info in list(self.positions.items()):
             name   = info.get("name", resolve_name(ticker))
@@ -4504,6 +4601,7 @@ class EdgeMonitor:
         for alert in alerts:
             tg(alert); self.today_alerts += 1; time.sleep(0.3)
     # ── 유니버스 스캔 (5분, 장중) ──────────────────
+
     def scan_universe(self, force_notify: bool = False):
         if not is_market_hour() and not force_notify:
             return
@@ -4523,6 +4621,46 @@ class EdgeMonitor:
             edge  = calculate_edge_v27(df, kind_adj, ticker) if df is not None else 0.5
             tm    = " 🔺" if info.get("trail_active") else ""
             rows.append([now, "보유", name, f"{cp:,.0f}", f"{ret:+.2f}%", edge])
+
+            # ── ③ 타임스탑 임박 알림 (D-3) ──────────────────
+            if C.get("TIME_STOP_ENABLED", True) and not info.get("timestop_alerted"):
+                _ts_days  = C.get("TIME_STOP_DAYS", 15)
+                _ts_thr   = C.get("TIME_STOP_THRESHOLD", 0.02)
+                _entry    = info.get("entry_date", "")
+                try:
+                    _hold = (date.today() - date.fromisoformat(_entry)).days if _entry else 0
+                except Exception:
+                    _hold = 0
+                _days_left = _ts_days - _hold
+                if (2 <= _days_left <= 3
+                        and abs(ret) <= _ts_thr
+                        and not info.get("ts_imminent_alerted")):
+                    tg(f"⏱ <b>타임스탑 임박: {name}</b>\n"
+                       f"━━━━━━━━━━━━━━━━━━\n"
+                       f"보유 {_hold}일째 — {_days_left}일 후 타임스탑 도달\n"
+                       f"현재 수익률: {ret:+.2%} (기준: ±{_ts_thr:.1%} 이내)\n\n"
+                       f"📌 지금 추이를 지켜보고\n"
+                       f"   {_ts_days}일이 되면 자동 매도 검토됩니다.")
+                    info["ts_imminent_alerted"] = True
+
+            # ── ④ Edge 급락 경고 ─────────────────────────────
+            _prev_edge_val = self.prev_edge.get(ticker, None)
+            _curr_edge_int = round(edge * 100)
+            if (_prev_edge_val is not None
+                    and _prev_edge_val - _curr_edge_int >= 15
+                    and not info.get("edge_drop_alerted")):
+                tg(f"📉 <b>Edge 급락 경고: {name}</b>\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"Edge: {_prev_edge_val}점 → {_curr_edge_int}점 "
+                   f"({_curr_edge_int - _prev_edge_val:+d}점)\n"
+                   f"현재 수익률: {ret:+.2%}\n\n"
+                   f"💡 매도의견을 확인해보세요.")
+                info["edge_drop_alerted"] = True
+            elif (_prev_edge_val is not None
+                    and _curr_edge_int - _prev_edge_val >= 10
+                    and info.get("edge_drop_alerted")):
+                info.pop("edge_drop_alerted", None)   # 회복 시 리셋
+            self.prev_edge[ticker] = _curr_edge_int
         # 유니버스 스캔 → 추천 (③ 당일 청산 종목 제외)
         held   = set(self.positions.keys())
         scored = []
@@ -4748,6 +4886,103 @@ class EdgeMonitor:
         self.last_offhours_hash = cur_hash
         tg("\n".join(lines), silent=True)
     # ── 일간 결산 리포트 (15:35 통합) ────────────
+    def check_kiwoom_balance_sync(self):
+        """④ 키움 실계좌 잔고와 positions.json 불일치 경보"""
+        kw = kiwoom()
+        if not kw or kw._mock:
+            return  # 모의투자는 체크 불필요
+        try:
+            balance = kw.get_balance()
+        except Exception as e:
+            log.warning(f"잔고 불일치 체크 오류: {e}")
+            return
+        if not balance and not self.positions:
+            return
+        kiwoom_tickers = {b["ticker"] for b in balance if b["qty"] > 0}
+        local_tickers  = set(self.positions.keys())
+        # 키움엔 있는데 로컬에 없는 종목
+        only_in_kiwoom = kiwoom_tickers - local_tickers
+        # 로컬엔 있는데 키움에 없는 종목
+        only_in_local  = local_tickers - kiwoom_tickers
+        if not only_in_kiwoom and not only_in_local:
+            return  # 일치
+        log.warning(f"[잔고 불일치] 키움전용={only_in_kiwoom}, 로컬전용={only_in_local}")
+        msg = (
+            "⚠️ <b>주식 잔고가 일치하지 않아요!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "키움증권 계좌와 AI 시스템의\n"
+            "보유 목록이 달라요\n\n"
+        )
+        if only_in_kiwoom:
+            names = [resolve_name(t) for t in only_in_kiwoom]
+            msg += (
+                "📌 <b>키움에만 있는 종목</b> (시스템이 모르는 종목)\n"
+                f"   {', '.join(names)}\n"
+                "   → 수동으로 매수하셨나요?\n\n"
+            )
+        if only_in_local:
+            names = [self.positions[t].get("name", resolve_name(t)) for t in only_in_local]
+            msg += (
+                "📌 <b>시스템에만 있는 종목</b> (키움에 없는 종목)\n"
+                f"   {', '.join(names)}\n"
+                "   → 수동으로 매도하셨나요?\n\n"
+            )
+        msg += (
+            "💡 <b>어떻게 해야 하나요?</b>\n"
+            "   직접 매수/매도하신 게 있으면\n"
+            "   텔레그램 메뉴에서 수동으로 등록/제거해주세요\n"
+            "   그래야 AI가 정확하게 관리할 수 있어요"
+        )
+        tg(msg)
+
+    def midday_report(self):
+        """③ 정오 일중 손익 현황 (12:00)"""
+        if not is_market_hour() or not is_trading_day():
+            return
+        if not self.positions:
+            return
+        log.info("🕛 정오 일중 손익 체크")
+        total_pnl  = 0
+        total_eval = 0
+        lines = []
+        for ticker, info in self.positions.items():
+            name  = info.get("name", resolve_name(ticker))
+            buy_p = float(info.get("buy_price", 0))
+            shares = int(info.get("shares", 0))
+            cp    = get_current_price(ticker)
+            if cp <= 0:
+                cached = _ohlcv_cache.get(ticker)
+                cp = float(cached["df"]["종가"].iloc[-1]) if cached and cached.get("df") is not None else buy_p
+            ret   = (cp - buy_p) / buy_p if buy_p > 0 else 0
+            pnl   = (cp - buy_p) * shares
+            eval_v = cp * shares
+            total_pnl  += pnl
+            total_eval += eval_v
+            r_icon = "✅" if ret >= 0 else "🔴"
+            trail_str = "  🔺추적중" if info.get("trail_active") else ""
+            lines.append(
+                f"📌 <b>{name}</b>{trail_str}\n"
+                f"   {buy_p:,.0f}원 → 지금 {cp:,.0f}원\n"
+                f"   {r_icon} {ret:+.2%}  ({pnl:+,.0f}원)\n"
+            )
+        tot_icon = "✅" if total_pnl >= 0 else "🔴"
+        regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(self.regime,"❓")
+        msg = (
+            f"🕛 <b>오전 중간 점검</b>  |  {datetime.now().strftime('%H:%M')}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"지금까지 내 주식이 어떻게 됐는지 알려드려요\n\n"
+        )
+        for line in lines:
+            msg += line + "\n"
+        msg += (
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{tot_icon} 현재까지 손익: <b>{total_pnl:+,.0f}원</b>\n"
+            f"💼 총 평가금액: {total_eval:,.0f}원\n\n"
+            f"{regime_emoji} 시장 국면: {self.regime}\n"
+            f"💡 장 마감까지 15:30 자동으로 최종 결산이 와요"
+        )
+        tg(msg)
+
     def close_report(self):
         if not is_trading_day():
             return
@@ -4937,7 +5172,86 @@ class EdgeMonitor:
             msg += "\n⭐ <b>다음주 미리 볼 종목</b>\n"
             for nm, eg in preview[:3]:
                 msg += f"  ⭐ {nm}: {eg:.3f}점\n"
-        tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
+        # ── ① 모의 vs 실계좌 비교 리포트 ──────────────────
+        try:
+            import sqlite3 as _sq3
+            _con = _sq3.connect(Path("trade_history.db"))
+            _con.row_factory = _sq3.Row
+            _all_rows = [dict(r) for r in _con.execute(
+                "SELECT * FROM trades WHERE action='sell' ORDER BY date"
+            ).fetchall()]
+            _con.close()
+
+            _wk_s = str(week_start)
+            _mock_week = [r for r in _all_rows if r.get("mode")=="mock" and r.get("date","")>=_wk_s]
+            _real_week = [r for r in _all_rows if r.get("mode")=="real" and r.get("date","")>=_wk_s]
+            _mock_all  = [r for r in _all_rows if r.get("mode")=="mock"]
+            _real_all  = [r for r in _all_rows if r.get("mode")=="real"]
+
+            def _stats(rows):
+                if not rows: return {"count":0,"wins":0,"win_rate":0,"total_pnl":0}
+                wins = sum(1 for r in rows if r.get("pnl",0)>0)
+                return {"count":len(rows),"wins":wins,
+                        "win_rate":wins/len(rows),"total_pnl":sum(r.get("pnl",0) for r in rows)}
+
+            _mw = _stats(_mock_week); _rw = _stats(_real_week)
+            _ma = _stats(_mock_all);  _ra = _stats(_real_all)
+
+            if _mock_all or _real_all:
+                _cmp_msg = ("━━━━━━━━━━━━━━━━━━\n"
+                            "⚖️ <b>모의 vs 실계좌 비교</b>\n"
+                            f"{'항목':<8} {'🔵모의':>10} {'🟢실계좌':>10}\n"
+                            f"{'이번주손익':<6} {_mw['total_pnl']:>+10,.0f} {_rw['total_pnl']:>+10,.0f}\n"
+                            f"{'이번주승률':<6} {_mw['win_rate']:>10.1%} {_rw['win_rate']:>10.1%}\n"
+                            f"{'누적손익':<6} {_ma['total_pnl']:>+10,.0f} {_ra['total_pnl']:>+10,.0f}\n"
+                            f"{'누적승률':<6} {_ma['win_rate']:>10.1%} {_ra['win_rate']:>10.1%}\n"
+                            f"{'거래횟수':<6} {_ma['count']:>10}회 {_ra['count']:>10}회\n")
+                # gap 분석
+                _pnl_gap = _ra['total_pnl'] - _ma['total_pnl']
+                _wr_gap  = _ra['win_rate'] - _ma['win_rate']
+                _gap_txt = (f"📐 실계좌 - 모의: 손익 {_pnl_gap:+,.0f}원 | 승률 {_wr_gap:+.1%}\n"
+                            if (_mock_all and _real_all) else "")
+                tg(_cmp_msg + _gap_txt)
+        except Exception as _e:
+            log.warning(f"모의vs실계좌 리포트 오류: {_e}")
+
+        # ── ② 슬리피지 주간 경고 ────────────────────────────
+        try:
+            import sqlite3 as _sq3b
+            _con2 = _sq3b.connect(Path("trade_history.db"))
+            _con2.row_factory = _sq3b.Row
+            _buy_rows = [dict(r) for r in _con2.execute(
+                "SELECT * FROM trades WHERE action='buy' AND date>=? ORDER BY date",
+                (str(week_start),)
+            ).fetchall()]
+            _con2.close()
+            _slip_vals = []
+            for _br in _buy_rows:
+                try:
+                    _df_sl = get_ohlcv(_br["ticker"], days=60)
+                    if _df_sl is None or len(_df_sl) < 2: continue
+                    import pandas as _pd2
+                    _df_sl.index = _pd2.to_datetime(_df_sl.index)
+                    _prior = _df_sl[_df_sl.index < _pd2.to_datetime(_br["date"])]
+                    if len(_prior) == 0: continue
+                    _sig_p = float(_prior["종가"].iloc[-1])
+                    if _sig_p > 0:
+                        _slip_vals.append((_br["price"] - _sig_p) / _sig_p)
+                except Exception:
+                    continue
+            if _slip_vals:
+                _avg_slip = sum(_slip_vals) / len(_slip_vals)
+                if abs(_avg_slip) > 0.003:   # 0.3% 초과 시 경고
+                    tg(f"⚠️ <b>슬리피지 경고</b>\n"
+                       f"━━━━━━━━━━━━━━━━━━\n"
+                       f"이번 주 평균 슬리피지: {_avg_slip:+.3%}\n"
+                       f"매수 {len(_slip_vals)}건 기준\n\n"
+                       f"{'📈 시장가 주문이 너무 높게 체결되고 있어요.' if _avg_slip > 0 else '✅ 유리하게 체결되고 있어요.'}\n"
+                       f"{'지정가 매수나 분할 매수를 고려해보세요.' if _avg_slip > 0.005 else ''}")
+        except Exception as _e2:
+            log.warning(f"슬리피지 경고 오류: {_e2}")
+
+        tg_btn(msg, [[ {"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
         # ── 월 1회 자동 최적화 (매월 마지막 금요일) ─────────
         today     = date.today()
         next_fri  = today + timedelta(days=7)
@@ -5309,6 +5623,27 @@ class EdgeMonitor:
                f"   새 종목의 업종을 추가해주세요\n"
                f"━━━━━━━━━━━━━━━━━━\n"
                f"미등록: {', '.join(_unmapped[:5])}{'...' if len(_unmapped) > 5 else ''}")
+        # ── 키움 예수금 조회 (아침 브리핑용) ─────────────────
+        _kw_morning = kiwoom()
+        if _kw_morning:
+            try:
+                _deposit = _kw_morning.get_deposit()
+                _mode_icon = "🔵" if _kw_morning._mock else "🟢"
+                _mode_str  = "모의투자" if _kw_morning._mock else "실제투자"
+                _dep_msg = (
+                    f"{_mode_icon} <b>오늘의 투자 준비 현황</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 지금 바로 주식을 살 수 있는 돈\n"
+                    f"   👉 <b>{_deposit:,.0f}원</b>\n\n"
+                    f"📌 현재 모드: {_mode_str}\n"
+                    f"   (모드가 맞는지 꼭 확인하세요!\n"
+                    f"    잘못된 모드면 주문이 안 나가요)\n\n"
+                    f"💡 오늘 AI가 추천하는 종목에\n"
+                    f"   이 금액 안에서 투자해보세요"
+                )
+                tg(_dep_msg)
+            except Exception as _e:
+                log.warning(f"아침 예수금 조회 실패: {_e}")
         log.info("🌅 아침 전략 보고")
         self.update_regime()
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(self.regime,"❓")
@@ -5428,7 +5763,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.5 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.6 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -5491,7 +5826,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.5 가동</b>\n"
+        f"🚀 <b>Edge Score v39.6 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
@@ -5507,21 +5842,23 @@ if __name__ == "__main__":
         f"📱 명령어: /help"
     )
     # ── 스케줄 ──────────────────────────────────
-    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.scan_universe)
-    schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
+    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.check_holdings)   # ATR손절·트레일링·수익알림
+    schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)    # 유니버스 스캔·신규 추천
     schedule.every(30).minutes.do(monitor.update_regime)
     schedule.every(30).minutes.do(monitor.offhours_check)
     schedule.every().day.at("08:30").do(monitor.do_refresh_universe)
     schedule.every().day.at("08:40").do(monitor.morning_report)
+    schedule.every().day.at("12:00").do(monitor.midday_report)
     schedule.every().day.at("15:30").do(monitor.close_report)
+    schedule.every(30).minutes.do(monitor.check_kiwoom_balance_sync)
     schedule.every().day.at("15:35").do(monitor.weekly_report)
     schedule.every().day.at("08:35").do(monitor.monday_reset)
     schedule.every().day.at("15:00").do(monitor.thursday_warning)
     schedule.every().day.at("15:20").do(monitor.friday_force_exit)
     schedule.every().day.at("15:35").do(monitor.wednesday_midcheck)
     log.info("스케줄:")
-    log.info(f"  {C['HOLD_CHECK_MIN']}분   → 보유 체크 (장중·거래일만)")
-    log.info(f"  {C['SCAN_CHECK_MIN']}분   → 유니버스 스캔 (장중·거래일만)")
+    log.info(f"  {C['HOLD_CHECK_MIN']}분   → 보유 체크 check_holdings (ATR손절·트레일링·수익알림)")
+    log.info(f"  {C['SCAN_CHECK_MIN']}분   → 유니버스 스캔 scan_universe (신규 추천)")
     log.info("  30분  → 국면갱신 / 장외체크")
     log.info("  08:30 → 유니버스 자동 갱신")
     log.info("  08:40 → 아침 전략 보고")
