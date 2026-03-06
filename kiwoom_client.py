@@ -15,6 +15,7 @@ import threading
 import logging
 import requests
 from datetime import datetime, timedelta
+from typing import Optional
 
 # ── .env 로드 (항상 스크립트 위치 기준) ──────────────────────
 def _load_env():
@@ -109,7 +110,7 @@ class KiwoomClient:
             "api-id":        api_id,
         }
 
-    def _post(self, endpoint: str, api_id: str, payload: dict) -> dict | None:
+    def _post(self, endpoint: str, api_id: str, payload: dict) -> Optional[dict]:
         if not self._ensure_token():
             log.error("[키움] 토큰 없음")
             return None
@@ -327,7 +328,7 @@ class KiwoomClient:
     #    cntr_qty(체결수량), cntr_uv(체결단가)
     # ══════════════════════════════════════════════════════════
 
-    def get_order_fill(self, order_no: str, ticker: str) -> dict | None:
+    def get_order_fill(self, order_no: str, ticker: str) -> Optional[dict]:
         """
         주문번호로 체결 여부 조회
         반환: {"filled": True/False, "cntr_qty": 체결수량, "cntr_uv": 체결단가}

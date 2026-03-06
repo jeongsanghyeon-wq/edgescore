@@ -1,5 +1,5 @@
 """
-Edge Score v39.4 — 완전 통합 엔진
+Edge Score v39.5 — 완전 통합 엔진
 =====================================================
 v37.1 패치:
 
@@ -64,7 +64,7 @@ v36.0 기능 전체 유지. 원래 v34 → v36 변경사항:
 
 필요 라이브러리:
     pip3 install finance-datareader pykrx yfinance pandas numpy \
-                 requests schedule gspread oauth2client beautifulsoup4
+                 requests schedule beautifulsoup4
 """
 
 import json, time, logging, hashlib, threading, sqlite3
@@ -129,12 +129,6 @@ try:
 except ImportError:
     YF_OK = False
 
-try:
-    import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-    GSHEET_OK = True
-except ImportError:
-    GSHEET_OK = False
 
 try:
     from bs4 import BeautifulSoup
@@ -320,17 +314,10 @@ TELEGRAM = {
     "chat_id": _os_tg.getenv("TELEGRAM_CHAT_ID", ""),
 }
 
-DRIVE_REPORT_PATH = Path(
-    "/Users/jeongsanghyeon/Library/CloudStorage/"
-    "GoogleDrive-jeongsanghyeon@gmail.com/"
-    "내 드라이브/EdgeScore/stock_report.txt"
-)
 POSITIONS_FILE   = Path("positions.json")
 UNIVERSE_FILE    = Path("universe_cache.json")
 TRADE_LOG_FILE   = Path("trade_log.json")
 TRADE_DB_FILE    = Path("trade_history.db")
-JSON_KEY_FILE  = "service_account.json"
-SHEET_NAME     = "EdgeScore_Report"
 
 INITIAL_UNIVERSE = {
     "005930": "삼성전자",   "000660": "SK하이닉스",
@@ -3906,13 +3893,11 @@ class EdgeMonitor:
         self.today_alerts  = 0
         self.today_exited       = set()
         self.last_offhours_hash = ""
-        self.sheet              = None
         self.prev_regime        = "SIDE"
         self.consec_loss        = 0
         self.consec_win         = 0   # 연속 수익 추적
         self._circuit_active    = False  # ㊱ 서킷브레이커 상태
         self._weekly_trend_cache = {}   # FIX-2: 주봉 추세 캐시 {ticker: bool}
-        self._init_gsheet()
         # 시작 시 이름 전체 캐시
         for tk, nm in self.universe.items():
             if nm and nm != tk: _name_cache[tk] = nm
@@ -3920,21 +3905,6 @@ class EdgeMonitor:
             nm = info.get("name", "")
             if nm and nm != tk: _name_cache[tk] = nm
         log.info(f"  유니버스 {len(self.universe)}개 / 보유 {len(self.positions)}개")
-
-    def _init_gsheet(self):
-        if not GSHEET_OK: return
-        try:
-            scope  = ["https://spreadsheets.google.com/feeds",
-                      "https://www.googleapis.com/auth/drive"]
-            creds  = ServiceAccountCredentials.from_json_keyfile_name(
-                         JSON_KEY_FILE, scope)
-            client = gspread.authorize(creds)
-            self.sheet = client.open(SHEET_NAME).sheet1
-            log.info("✅ 구글 시트 연결 성공")
-            err_tracker.record_ok("구글시트")
-        except Exception as e:
-            log.error(f"❌ 구글 시트: {e}")
-            err_tracker.record_fail("구글시트")
 
     def update_regime(self):
         new_regime = calc_regime_from_kospi()
@@ -4485,12 +4455,7 @@ class EdgeMonitor:
         rows         = []
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
             self.regime, "❓")
-        drive_lines  = [
-            f"🤖 Edge Score v39.4 ({now})",
-            f"국면: {self.regime} | 유니버스: {len(self.universe)}개",
-        ]
         # 보유 종목 현황
-        drive_lines.append("\n[보유 종목]")
         for ticker, info in self.positions.items():
             name  = info.get("name", resolve_name(ticker))
             cp    = get_current_price(ticker)
@@ -4502,11 +4467,7 @@ class EdgeMonitor:
             edge  = calculate_edge_v27(df, kind_adj, ticker) if df is not None else 0.5
             tm    = " 🔺" if info.get("trail_active") else ""
             rows.append([now, "보유", name, f"{cp:,.0f}", f"{ret:+.2f}%", edge])
-            drive_lines.append(
-                f"  • {name}: {cp:,.0f}원 ({ret:+.2f}%) "
-                f"Edge={edge:.3f}{tm} {shares:,}주")
         # 유니버스 스캔 → 추천 (③ 당일 청산 종목 제외)
-        drive_lines.append("\n[AI 추천]")
         held   = set(self.positions.keys())
         scored = []
         # STEP3: 경제이벤트 플래그 루프 밖 사전계산
@@ -4612,32 +4573,6 @@ class EdgeMonitor:
         for i, s in enumerate(top5):
             rows.append([now, f"추천{i+1}", s["name"],
                          f"{s['price']:,.0f}", "-", s["edge"]])
-            # ⑤ 분할매수 가이드 포함
-            split_hint = ""
-            for step in C["SPLIT_BUY_STEPS"]:
-                if s["edge"] >= step["edge"]:
-                    split_hint = f" [{step['label']} 진입 가능]"
-            drive_lines.append(
-                f"  {i+1}. {s['name']}: {s['edge']:.3f}점"
-                f" ({s['price']:,.0f}원) 기대{s['expected']:.1%}{split_hint}")
-        # 구글 시트
-        try:
-            if self.sheet:
-                self.sheet.update(range_name="A1", values=[[
-                    "마지막업데이트","구분","종목명",
-                    "현재가","수익률","Edge점수"]])
-                if rows: self.sheet.update(range_name="A2", values=rows)
-                err_tracker.record_ok("구글시트")
-        except Exception as e:
-            log.error(f"시트 저장 실패: {e}")
-            err_tracker.record_fail("구글시트")
-        # 구글 드라이브
-        try:
-            DRIVE_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(DRIVE_REPORT_PATH,"w",encoding="utf-8") as f:
-                f.write("\n".join(drive_lines))
-        except Exception as e:
-            log.error(f"드라이브 저장 실패: {e}")
         # 스마트 알림
         raw_str  = "".join(r[3] for r in rows if r[1]=="보유")
         cur_hash = hashlib.md5(raw_str.encode()).hexdigest()
@@ -5437,7 +5372,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.4 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.5 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -5500,7 +5435,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.4 가동</b>\n"
+        f"🚀 <b>Edge Score v39.5 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
