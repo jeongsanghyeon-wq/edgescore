@@ -2210,10 +2210,7 @@ def tg(text: str, silent: bool = False):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage",
             json={"chat_id": TELEGRAM["chat_id"], "text": text + _ds_footer(),
-                  "parse_mode": "HTML", "disable_notification": silent,
-                  "reply_markup": {"inline_keyboard": [
-                      [{"text": "📋 메인메뉴", "callback_data": "menu"}]
-                  ]}},
+                  "parse_mode": "HTML", "disable_notification": silent},
             timeout=10,
         )
         err_tracker.record_ok("텔레그램")
@@ -2258,7 +2255,8 @@ MAIN_MENU = [
      {"text": "❓ 도움말",         "callback_data": "help"}],
     [{"text": "🟢 실제투자 실행",  "callback_data": "trading_real"},
      {"text": "🔵 모의투자 전환",  "callback_data": "trading_mock"}],
-    [{"text": "🔴 비상정지",       "callback_data": "emergency_stop"}],
+    [{"text": "🔍 연결 확인",      "callback_data": "check_connection"},
+     {"text": "🔴 비상정지",       "callback_data": "emergency_stop"}],
 ]
 
 # ══════════════════════════════════════════════════
@@ -2342,6 +2340,7 @@ class TelegramCommander:
             "opt_last":           self._optimizer_last,
             "trading_real":       self._trading_real,
             "trading_mock":       self._trading_mock,
+            "check_connection":   self._check_connection,
             "emergency_stop":     self._emergency_stop,
         }
         if cmd in dispatch:
@@ -3811,6 +3810,60 @@ class TelegramCommander:
     # ════════════════════════════════════════════
     # 투자 모드 전환 / 비상정지
     # ════════════════════════════════════════════
+
+    def _check_connection(self):
+        """🔍 연결 확인 — 현재 모의/실계좌 접속 상태 및 예수금 조회"""
+        kw = kiwoom()
+        if not kw:
+            tg("❌ 키움 클라이언트 연결 실패\nkiwoom_client.py를 확인해주세요.")
+            return
+
+        mode_icon = "🔵" if kw._mock else "🟢"
+        mode_str  = "모의투자" if kw._mock else "실제투자(실계좌)"
+        host_str  = kw._host
+        account   = kw._account or "계좌번호 없음"
+
+        # 토큰 발급 확인
+        token_ok = kw._ensure_token()
+        token_str = "✅ 정상" if token_ok else "❌ 실패"
+
+        # 예수금 조회 (실제 API 호출)
+        deposit = 0
+        deposit_str = "조회 실패"
+        try:
+            deposit = kw.get_deposit()
+            deposit_str = f"{deposit:,}원" if deposit > 0 else "0원 (장마감 또는 잔고없음)"
+        except Exception as e:
+            deposit_str = f"오류: {str(e)[:40]}"
+
+        # 잔고 조회
+        balance = []
+        try:
+            balance = kw.get_balance()
+        except Exception:
+            pass
+
+        msg = (
+            f"{mode_icon} <b>키움 연결 확인</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📡 모드: <b>{mode_str}</b>\n"
+            f"🏦 계좌: {account}\n"
+            f"🌐 서버: {host_str}\n"
+            f"🔑 토큰: {token_str}\n"
+            f"💰 예수금: {deposit_str}\n"
+        )
+        if balance:
+            msg += f"\n📦 <b>보유종목 ({len(balance)}개)</b>\n"
+            for b in balance[:5]:
+                sign = "+" if b["pnl"] >= 0 else ""
+                msg += (f"• {b['name']} {b['qty']}주 "
+                        f"{sign}{b['pnl_pct']:.1f}%\n")
+            if len(balance) > 5:
+                msg += f"  ... 외 {len(balance)-5}개\n"
+        else:
+            msg += "\n📦 보유종목 없음\n"
+
+        tg(msg)
 
     def _trading_real(self):
         """🟢 실제투자 실행 — 모의 → 실계좌 전환"""
