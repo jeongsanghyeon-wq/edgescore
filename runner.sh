@@ -32,6 +32,10 @@ cd /Users/jeongsanghyeon/Desktop/edgescore
 
 while true
 do
+    # 재시작 전 잔여 프로세스 정리 (5000 포트 충돌 방지)
+    pkill -f dashboard_api 2>/dev/null
+    sleep 1
+
     echo "============================================================"
     echo "🚀 [$(date '+%Y년 %m월 %d일 %A %H시 %M분 %S초 KST')] Edge Score 엔진 기동 시작..."
     echo "============================================================"
