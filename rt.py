@@ -2210,7 +2210,10 @@ def tg(text: str, silent: bool = False):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage",
             json={"chat_id": TELEGRAM["chat_id"], "text": text + _ds_footer(),
-                  "parse_mode": "HTML", "disable_notification": silent},
+                  "parse_mode": "HTML", "disable_notification": silent,
+                  "reply_markup": {"inline_keyboard": [
+                      [{"text": "📋 메인메뉴", "callback_data": "menu"}]
+                  ]}},
             timeout=10,
         )
         err_tracker.record_ok("텔레그램")
