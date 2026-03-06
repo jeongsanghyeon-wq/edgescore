@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 
 // ── CONFIG (자동 감지) ──
 // Tailscale IP를 여기에 한 번만 입력하세요 (맥미니에서 tailscale ip -4 로 확인)
-const TAILSCALE_IP = "100.64.0.2"; // ← 본인 맥미니 Tailscale IP로 변경
+const TAILSCALE_IP = "100.84.228.61"; // ← 본인 맥미니 Tailscale IP로 변경
 const RT_PORT = 5000;
 
 // 자동 감지: localhost/127.0.0.1/맥미니LAN IP → 로컬, 그 외 → Tailscale
