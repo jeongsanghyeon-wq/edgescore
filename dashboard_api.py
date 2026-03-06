@@ -1,5 +1,5 @@
 """
-Edge Score v39.3 — Dashboard API Server v1.2
+Edge Score v39.4 — Dashboard API Server v1.4
 =============================================================
 v1.0 → v1.1 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -12,6 +12,10 @@ v1.1 → v1.2 변경사항:
   [2] 버그수정 — sell_opinion 타임스탑 기준 하드코딩 7일 → config TIME_STOP_DAYS 연동
   [3] 버그수정 — ts_candidates ret 필드 없을 때 fallback 처리
   [4] 최적화 — _calc_hold_days 헬퍼 모듈레벨 이동, 중복 호출 제거
+
+v1.2 → v1.4 변경사항:
+  [1] /api/today_trades — SQLite trade_history.db 기반 오늘 체결내역 API 추가
+      (매수/매도 건수, 체결가, 실현손익, 승률 포함)
 
 사용법: rt.py main에서
   from dashboard_api import start_dashboard
@@ -138,8 +142,10 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         wt_cache = _safe_attr("_weekly_trend_cache", {})
+        # 현재 활성 데이터 소스
+        _ds = getattr(_rt_module, "_data_source_status", {})
         return {
-            "version": "v39.2", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.4", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -147,6 +153,8 @@ def _create_app():
             "capital_floor_ratio": C.get("CAPITAL_FLOOR_RATIO", 0.70),
             "weekly_trend_up": sum(1 for v in wt_cache.values() if v),
             "weekly_trend_total": len(wt_cache),
+            "data_source": _ds.get("source", "확인중"),
+            "data_source_ok": _ds.get("ok", False),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -675,25 +683,88 @@ def _create_app():
         rt = _rt_module
         sources = []
         test_tk = "005930"
+
+        # 현재 활성 데이터 소스 (rt.py _data_source_status)
+        _ds = getattr(rt, "_data_source_status", {})
+        active_source = _ds.get("source", "확인중")
+
+        # ① 키움 (최우선)
         try:
-            if hasattr(rt, "FDR_OK") and rt.FDR_OK:
-                sources.append({"name": "FDR (일봉)", "status": "ok", "icon": "✅"})
+            kw = rt.kiwoom() if hasattr(rt, "kiwoom") else None
+            if kw:
+                kp = kw.get_price(test_tk)
+                kiwoom_ok = kp and kp > 0
+                sources.append({
+                    "name": "키움 실시간",
+                    "status": "ok" if kiwoom_ok else "no_data",
+                    "icon": "✅" if kiwoom_ok else "⚠️",
+                    "last_price": kp if kiwoom_ok else 0,
+                    "active": active_source == "키움(실시간)",
+                    "priority": 1,
+                })
             else:
-                sources.append({"name": "FDR", "status": "unavailable", "icon": "❌"})
-        except:
-            sources.append({"name": "FDR", "status": "error", "icon": "❌"})
+                sources.append({"name": "키움 실시간", "status": "unavailable",
+                                 "icon": "❌", "active": False, "priority": 1})
+        except Exception:
+            sources.append({"name": "키움 실시간", "status": "error",
+                             "icon": "❌", "active": False, "priority": 1})
+
+        # ② 네이버 크롤링
         try:
-            p = rt.get_current_price(test_tk)
-            sources.append({"name": "네이버 실시간", "status": "ok" if p > 0 else "no_data", "icon": "✅" if p > 0 else "⚠️", "last_price": round(p) if p > 0 else 0})
-        except:
-            sources.append({"name": "네이버 실시간", "status": "error", "icon": "❌"})
+            p = rt._fetch_naver_realtime(test_tk) if hasattr(rt, "_fetch_naver_realtime") else 0
+            sources.append({
+                "name": "네이버 실시간",
+                "status": "ok" if p > 0 else "no_data",
+                "icon": "✅" if p > 0 else "⚠️",
+                "last_price": round(p) if p > 0 else 0,
+                "active": active_source == "네이버(실시간)",
+                "priority": 2,
+            })
+        except Exception:
+            sources.append({"name": "네이버 실시간", "status": "error",
+                             "icon": "❌", "active": False, "priority": 2})
+
+        # ③ FDR
         try:
-            if hasattr(rt, "PYKRX_OK") and rt.PYKRX_OK:
-                sources.append({"name": "pykrx (폴백)", "status": "ok", "icon": "✅"})
-            else:
-                sources.append({"name": "pykrx", "status": "unavailable", "icon": "⚠️"})
-        except:
-            sources.append({"name": "pykrx", "status": "unknown", "icon": "⚠️"})
+            fdr_ok = hasattr(rt, "FDR_OK") and rt.FDR_OK
+            sources.append({
+                "name": "FDR (일봉)",
+                "status": "ok" if fdr_ok else "unavailable",
+                "icon": "✅" if fdr_ok else "❌",
+                "active": active_source == "FDR(일봉)",
+                "priority": 3,
+            })
+        except Exception:
+            sources.append({"name": "FDR (일봉)", "status": "error",
+                             "icon": "❌", "active": False, "priority": 3})
+
+        # ④ pykrx
+        try:
+            pykrx_ok = hasattr(rt, "PYKRX_OK") and rt.PYKRX_OK
+            sources.append({
+                "name": "pykrx (폴백)",
+                "status": "ok" if pykrx_ok else "unavailable",
+                "icon": "✅" if pykrx_ok else "⚠️",
+                "active": False,
+                "priority": 4,
+            })
+        except Exception:
+            sources.append({"name": "pykrx (폴백)", "status": "unknown",
+                             "icon": "⚠️", "active": False, "priority": 4})
+
+        # ⑤ yfinance
+        try:
+            yf_ok = hasattr(rt, "YF_OK") and rt.YF_OK
+            sources.append({
+                "name": "yfinance (최종폴백)",
+                "status": "ok" if yf_ok else "unavailable",
+                "icon": "✅" if yf_ok else "⚠️",
+                "active": False,
+                "priority": 5,
+            })
+        except Exception:
+            sources.append({"name": "yfinance (최종폴백)", "status": "unknown",
+                             "icon": "⚠️", "active": False, "priority": 5})
 
         param_log_file = Path("param_changes.json")
         param_history = []
@@ -734,11 +805,39 @@ def _create_app():
 
         return {
             "data_sources": sources,
+            "active_source": active_source,
             "param_history": param_history[-20:],
             "current_params": params,
             "cache_info": cache_info,
             "uptime": datetime.now().isoformat(),
         }
+
+    @app.route("/api/today_trades")
+    def api_today_trades():
+        """오늘 체결내역 — SQLite trade_history.db 기반 (캐시 제외, 항상 최신)"""
+        try:
+            rt = _rt_module
+            rows = rt.db_query_today()
+            summary = rt.db_daily_summary()
+            buys  = [r for r in rows if r.get("action") == "buy"]
+            sells = [r for r in rows if r.get("action") == "sell"]
+            return {
+                "date":       str(date.today()),
+                "buy_count":  summary["buy_count"],
+                "sell_count": summary["sell_count"],
+                "total_pnl":  round(summary["total_pnl"]),
+                "win_rate":   round(summary["win_rate"], 4),
+                "buys":  [{"ticker": r["ticker"], "name": r["name"],
+                           "price": r["price"], "shares": r["shares"],
+                           "reason": r["reason"]} for r in buys],
+                "sells": [{"ticker": r["ticker"], "name": r["name"],
+                           "price": r["price"], "shares": r["shares"],
+                           "pnl": round(r["pnl"]), "ret": round(r["ret"], 4),
+                           "reason": r["reason"]} for r in sells],
+            }
+        except Exception as e:
+            return {"error": str(e), "buy_count": 0, "sell_count": 0,
+                    "total_pnl": 0, "win_rate": 0, "buys": [], "sells": []}
 
     return app
 

@@ -183,12 +183,13 @@ export default function Dashboard(){
     [watch,setWatch]=useState([]),[alerts,setAlerts]=useState([]),[perf,setPerf]=useState(null),
     [def,setDef]=useState(null),[kospi,setKospi]=useState(null),[risk,setRisk]=useState(null),
     [market,setMarket]=useState(null),[sentiment,setSentiment]=useState(null),[system,setSystem]=useState(null),
-    [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null);
+    [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null),
+    [todayTrades,setTodayTrades]=useState(null);
 
   const fetchAll=useCallback(async(signal)=>{
     const s=await api("/status",signal);if(!s){setConn(false);return;}setConn(true);setSt(s);
-    const [p,w,a,pf,d,k,r,m,se,sy]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal)]);
-    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);
+    const [p,w,a,pf,d,k,r,m,se,sy,tt]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal),api("/today_trades",signal)]);
+    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);if(tt)setTodayTrades(tt);
   },[]);
 
   useEffect(()=>{const ac=new AbortController();fetchAll(ac.signal);const iv=setInterval(()=>{fetchAll(ac.signal);setTime(new Date())},TICK);return()=>{ac.abort();clearInterval(iv)}},[fetchAll]);
@@ -314,6 +315,25 @@ export default function Dashboard(){
                 </tr>)}</tbody></table>}
             </div>
           )}
+
+          {/* ── 오늘 체결내역 ── */}
+          {todayTrades&&(todayTrades.buy_count>0||todayTrades.sell_count>0)&&(
+            <div style={{background:'#111827',border:'1px solid #1e293b',borderRadius:8,padding:12,marginTop:10}}>
+              <div style={{fontWeight:700,fontSize:12,marginBottom:8,color:'#e2e8f0'}}>📋 오늘 체결내역</div>
+              <div style={{display:'flex',gap:16,marginBottom:8,flexWrap:'wrap'}}>
+                <span style={{fontSize:11,color:'#64748b'}}>🟢 매수 <b style={{color:'#22c55e'}}>{todayTrades.buy_count}건</b></span>
+                <span style={{fontSize:11,color:'#64748b'}}>🔴 매도 <b style={{color:'#ef4444'}}>{todayTrades.sell_count}건</b></span>
+                {todayTrades.sell_count>0&&<span style={{fontSize:11,color:'#64748b'}}>손익 <b style={{color:todayTrades.total_pnl>=0?'#22c55e':'#ef4444'}}>{todayTrades.total_pnl>=0?'+':''}{todayTrades.total_pnl.toLocaleString()}원</b></span>}
+                {todayTrades.sell_count>0&&<span style={{fontSize:11,color:'#64748b'}}>승률 <b style={{color:'#3b82f6'}}>{(todayTrades.win_rate*100).toFixed(0)}%</b></span>}
+              </div>
+              {todayTrades.sells.length>0&&<div style={{display:'flex',flexDirection:'column',gap:4}}>
+                {todayTrades.sells.map((s,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'#94a3b8',borderTop:'1px solid #1e293b',paddingTop:4}}>
+                  <span>{s.name} ({s.ticker})</span>
+                  <span style={{color:s.pnl>=0?'#22c55e':'#ef4444'}}>{s.pnl>=0?'+':''}{s.pnl.toLocaleString()}원 | {s.reason}</span>
+                </div>)}
+              </div>}
+            </div>
+          )}
         </>}
 
         {/* ═══ 신호 ═══ */}
@@ -382,8 +402,9 @@ export default function Dashboard(){
         {tab==="system"&&system&&<><div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>📡 데이터 소스</div>
-            {system.data_sources?.map((s,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #1e293b",fontSize:11}}>
-              <span style={{color:"#94a3b8"}}>{s.icon} {s.name}</span><span style={{color:s.status==="ok"?"#22c55e":"#f97316",fontWeight:600}}>{s.status}</span></div>)}</div>
+            {system.active_source&&<div style={{marginBottom:6,padding:"4px 8px",background:"#22c55e22",border:"1px solid #22c55e44",borderRadius:4,fontSize:10,color:"#22c55e"}}>🟢 현재 사용: <b>{system.active_source}</b></div>}
+            {system.data_sources?.map((s,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #1e293b",fontSize:11,background:s.active?"#22c55e0a":"transparent",paddingLeft:s.active?6:0,borderLeft:s.active?"2px solid #22c55e":"none"}}>
+              <span style={{color:s.active?"#22c55e":"#94a3b8"}}>{s.priority}. {s.icon} {s.name}{s.active?" ← 현재":""}</span><span style={{color:s.status==="ok"?"#22c55e":"#64748b",fontWeight:s.active?700:400}}>{s.status}{s.last_price?" ("+s.last_price.toLocaleString()+"원)":""}</span></div>)}</div>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>⚙️ 파라미터</div>
             {system.current_params&&Object.entries(system.current_params).map(([k,v],i)=>v!=null&&<div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e293b",fontSize:10}}>

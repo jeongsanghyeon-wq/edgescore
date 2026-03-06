@@ -7,7 +7,12 @@ const RT_PORT = 5000;
 
 // 자동 감지: localhost/127.0.0.1/맥미니LAN IP → 로컬, 그 외 → Tailscale
 const _host = window.location.hostname;
-const API = "http://100.84.228.61:5000";
+const _isLocal = ["localhost","127.0.0.1","0.0.0.0",""].includes(_host)
+  || _host.startsWith("192.168.") || _host.startsWith("10.");
+const API = _isLocal
+  ? `http://${_host || "localhost"}:${RT_PORT}`
+  : `http://${TAILSCALE_IP}:${RT_PORT}`;
+
 const TICK = 5000;
 const RM = { BULL:{icon:"📈",label:"상승장",c:"#22c55e"}, SIDE:{icon:"➡️",label:"보합장",c:"#eab308"}, BEAR:{icon:"📉",label:"하락장",c:"#ef4444"} };
 const fmt = n => n?.toLocaleString("ko-KR") ?? "0";
@@ -57,9 +62,9 @@ function CapitalGauge({gauge,mobile}){
       <span style={{fontWeight:700,fontSize:mobile?11:13}}>💰 자본 게이지</span>
       <span style={{color:danger?"#ef4444":"#22c55e",fontWeight:600,fontSize:12}}>{(p*100).toFixed(1)}%</span>
     </div>
-    <div style={{position:"relative",height:20,background:"#1e293b",borderRadius:10}}>
+    <div style={{position:"relative",height:20,background:"#1e293b",borderRadius:10,overflow:"hidden"}}>
       <div style={{height:20,width:`${Math.min(barPct,100)}%`,background:danger?"linear-gradient(90deg,#ef4444,#f97316)":"linear-gradient(90deg,#22c55e,#3b82f6)",borderRadius:10,transition:"width 0.8s"}}/>
-      <div style={{position:"absolute",top:-3,left:`${floorPos}%`,width:"100%",height:26,background:"#ef4444"}}/>
+      <div style={{position:"absolute",top:-3,left:`${floorPos}%`,width:2,height:26,background:"#ef4444"}}/>
       <div style={{position:"absolute",top:-16,left:`${floorPos-2}%`,fontSize:8,color:"#ef4444",fontWeight:600}}>70%</div>
     </div>
     {!mobile&&<div style={{display:"flex",justifyContent:"space-between",marginTop:4,fontSize:9,color:"#64748b"}}><span>₩0</span><span>₩{fmt(floor)}</span><span>₩{fmt(capital)}</span></div>}
@@ -90,7 +95,7 @@ function CorrMatrix({data}){
   const gc=(a,b)=>{const p=pairs.find(p=>(p.a===a&&p.b===b)||(p.a===b&&p.b===a));return p?p.corr:0;};
   const cc=v=>v>=0.7?"#ef4444":v>=0.3?"#f97316":v>=-0.3?"#94a3b8":"#3b82f6";
   return <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",fontSize:10}}>
-    <thead><tr><th></th>{names.map(n=><th key={n} style={{padding:3,color:"#94a3b8",maxWidth:"100vw"}}>{n.slice(0,3)}</th>)}</tr></thead>
+    <thead><tr><th></th>{names.map(n=><th key={n} style={{padding:3,color:"#94a3b8",maxWidth:50}}>{n.slice(0,3)}</th>)}</tr></thead>
     <tbody>{names.map((n1,i)=><tr key={n1}><td style={{padding:3,color:"#94a3b8",fontWeight:600,whiteSpace:"nowrap",fontSize:9}}>{n1.slice(0,4)}</td>
       {names.map((n2,j)=>{const v=gc(n1,n2);return <td key={n2} style={{padding:3,textAlign:"center",background:i===j?"#1e293b":`${cc(v)}22`,color:cc(v),fontWeight:600,borderRadius:3,fontSize:9}}>{v.toFixed(1)}</td>})}</tr>)}</tbody>
   </table></div>;
@@ -103,7 +108,7 @@ function RotationMap({data,mobile}){
   const xs=data.map(d=>d.ret_1w),ys=data.map(d=>d.ret_1m);
   const xn=Math.min(...xs,-0.05),xx=Math.max(...xs,0.05),yn=Math.min(...ys,-0.1),yx=Math.max(...ys,0.1);
   const tx=v=>P+(v-xn)/(xx-xn)*(W-2*P),ty=v=>H-P-(v-yn)/(yx-yn)*(H-2*P);
-  return <svg width={W} height={H} style={{background:"#0f172a",borderRadius:8,maxWidth:"100vw"}}>
+  return <svg width={W} height={H} style={{background:"#0f172a",borderRadius:8,maxWidth:"100%"}}>
     <line x1={P} y1={ty(0)} x2={W-P} y2={ty(0)} stroke="#334155" strokeDasharray="4"/>
     <line x1={tx(0)} y1={P} x2={tx(0)} y2={H-P} stroke="#334155" strokeDasharray="4"/>
     {data.map(d=>{const x=tx(d.ret_1w),y=ty(d.ret_1m);const c=d.ret_1w>0&&d.ret_1m>0?"#22c55e":d.ret_1w<0&&d.ret_1m<0?"#ef4444":"#eab308";
@@ -116,7 +121,7 @@ function TradeCalendar({data}){
   if(!data?.length)return null;
   const cells=[],today=new Date();
   for(let i=90;i>=0;i--){const d=new Date(today);d.setDate(d.getDate()-i);const ds=d.toISOString().slice(0,10);const e=data.find(t=>t.date===ds);const pnl=e?.pnl||0;
-    cells.push(<div key={ds} title={`${ds}: ₩${fmt(pnl)}`} style={{width:"100%",height:8,background:pnl>0?"#166534":pnl<0?"#7f1d1d":"#1e293b",borderRadius:1.5}}/>);}
+    cells.push(<div key={ds} title={`${ds}: ₩${fmt(pnl)}`} style={{width:8,height:8,background:pnl>0?"#166534":pnl<0?"#7f1d1d":"#1e293b",borderRadius:1.5}}/>);}
   return <div><div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:4}}>📅 거래 캘린더 (90일)</div>
     <div style={{display:"flex",flexWrap:"wrap",gap:1.5}}>{cells}</div></div>;
 }
@@ -146,7 +151,7 @@ function EmotionThermo({emotion,mobile}){
 function HoldingCard({h, onSell}){
   return <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12,marginBottom:8}} onClick={()=>onSell(h.ticker)}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-      <div><div style={{fontWeight:700,fontSize:13}}>{h.name}</div><div style={{fontSize:9,color:"#64748b"}}>{h.sector} · {h.hold_days}일째</div></div>
+      <div><div style={{fontWeight:700,fontSize:13}}>{h.name}</div><div style={{fontSize:9,color:"#64748b"}}>{h.sector} · {h.hold_days}일째 · {h.shares}주</div></div>
       <Gauge score={h.edge} size={44}/>
     </div>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
@@ -173,17 +178,18 @@ function HoldingCard({h, onSell}){
 // MAIN DASHBOARD
 // ══════════════════════════════════════
 export default function Dashboard(){
-  const mobile = true; // useIsMobile();
+  const mobile = useIsMobile();
   const [conn,setConn]=useState(false),[st,setSt]=useState(null),[port,setPort]=useState(null),
     [watch,setWatch]=useState([]),[alerts,setAlerts]=useState([]),[perf,setPerf]=useState(null),
     [def,setDef]=useState(null),[kospi,setKospi]=useState(null),[risk,setRisk]=useState(null),
     [market,setMarket]=useState(null),[sentiment,setSentiment]=useState(null),[system,setSystem]=useState(null),
-    [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null);
+    [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null),
+    [todayTrades,setTodayTrades]=useState(null);
 
   const fetchAll=useCallback(async(signal)=>{
     const s=await api("/status",signal);if(!s){setConn(false);return;}setConn(true);setSt(s);
-    const [p,w,a,pf,d,k,r,m,se,sy]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal)]);
-    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);
+    const [p,w,a,pf,d,k,r,m,se,sy,tt]=await Promise.all([api("/portfolio",signal),api("/watchlist",signal),api("/alerts",signal),api("/performance",signal),api("/defense",signal),api("/kospi",signal),api("/risk",signal),api("/market",signal),api("/sentiment",signal),api("/system",signal),api("/today_trades",signal)]);
+    if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);if(tt)setTodayTrades(tt);
   },[]);
 
   useEffect(()=>{const ac=new AbortController();fetchAll(ac.signal);const iv=setInterval(()=>{fetchAll(ac.signal);setTime(new Date())},TICK);return()=>{ac.abort();clearInterval(iv)}},[fetchAll]);
@@ -191,21 +197,21 @@ export default function Dashboard(){
   const r_=RM[st?.regime]||RM.SIDE, sm=port?.summary||{}, hld=port?.holdings||[], emo=sentiment?.emotion;
 
   // ── 연결 실패 ──
-  if(!conn&&!st)return(<div style={{minHeight:"100vh",width:"100%",maxWidth:"100%",width:"100%",background:"#0a0e1a",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",color:"#e2e8f0",fontFamily:"monospace",padding:20}}>
+  if(!conn&&!st)return(<div style={{minHeight:"100vh",background:"#0a0e1a",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",color:"#e2e8f0",fontFamily:"monospace",padding:20}}>
     <div style={{fontSize:48,marginBottom:16}}>📊</div>
     <div style={{fontSize:20,fontWeight:700}}><span style={{color:"#3b82f6"}}>Edge</span><span style={{color:"#94a3b8"}}>Score</span></div>
     <div style={{color:"#64748b",margin:16,textAlign:"center"}}>RT 서버 연결 중...</div>
-    <div style={{background:"#ef444422",border:"1px solid #ef444455",borderRadius:8,padding:"12px 20px",color:"#fca5a5",fontSize:12,textAlign:"center",maxWidth:"100vw"}}>
-      연결 실패<br/><span style={{fontSize:10,color:"#94a3b8"}}>python rt.py 실행 확인<br/>API: {API || "http://100.84.228.61:5000"}</span></div>
+    <div style={{background:"#ef444422",border:"1px solid #ef444455",borderRadius:8,padding:"12px 20px",color:"#fca5a5",fontSize:12,textAlign:"center",maxWidth:320}}>
+      연결 실패<br/><span style={{fontSize:10,color:"#94a3b8"}}>python rt.py 실행 확인<br/>API: {API || location.origin}:5000</span></div>
   </div>);
 
   const P = mobile ? 12 : 16; // padding
 
-  return(<div style={{minHeight:"100vh",width:"100%",maxWidth:"100%",width:"100%",background:"#0a0e1a",color:"#e2e8f0",fontFamily:"'SF Mono','JetBrains Mono',monospace",fontSize:mobile?12:13}}>
+  return(<div style={{minHeight:"100vh",width:"100%",maxWidth:"100%",overflowX:"hidden",background:"#0a0e1a",color:"#e2e8f0",fontFamily:"'SF Mono','JetBrains Mono',monospace",fontSize:mobile?12:13}}>
 
     {/* ── 매도의견 모달 ── */}
     {sellModal&&<div style={{position:"fixed",inset:0,background:"#000000cc",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={()=>setSellModal(null)}>
-      <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:12,padding:20,maxWidth:"100vw",width:"100%"}} onClick={e=>e.stopPropagation()}>
+      <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:12,padding:20,maxWidth:400,width:"100%"}} onClick={e=>e.stopPropagation()}>
         <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
           <span style={{fontSize:15,fontWeight:700}}>{sellModal.name} 매도 의견</span>
           <button onClick={()=>setSellModal(null)} style={{background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:20}}>✕</button></div>
@@ -227,12 +233,14 @@ export default function Dashboard(){
           <div style={{fontSize:mobile?15:18,fontWeight:800}}><span style={{color:"#3b82f6"}}>Edge</span><span style={{color:"#94a3b8"}}>Score</span></div>
           <div style={{background:r_.c+"22",border:`1px solid ${r_.c}55`,borderRadius:5,padding:"2px 8px",fontSize:10,color:r_.c,fontWeight:600}}>{r_.icon}{mobile?"":` ${r_.label}`}</div>
           {st?.circuit_active&&<div style={{background:"#ef444422",border:"1px solid #ef444455",borderRadius:5,padding:"2px 8px",fontSize:9,color:"#ef4444",fontWeight:600,animation:"pulse 2s infinite"}}>🚨{mobile?"":" 서킷브레이커"}</div>}
+          {def?.econ_event?.today&&<div style={{background:"#eab30822",border:"1px solid #eab30855",borderRadius:5,padding:"2px 8px",fontSize:9,color:"#eab308",fontWeight:600}}>📆{mobile?"":" 경제이벤트 당일"}</div>}
+          {!def?.econ_event?.today&&def?.econ_event?.tomorrow&&<div style={{background:"#3b82f622",border:"1px solid #3b82f655",borderRadius:5,padding:"2px 8px",fontSize:9,color:"#3b82f6",fontWeight:600}}>📆{mobile?"":" 내일 경제이벤트"}</div>}
         </div>
         <div style={{display:"flex",alignItems:"center",gap:mobile?8:14,fontSize:mobile?10:11,color:"#64748b"}}>
           {kospi&&<span style={{color:kospi.change>=0?"#22c55e":"#ef4444",fontWeight:600}}>{fmt(kospi.price)} {pct(kospi.change)}</span>}
           {emo&&<span style={{color:emo.score>50?"#ef4444":"#22c55e",fontWeight:600}}>{emo.emoji}{emo.score}°</span>}
           <span>{time.toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"})}</span>
-          <div style={{width:"100%",height:7,borderRadius:"50%",background:conn?"#22c55e":"#ef4444",animation:"pulse 1.5s infinite"}}/>
+          <div style={{width:7,height:7,borderRadius:"50%",background:conn?"#22c55e":"#ef4444",animation:"pulse 1.5s infinite"}}/>
         </div>
       </div>
     </div>
@@ -249,11 +257,19 @@ export default function Dashboard(){
 
         {/* ═══ 포트폴리오 ═══ */}
         {tab==="portfolio"&&<>
-          {/* 카드 (모바일: 2열) */}
-          <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(4,1fr)",gap:mobile?8:10,marginBottom:12}}>
-            {[{l:"평가금",v:`₩${fmt(sm.total_eval)}`,s:mobile?"":`원금 ₩${fmt(sm.total_invested)}`,c:"#3b82f6"},
+          {/* 카드 (모바일: 2열, PC: 3열) */}
+          <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(3,1fr)",gap:mobile?8:10,marginBottom:8}}>
+            {[{l:"평가금",v:`₩${fmt(sm.total_eval)}`,s:`원금 ₩${fmt(sm.total_invested)}`,c:"#3b82f6"},
               {l:"손익",v:`₩${fmt(sm.total_pnl)}`,s:pct(sm.total_ret||0),c:(sm.total_pnl||0)>=0?"#22c55e":"#ef4444"},
-              {l:"하한선",v:`₩${fmt(sm.floor)}`,s:mobile?"":`여유 ₩${fmt(sm.floor_remaining)}`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
+              {l:"가용현금",v:`₩${fmt(sm.available_cash)}`,s:`총자산 ₩${fmt(sm.capital)}`,c:"#f59e0b"}].map((c,i)=>
+              <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
+                <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>
+                <div style={{fontSize:mobile?15:18,fontWeight:700,color:c.c,marginTop:1}}>{c.v}</div>
+                {c.s&&<div style={{fontSize:9,color:"#94a3b8",marginTop:1}}>{c.s}</div>}
+              </div>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(2,1fr)",gap:mobile?8:10,marginBottom:12}}>
+            {[{l:"하한선",v:`₩${fmt(sm.floor)}`,s:`여유 ₩${fmt(sm.floor_remaining)}`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
               {l:"보유",v:`${sm.count||0}개`,s:`트레일링 ${sm.trail_active_count||0}`,c:"#8b5cf6"}].map((c,i)=>
               <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>
@@ -297,6 +313,25 @@ export default function Dashboard(){
                   <td style={{textAlign:"center"}}>{h.trail_active?<span style={{background:"#22c55e22",color:"#22c55e",padding:"2px 6px",borderRadius:4,fontSize:9,fontWeight:600}}>🔺추적</span>:h.atr_alerted?<span style={{background:"#ef444422",color:"#ef4444",padding:"2px 6px",borderRadius:4,fontSize:9,fontWeight:600}}>⚠손절</span>:<span style={{background:"#3b82f622",color:"#3b82f6",padding:"2px 6px",borderRadius:4,fontSize:9,fontWeight:600}}>보유</span>}</td>
                   <td><button onClick={e=>{e.stopPropagation();fetchSell(h.ticker)}} style={{background:"#3b82f622",border:"1px solid #3b82f644",color:"#3b82f6",borderRadius:4,padding:"2px 8px",fontSize:9,cursor:"pointer",fontFamily:"inherit"}}>💬</button></td>
                 </tr>)}</tbody></table>}
+            </div>
+          )}
+
+          {/* ── 오늘 체결내역 ── */}
+          {todayTrades&&(todayTrades.buy_count>0||todayTrades.sell_count>0)&&(
+            <div style={{background:'#111827',border:'1px solid #1e293b',borderRadius:8,padding:12,marginTop:10}}>
+              <div style={{fontWeight:700,fontSize:12,marginBottom:8,color:'#e2e8f0'}}>📋 오늘 체결내역</div>
+              <div style={{display:'flex',gap:16,marginBottom:8,flexWrap:'wrap'}}>
+                <span style={{fontSize:11,color:'#64748b'}}>🟢 매수 <b style={{color:'#22c55e'}}>{todayTrades.buy_count}건</b></span>
+                <span style={{fontSize:11,color:'#64748b'}}>🔴 매도 <b style={{color:'#ef4444'}}>{todayTrades.sell_count}건</b></span>
+                {todayTrades.sell_count>0&&<span style={{fontSize:11,color:'#64748b'}}>손익 <b style={{color:todayTrades.total_pnl>=0?'#22c55e':'#ef4444'}}>{todayTrades.total_pnl>=0?'+':''}{todayTrades.total_pnl.toLocaleString()}원</b></span>}
+                {todayTrades.sell_count>0&&<span style={{fontSize:11,color:'#64748b'}}>승률 <b style={{color:'#3b82f6'}}>{(todayTrades.win_rate*100).toFixed(0)}%</b></span>}
+              </div>
+              {todayTrades.sells.length>0&&<div style={{display:'flex',flexDirection:'column',gap:4}}>
+                {todayTrades.sells.map((s,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'#94a3b8',borderTop:'1px solid #1e293b',paddingTop:4}}>
+                  <span>{s.name} ({s.ticker})</span>
+                  <span style={{color:s.pnl>=0?'#22c55e':'#ef4444'}}>{s.pnl>=0?'+':''}{s.pnl.toLocaleString()}원 | {s.reason}</span>
+                </div>)}
+              </div>}
             </div>
           )}
         </>}
@@ -367,8 +402,9 @@ export default function Dashboard(){
         {tab==="system"&&system&&<><div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>📡 데이터 소스</div>
-            {system.data_sources?.map((s,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #1e293b",fontSize:11}}>
-              <span style={{color:"#94a3b8"}}>{s.icon} {s.name}</span><span style={{color:s.status==="ok"?"#22c55e":"#f97316",fontWeight:600}}>{s.status}</span></div>)}</div>
+            {system.active_source&&<div style={{marginBottom:6,padding:"4px 8px",background:"#22c55e22",border:"1px solid #22c55e44",borderRadius:4,fontSize:10,color:"#22c55e"}}>🟢 현재 사용: <b>{system.active_source}</b></div>}
+            {system.data_sources?.map((s,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #1e293b",fontSize:11,background:s.active?"#22c55e0a":"transparent",paddingLeft:s.active?6:0,borderLeft:s.active?"2px solid #22c55e":"none"}}>
+              <span style={{color:s.active?"#22c55e":"#94a3b8"}}>{s.priority}. {s.icon} {s.name}{s.active?" ← 현재":""}</span><span style={{color:s.status==="ok"?"#22c55e":"#64748b",fontWeight:s.active?700:400}}>{s.status}{s.last_price?" ("+s.last_price.toLocaleString()+"원)":""}</span></div>)}</div>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>⚙️ 파라미터</div>
             {system.current_params&&Object.entries(system.current_params).map(([k,v],i)=>v!=null&&<div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e293b",fontSize:10}}>
@@ -377,10 +413,10 @@ export default function Dashboard(){
       </div>
 
       {/* ── 사이드바 (PC만) ── */}
-      {!mobile&&<div style={{width:"100%",minWidth:260,borderLeft:"1px solid #1e293b",background:"#0f172a",padding:14,overflow:"auto",display:"flex",flexDirection:"column",gap:12}}>
+      {!mobile&&<div style={{width:260,minWidth:260,borderLeft:"1px solid #1e293b",background:"#0f172a",padding:14,overflow:"auto",display:"flex",flexDirection:"column",gap:12}}>
         <div style={{background:"#111827",borderRadius:8,padding:10,border:"1px solid #1e293b"}}>
           <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",marginBottom:6}}>🛡️ 안전장치</div>
-          {[{l:"손절 체크",ok:true},{l:"매수 차단",ok:st?.circuit_active,w:true},{l:"자본 보호",ok:(sm.floor_remaining||0)>0},{l:"금요일 청산",ok:true}].map((i,j)=>
+          {[{l:"손절 체크",ok:true},{l:"매수 차단",ok:st?.circuit_active,w:true},{l:"자본 보호",ok:(sm.floor_remaining||0)>0},{l:"금요일 청산",ok:true},{l:"타임스탑",ok:def?.time_stop?.enabled},{l:"섹터제한",ok:def?.sector_limit?.enabled&&!(def?.sector_limit?.overloaded?.length>0)},{l:"주봉필터",ok:def?.weekly_trend?.enabled},{l:"이벤트감지",ok:!def?.econ_event?.today&&!def?.econ_event?.tomorrow}].map((i,j)=>
             <div key={j} style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}><span style={{color:"#94a3b8"}}>{i.l}</span><span style={{color:i.w&&i.ok?"#ef4444":i.ok?"#22c55e":"#ef4444"}}>{i.w&&i.ok?"🚨":"✅"}</span></div>)}</div>
         {emo&&<div style={{background:emo.score>50?"#450a0a":"#052e16",borderRadius:8,padding:10,border:`1px solid ${emo.score>50?"#ef444433":"#22c55e33"}`}}>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:10}}><span style={{color:"#94a3b8"}}>{emo.emoji} 감정온도</span><span style={{fontWeight:700,color:emo.score>50?"#ef4444":"#22c55e"}}>{emo.score}°</span></div></div>}
@@ -405,7 +441,8 @@ export default function Dashboard(){
       ::-webkit-scrollbar-track{background:#0a0e1a}
       ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
       html{-webkit-text-size-adjust:100%}
-      body{overscroll-behavior:none}
+      body{overscroll-behavior:none;margin:0;padding:0;overflow-x:hidden}
+      #root{max-width:100%!important;width:100%!important;padding:0!important;margin:0!important}
     `}</style>
   </div>);
 }

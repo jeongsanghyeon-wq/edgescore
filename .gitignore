@@ -1,36 +1,30 @@
-# ============================================================
-# Edge Score — .gitignore
-# 아래 파일들은 깃헙에 절대 올라가지 않습니다
-# ============================================================
-
-# ── 민감정보 (절대 업로드 금지) ──────────────────────────
+# 개인정보
 .env
 service_account.json
 
-# ── 런타임 데이터 ─────────────────────────────────────────
-config.json
-positions.json
-trade_log.json
+# 데이터 파일
 trade_history.db
+trade_log.json
+positions.json
 universe_cache.json
-*.db
 
-# ── 로그 ─────────────────────────────────────────────────
+# 로그
 *.log
-realtime.log
-cron.log
 runner_stdout.log
 runner_stderr.log
+realtime.log
 
-# ── Python ───────────────────────────────────────────────
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-.venv/
-venv/
 
-# ── Node / React ─────────────────────────────────────────
+# Node
 node_modules/
-dist/
-build/
+edge-dashboard/node_modules/
+
+# 빌드
+edge-dashboard/dist/
+edge-dashboard/.vite/
 .DS_Store
+.tmp.drivedownload/

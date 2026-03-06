@@ -1,11 +1,6 @@
 """
-Edge Score v39.3 — 완전 통합 엔진
+Edge Score v39.4 — 완전 통합 엔진
 =====================================================
-v39.2 → v39.3 변경사항:
-  [1] env 적용 — TELEGRAM_TOKEN/CHAT_ID를 .env 파일 환경변수로 우선 읽기
-      우선순위: .env > config.json > DEFAULT_CONFIG
-      (python-dotenv 없어도 자동 파싱, GitHub 민감정보 노출 방지)
-
 v37.1 패치:
 
   [버그수정] 장외 보유현황 반복 스팸 수정
@@ -72,33 +67,38 @@ v36.0 기능 전체 유지. 원래 v34 → v36 변경사항:
                  requests schedule gspread oauth2client beautifulsoup4
 """
 
-import os, json, time, logging, hashlib, threading
+import json, time, logging, hashlib, threading, sqlite3
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
 from io import StringIO
 
-# ── .env 로드 (python-dotenv 있으면 자동, 없으면 수동 파싱) ──────────────
-def _load_env():
-    env_file = Path(__file__).parent / ".env"
-    if not env_file.exists():
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(env_file)
-    except ImportError:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-_load_env()
-
 import numpy as np
 import pandas as pd
 import requests
 import schedule
+
+# ── 키움 REST API 클라이언트 ──────────────────────────────────
+try:
+    from kiwoom_client import get_client as _kiwoom_get_client
+    KIWOOM_OK = True
+except ImportError:
+    KIWOOM_OK = False
+    log_tmp = logging.getLogger("rt")
+    log_tmp.warning("[키움] kiwoom_client.py 없음 — 주문 기능 비활성화")
+
+def kiwoom():
+    """키움 클라이언트 싱글턴 반환 (KIWOOM_OK=False면 None)"""
+    if not KIWOOM_OK:
+        return None
+    try:
+        return _kiwoom_get_client()
+    except Exception as e:
+        logging.getLogger("rt").error(f"[키움] 클라이언트 오류: {e}")
+        return None
+
+# 비상정지 플래그 (True면 모든 자동 주문 차단)
+EMERGENCY_STOP = False
 
 try:
     import FinanceDataReader as fdr
@@ -256,49 +256,68 @@ DEFAULT_CONFIG = {
     # ── 네트워크 체크 ─────────────────────────
     "NET_CHECK_URL":      "https://api.telegram.org",
     "NET_CHECK_INTERVAL": 60,   # 초
-
-    # ── 텔레그램 ──────────────────────────────
-    # .env 파일의 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 가 최우선 적용됨
-    # config.json 에 직접 입력해도 동작하지만 .env 사용을 권장
-    "TELEGRAM_TOKEN":   "여기에_봇토큰_입력",
-    "TELEGRAM_CHAT_ID": "여기에_chat_id_입력",
 }
+
+_ENV_ONLY_KEYS = {"TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"}  # .env 전용 — config.json 불저장
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
+            # 개인정보 키는 config.json에서 제거
+            for k in _ENV_ONLY_KEYS:
+                saved.pop(k, None)
             # DEFAULT_CONFIG 기준으로 merge (새 키 = 기본값 보충)
             merged = DEFAULT_CONFIG.copy()
             merged.update(saved)
             # ── 신규 키 감지 → disk 자동 write-back ──────────────────────
-            new_keys = [k for k in merged if k not in saved]
+            new_keys = [k for k in merged if k not in saved and k not in _ENV_ONLY_KEYS]
             if new_keys:
+                save_data = {k: v for k, v in merged.items() if k not in _ENV_ONLY_KEYS}
                 with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                    json.dump(merged, f, ensure_ascii=False, indent=2)
+                    json.dump(save_data, f, ensure_ascii=False, indent=2)
                 log.info(f"[config] 신규 키 {len(new_keys)}개 자동 추가: {new_keys}")
             return merged
         except Exception as e:
             log.warning(f"[config] 로드 실패 ({e}) — 기본값 사용")
-    # 파일 없으면 DEFAULT_CONFIG 전체로 생성
+    # 파일 없으면 DEFAULT_CONFIG 전체로 생성 (env 전용 키 제외)
+    save_data = {k: v for k, v in DEFAULT_CONFIG.items() if k not in _ENV_ONLY_KEYS}
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        json.dump(save_data, f, ensure_ascii=False, indent=2)
     log.info("[config] config.json 생성됨 — 필요 시 수정 후 재시작")
     return DEFAULT_CONFIG.copy()
 
 C = load_config()   # 전역 설정 객체
 
 # ═══════════════════════════════════════════════════
-# ★ 텔레그램 인증정보 — .env 파일 우선, config.json 폴백
-#   우선순위: 환경변수(.env) > config.json > DEFAULT_CONFIG
+# ★ 텔레그램 설정 — .env 파일에서만 로드
 #   TELEGRAM_TOKEN   : BotFather 에서 발급한 봇 토큰
 #   TELEGRAM_CHAT_ID : 본인 텔레그램 chat_id
 # ═══════════════════════════════════════════════════
 
+def _load_env_file():
+    """스크립트 위치 기준 .env 로드"""
+    env_path = Path(__file__).parent / ".env"
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_path)
+    except ImportError:
+        if env_path.exists():
+            with open(env_path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        os.environ.setdefault(_k.strip(), _v.strip())
+
+import os
+import os as _os_tg
+_load_env_file()
+
 TELEGRAM = {
-    "token":   os.environ.get("TELEGRAM_TOKEN",   C["TELEGRAM_TOKEN"]),
-    "chat_id": os.environ.get("TELEGRAM_CHAT_ID", C["TELEGRAM_CHAT_ID"]),
+    "token":   _os_tg.getenv("TELEGRAM_TOKEN",   ""),
+    "chat_id": _os_tg.getenv("TELEGRAM_CHAT_ID", ""),
 }
 
 DRIVE_REPORT_PATH = Path(
@@ -306,9 +325,10 @@ DRIVE_REPORT_PATH = Path(
     "GoogleDrive-jeongsanghyeon@gmail.com/"
     "내 드라이브/EdgeScore/stock_report.txt"
 )
-POSITIONS_FILE = Path("positions.json")
-UNIVERSE_FILE  = Path("universe_cache.json")
-TRADE_LOG_FILE = Path("trade_log.json")
+POSITIONS_FILE   = Path("positions.json")
+UNIVERSE_FILE    = Path("universe_cache.json")
+TRADE_LOG_FILE   = Path("trade_log.json")
+TRADE_DB_FILE    = Path("trade_history.db")
 JSON_KEY_FILE  = "service_account.json"
 SHEET_NAME     = "EdgeScore_Report"
 
@@ -883,22 +903,57 @@ def fetch_kospi_top_by_volume_naver(pool_size: int = 60) -> dict:
 def get_ohlcv(ticker: str, days: int = 90):
     now    = time.time()
     cached = _ohlcv_cache.get(ticker)
-    # [최적화] 장중 60초 / 장외 설정값(기본 300초)
-    eff_ttl = min(60, C["CACHE_TTL_SEC"]) if is_market_hour() else C["CACHE_TTL_SEC"]
+    # 장중 60초 / 장외 3600초(1시간) — 일봉은 하루에 한 번만 바뀜
+    eff_ttl = 60 if is_market_hour() else 3600
     if cached and (now - cached["ts"]) < eff_ttl:
         return cached["df"]
 
     df = None
     start_dt = date.today() - timedelta(days=int(days * 1.8))
 
-    # ── ① FDR (FinanceDataReader) — 1순위 ──────────────────
-    if FDR_OK:
+    # ── ① 키움 API (최우선) — 429 rate limit 시 자동 폴백 ────
+    _kw_rl_key = "_kiwoom_ohlcv_rl"
+    _kw_rl_until = _ohlcv_cache.get(_kw_rl_key, {}).get("until", 0)
+    if now < _kw_rl_until:
+        log.debug(f"[키움] 일봉 rate limit 대기 중 ({int(_kw_rl_until - now)}초 남음)")
+    else:
+        try:
+            kw = kiwoom()
+            if kw:
+                rows = kw.get_ohlcv(ticker, days=days)
+                if rows and len(rows) >= 20:
+                    df = pd.DataFrame({
+                        "종가":   [r["close"]  for r in rows],
+                        "고가":   [r["high"]   for r in rows],
+                        "저가":   [r["low"]    for r in rows],
+                        "거래량": [r["volume"] for r in rows],
+                    }, index=pd.to_datetime([r["date"] for r in rows]))
+                    try:
+                        fnet = fetch_foreign_net_naver(ticker, days)
+                        df["foreign_net"] = (
+                            fnet.reindex(df.index).fillna(0) if len(fnet) > 0 else 0
+                        )
+                    except Exception:
+                        df["foreign_net"] = 0
+                    err_tracker.record_ok(f"kiwoom_ohlcv:{ticker}")
+                    log.debug(f"[키움] 일봉 {ticker} {len(df)}행")
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "허용된 요청 개수를 초과" in emsg or "return_code" in emsg:
+                # 429: 1시간 rate limit 설정
+                _ohlcv_cache[_kw_rl_key] = {"until": now + 3600}
+                log.warning(f"[키움] 일봉 429 rate limit → 1시간 FDR 폴백 전환")
+            else:
+                log.debug(f"[키움] 일봉 실패 {ticker}: {type(e).__name__}")
+            err_tracker.record_fail(f"kiwoom_ohlcv:{ticker}")
+
+    # ── ② FDR (키움 실패 시) ─────────────────────────────────
+    if df is None and FDR_OK:
         try:
             start_s = start_dt.strftime("%Y-%m-%d")
             raw = fdr.DataReader(ticker, start_s)
             if raw is not None and len(raw) >= 20:
                 raw.index = pd.to_datetime(raw.index)
-                # FDR 컬럼: Close, High, Low, Volume (대소문자 혼용 가능)
                 cm = {}
                 for c in raw.columns:
                     cs = str(c).strip()
@@ -911,7 +966,6 @@ def get_ohlcv(ticker: str, days: int = 90):
                         if c in raw.columns]
                 if len(need) == 4:
                     df = raw[need].copy().tail(days)
-                    # 외국인 순매수 — 네이버 크롤링
                     try:
                         fnet = fetch_foreign_net_naver(ticker, days)
                         df["foreign_net"] = (
@@ -924,7 +978,7 @@ def get_ohlcv(ticker: str, days: int = 90):
             log.debug(f"FDR [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"fdr:{ticker}")
 
-    # ── ② pykrx — FDR 실패 시 폴백 ────────────────────────
+    # ── ③ pykrx — FDR 실패 시 폴백 ─────────────────────────
     if df is None and PYKRX_OK:
         try:
             start_s = start_dt.strftime("%Y%m%d")
@@ -943,7 +997,6 @@ def get_ohlcv(ticker: str, days: int = 90):
                 need = [c for c in ["종가", "고가", "저가", "거래량"]
                         if c in raw.columns]
                 df   = raw[need].copy()
-                # 외국인 순매수 — 네이버 크롤링 (pykrx 폴백 내에서도 동일 소스)
                 try:
                     fnet = fetch_foreign_net_naver(ticker, days)
                     df["foreign_net"] = (
@@ -957,7 +1010,7 @@ def get_ohlcv(ticker: str, days: int = 90):
             log.debug(f"pykrx [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"pykrx:{ticker}")
 
-    # ── ③ yfinance — 최종 폴백 ──────────────────────────────
+    # ── ④ yfinance — 최종 폴백 ──────────────────────────────
     if df is None and YF_OK:
         try:
             sym = f"{ticker}.KS"
@@ -1033,21 +1086,42 @@ def _fetch_naver_realtime(ticker: str) -> float:
     return 0.0
 
 def get_current_price(ticker: str) -> float:
-    """실시간 현재가 — ① 네이버 크롤링(장중) ② FDR/pykrx 일봉(폴백)"""
-    now = time.time()
+    """실시간 현재가 — ① 키움 API ② 네이버 크롤링 ③ FDR/pykrx 일봉(폴백)"""
+    now    = time.time()
     cached = _realtime_price_cache.get(ticker)
     if cached and (now - cached["ts"]) < _REALTIME_CACHE_TTL:
         return cached["price"]
     price = 0.0
+
+    # ── ① 키움 API (최우선) ──────────────────────────────────
     if is_market_hour():
+        try:
+            kw = kiwoom()
+            if kw:
+                _kp = kw.get_price(ticker)
+                if _kp and _kp > 0:
+                    price = float(_kp)
+                    _data_source_status["source"] = "키움(실시간)"
+                    _data_source_status["ok"]     = True
+        except Exception as _e:
+            log.debug(f"[키움] 현재가 실패 {ticker}: {_e}")
+
+    # ── ② 네이버 크롤링 (키움 실패 시) ──────────────────────
+    if price <= 0 and is_market_hour():
         price = _fetch_naver_realtime(ticker)
+        if price > 0:
+            _data_source_status["source"] = "네이버(실시간)"
+            _data_source_status["ok"]     = True
+
+    # ── ③ FDR/pykrx 일봉 종가 (최종 폴백) ───────────────────
     if price <= 0:
         df = get_ohlcv(ticker, days=5)
         if df is not None and len(df) > 0:
             price = float(df["종가"].iloc[-1])
             if _data_source_status["source"] == "초기화중":
                 _data_source_status["source"] = "FDR(일봉)"
-                _data_source_status["ok"] = True
+                _data_source_status["ok"]     = True
+
     if price > 0:
         _realtime_price_cache[ticker] = {"price": price, "ts": now}
     return price
@@ -1755,7 +1829,110 @@ def load_trade_log() -> list:
             pass
     return []
 
+def _db_init():
+    """SQLite trade_history.db 테이블 초기화 (없으면 생성)"""
+    try:
+        con = sqlite3.connect(TRADE_DB_FILE)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT,
+                ticker      TEXT,
+                name        TEXT,
+                action      TEXT,
+                price       REAL,
+                shares      INTEGER,
+                pnl         REAL,
+                ret         REAL,
+                reason      TEXT,
+                created_at  TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] 초기화 실패: {e}")
+
+_db_init()
+
+def _db_insert(entry: dict):
+    """거래 내역 SQLite에 삽입"""
+    try:
+        action = entry.get("action", "")
+        # date: exit_date(매도) → entry_date(매수) → today 순서로 fallback
+        _date = (entry.get("exit_date")
+                 or entry.get("entry_date")
+                 or str(date.today()))
+        # price: 매도는 체결가(exit_price), 매수는 매수가(buy_price)
+        if action == "sell":
+            _price = float(entry.get("exit_price") or entry.get("sell_price") or 0)
+        else:
+            _price = float(entry.get("buy_price") or 0)
+        con = sqlite3.connect(TRADE_DB_FILE)
+        con.execute("""
+            INSERT INTO trades (date, ticker, name, action, price, shares, pnl, ret, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _date,
+            entry.get("ticker", ""),
+            entry.get("name", ""),
+            action,
+            _price,
+            int(entry.get("shares", 0)),
+            float(entry.get("pnl", 0)),
+            float(entry.get("ret", 0)),
+            entry.get("reason", ""),
+        ))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.error(f"[DB] 삽입 실패: {e}")
+
+def db_query_today() -> list:
+    """오늘 체결 내역 조회 (list of dict)"""
+    try:
+        con = sqlite3.connect(TRADE_DB_FILE)
+        con.row_factory = sqlite3.Row
+        cur = con.execute(
+            "SELECT * FROM trades WHERE date = ? ORDER BY id",
+            (str(date.today()),)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        con.close()
+        return rows
+    except Exception as e:
+        log.error(f"[DB] 오늘 조회 실패: {e}")
+        return []
+
+def db_daily_summary(target_date: str = None) -> dict:
+    """일별 요약 (매수건수, 매도건수, 실현손익, 승률)"""
+    if target_date is None:
+        target_date = str(date.today())
+    try:
+        con = sqlite3.connect(TRADE_DB_FILE)
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM trades WHERE date = ?", (target_date,)
+        ).fetchall()]
+        con.close()
+        buys  = [r for r in rows if r.get("action") == "buy"]
+        sells = [r for r in rows if r.get("action") == "sell"]
+        pnls  = [r["pnl"] for r in sells if r.get("pnl")]
+        wins  = [p for p in pnls if p > 0]
+        return {
+            "buy_count":  len(buys),
+            "sell_count": len(sells),
+            "total_pnl":  sum(pnls),
+            "win_rate":   len(wins) / len(pnls) if pnls else 0,
+        }
+    except Exception as e:
+        log.error(f"[DB] 일별 요약 실패: {e}")
+        return {"buy_count": 0, "sell_count": 0, "total_pnl": 0, "win_rate": 0}
+
 def append_trade_log(entry: dict):
+    # [설계 의도] positions 저장 직후 기록 → 앱 재시작 시 포지션-로그 일관성 보장
+    # 키움 주문 실패 시 로그는 남지만 positions도 이미 업데이트된 상태이므로 허용
+    # JSON 백업
     logs = load_trade_log()
     logs.append(entry)
     try:
@@ -1763,6 +1940,8 @@ def append_trade_log(entry: dict):
             json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
         log.error(f"거래로그 저장 실패: {e}")
+    # SQLite 동시 기록
+    _db_insert(entry)
 
 def calc_performance(logs: list = None) -> dict:
     if logs is None:
@@ -1834,6 +2013,103 @@ def save_universe(univ: dict):
             json.dump(univ, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error(f"유니버스 저장 실패: {e}")
+
+def _notify_on_fill(order_no: str, ticker: str, name: str,
+                    action: str, qty: int, price: int,
+                    buy_price: float = 0.0,
+                    reason: str = ""):
+    """
+    백그라운드에서 체결 확인 후 텔레그램 알림 발송
+    action: 'buy' or 'sell'
+    buy_price: 매도 시 손익 계산용 매수단가
+    최대 60초간 3초 간격으로 폴링
+    """
+    def _wait_and_notify():
+        kw = kiwoom()
+        if not kw:
+            return
+        _mode   = "모의" if kw._mock else "실계좌"
+        _icon   = "🔵" if kw._mock else "🟢"
+        _action = "매수" if action == "buy" else "매도"
+
+        for _ in range(20):  # 3초 × 20 = 최대 60초
+            time.sleep(3)
+            try:
+                fill = kw.get_order_fill(order_no, ticker)
+                if fill and fill.get("filled"):
+                    cntr_qty = fill["cntr_qty"]
+                    cntr_uv  = fill["cntr_uv"]
+                    cntr_tm  = fill.get("cntr_tm", "")
+                    amount   = cntr_qty * cntr_uv
+
+                    if action == "buy":
+                        msg = (
+                            f"{_icon} <b>[{_mode}] 매수 체결 완료!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 종목: <b>{name}</b> ({ticker})\n"
+                            f"💰 체결가: {cntr_uv:,}원\n"
+                            f"📦 체결수량: {cntr_qty:,}주\n"
+                            f"💵 체결금액: {amount:,}원\n"
+                            f"⏰ 체결시간: {cntr_tm}"
+                        )
+                    else:
+                        # 실제 체결가 기준으로 손익 재계산
+                        _pnl = (cntr_uv - buy_price) * cntr_qty if buy_price > 0 else 0
+                        _ret = (cntr_uv - buy_price) / buy_price if buy_price > 0 else 0
+                        pnl_icon = "✅" if _pnl >= 0 else "🔴"
+                        msg = (
+                            f"{_icon} <b>[{_mode}] 매도 체결 완료!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 종목: <b>{name}</b> ({ticker})\n"
+                            f"{('🔔 사유: ' + reason + chr(10)) if reason else ''}"
+                            f"💰 체결가: {cntr_uv:,}원\n"
+                            f"📦 체결수량: {cntr_qty:,}주\n"
+                            f"💵 체결금액: {amount:,}원\n"
+                            f"{pnl_icon} 손익: {_pnl:+,.0f}원 ({_ret:+.2%})\n"
+                            f"⏰ 체결시간: {cntr_tm}"
+                        )
+                    tg(msg)
+                    return
+            except Exception as e:
+                log.warning(f"[키움] 체결 확인 오류: {e}")
+
+        # 60초 후에도 미체결 → 미체결 알림
+        tg(
+            f"⚠️ <b>[{_mode}] {_action} 미체결</b>\n"
+            f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
+            f"직접 확인이 필요해요."
+        )
+
+    threading.Thread(target=_wait_and_notify, daemon=True).start()
+
+def _get_env_path() -> str:
+    """스크립트 위치 기준 .env 경로 반환"""
+    return str(Path(__file__).parent / ".env")
+
+def _set_env_value(env_path: str, key: str, value: str):
+    """기존 .env 파일에서 특정 키 값을 변경 (없으면 추가)"""
+    try:
+        lines = []
+        found = False
+        if Path(env_path).exists():
+            with open(env_path, "r") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                        lines.append(f"{key}={value}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        if not found:
+            lines.append(f"{key}={value}\n")
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+        # 런타임 환경변수도 즉시 반영
+        import os
+        os.environ[key] = value
+        log.info(f"[.env] {key}={value} 저장 완료")
+    except Exception as e:
+        log.error(f"[.env] 수정 실패: {e}")
 
 def refresh_universe(current_positions: dict) -> dict:
     log.info("🔍 유니버스 자동 갱신 시작...")
@@ -1933,13 +2209,20 @@ def _ret_str(ret: float) -> str:
 # 텔레그램 전송 (버튼 포함 / 미포함)
 # ══════════════════════════════════════════════════
 
+def _ds_footer() -> str:
+    """현재 데이터 소스를 한 줄 푸터로 반환"""
+    src = _data_source_status.get("source", "확인중")
+    ok  = _data_source_status.get("ok", False)
+    icon = "🟢" if ok else "🔴"
+    return f"\n<i>{icon} 데이터: {src}</i>"
+
 def tg(text: str, silent: bool = False):
     if len(TELEGRAM["token"]) < 20 or "여기에" in TELEGRAM["token"]:
         log.warning("[TG 미설정] " + text[:60]); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage",
-            json={"chat_id": TELEGRAM["chat_id"], "text": text,
+            json={"chat_id": TELEGRAM["chat_id"], "text": text + _ds_footer(),
                   "parse_mode": "HTML", "disable_notification": silent},
             timeout=10,
         )
@@ -1955,7 +2238,7 @@ def tg_btn(text: str, buttons: list, silent: bool = False):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM['token']}/sendMessage",
-            json={"chat_id": TELEGRAM["chat_id"], "text": text,
+            json={"chat_id": TELEGRAM["chat_id"], "text": text + _ds_footer(),
                   "parse_mode": "HTML", "disable_notification": silent,
                   "reply_markup": {"inline_keyboard": buttons}},
             timeout=10,
@@ -1983,6 +2266,9 @@ MAIN_MENU = [
      {"text": "⚙️ 설정",           "callback_data": "settings"}],
     [{"text": "🧠 자동 최적화",    "callback_data": "optimizer"},
      {"text": "❓ 도움말",         "callback_data": "help"}],
+    [{"text": "🟢 실제투자 실행",  "callback_data": "trading_real"},
+     {"text": "🔵 모의투자 전환",  "callback_data": "trading_mock"}],
+    [{"text": "🔴 비상정지",       "callback_data": "emergency_stop"}],
 ]
 
 # ══════════════════════════════════════════════════
@@ -2064,6 +2350,9 @@ class TelegramCommander:
             "opt_apply":          self._optimizer_apply,
             "opt_apply_confirm":  self._optimizer_apply_confirm,
             "opt_last":           self._optimizer_last,
+            "trading_real":       self._trading_real,
+            "trading_mock":       self._trading_mock,
+            "emergency_stop":     self._emergency_stop,
         }
         if cmd in dispatch:
             dispatch[cmd]()
@@ -2152,12 +2441,24 @@ class TelegramCommander:
         regime     = self.monitor.regime
         held_cnt   = len(self.monitor.positions)
         market_str = "🟢 장중" if is_market_hour() else "🔴 장 마감"
+
+        # 투자 모드 표시
+        if EMERGENCY_STOP:
+            mode_str = "🔴 비상정지 중"
+        else:
+            kw = kiwoom()
+            if kw and not kw._mock:
+                mode_str = "🟢 실제투자 중"
+            else:
+                mode_str = "🔵 모의투자 중"
+
         tg_btn(
             f"🤖 <b>Edge Score 메인 메뉴</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🕐 {datetime.now().strftime('%H:%M')}  {market_str}\n"
             f"📈 시장: {_regime_plain(regime)}\n"
-            f"💼 현재 보유 종목: {held_cnt}개\n\n"
+            f"💼 현재 보유 종목: {held_cnt}개\n"
+            f"💡 투자 모드: {mode_str}\n\n"
             f"원하는 기능을 눌러주세요 👇",
             MAIN_MENU
         )
@@ -2183,13 +2484,10 @@ class TelegramCommander:
 
         total_pnl  = 0
         total_eval = 0
-        _src = _data_source_status.get("source", "확인중")
-        _si  = "🟢" if _data_source_status.get("ok") else "🔴"
         msg = (f"📊 <b>내 주식 현황</b>\n"
                f"━━━━━━━━━━━━━━━━━━\n"
                f"🕐 {datetime.now().strftime('%H:%M')} 기준\n"
                f"📈 시장: {_regime_plain(regime)}\n"
-               f"{_si} 데이터: {_src}\n"
                f"💡 {_regime_tip(regime)}\n"
                f"━━━━━━━━━━━━━━━━━━\n")
 
@@ -2408,10 +2706,28 @@ class TelegramCommander:
         append_trade_log({
             "action": "buy", "ticker": ticker, "name": name,
             "buy_price": buy_price, "shares": shares, "amount": amount,
+            "date": str(date.today()),       # api_performance equity_curve용
             "entry_date": str(date.today()),
             "exit_price": 0, "hold_days": 0,
             "reason": "추가매수" if is_add else "수동매수",
         })
+
+        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode = "모의" if kw._mock else "실계좌"
+                _res  = kw.buy(ticker, shares, buy_price, order_type="0")
+                if _res.get("success"):
+                    tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
+                       f"종목: {name} | {shares:,}주 | {buy_price:,}원")
+                    _notify_on_fill(
+                        _res.get("order_no", ""), ticker, name,
+                        action="buy", qty=shares, price=buy_price
+                    )
+                else:
+                    tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n종목: {name}")
+        # ─────────────────────────────────────────────────────
 
         kelly_amt = calc_kelly_amount(C["TOTAL_CAPITAL"])
         add_line  = f"\n🔄 추가 매수!  평균단가 → {avg_price:,.0f}원" if is_add else ""
@@ -2585,6 +2901,7 @@ class TelegramCommander:
             "action": "sell", "ticker": ticker, "name": name,
             "buy_price": buy_price, "sell_price": sell_price,
             "shares": sell_shares, "amount": buy_price * sell_shares,
+            "date": str(date.today()),       # api_performance equity_curve용
             "entry_date": entry_date, "exit_date": str(date.today()),
             "exit_price": sell_price, "hold_days": hold_days,
             "ret": round(ret, 4), "pnl": round(pnl, 0),
@@ -2596,6 +2913,24 @@ class TelegramCommander:
             "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
             "carry_over":   False,
         })
+
+        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode = "모의" if kw._mock else "실계좌"
+                _res  = kw.sell(ticker, sell_shares, sell_price, order_type="0")
+                if _res.get("success"):
+                    tg(f"📨 [{_mode}] 매도주문 접수 → 체결 대기 중...\n"
+                       f"종목: {name} | {sell_shares:,}주 | {sell_price:,}원")
+                    _notify_on_fill(
+                        _res.get("order_no", ""), ticker, name,
+                        action="sell", qty=sell_shares, price=sell_price,
+                        buy_price=buy_price
+                    )
+                else:
+                    tg(f"⚠️ [{_mode}] 매도주문 실패: {_res.get('error','')}\n종목: {name}")
+        # ─────────────────────────────────────────────────────
 
         if is_partial:
             remain = total_shares - sell_shares
@@ -3484,6 +3819,63 @@ class TelegramCommander:
                  {"text": "🔙 돌아가기",       "callback_data": "optimizer"}]])
 
     # ════════════════════════════════════════════
+    # 투자 모드 전환 / 비상정지
+    # ════════════════════════════════════════════
+
+    def _trading_real(self):
+        """🟢 실제투자 실행 — 모의 → 실계좌 전환"""
+        import os
+        global EMERGENCY_STOP
+        EMERGENCY_STOP = False  # 비상정지 해제
+
+        env_path = _get_env_path()
+        _set_env_value(env_path, "KIWOOM_MOCK", "false")
+
+        # 싱글턴 리셋 → 다음 호출 시 실계좌로 재연결
+        import kiwoom_client as _kc
+        _kc._client = None
+
+        tg_btn(
+            "🟢 <b>실제투자 모드로 전환했어요!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ 지금부터 모든 매수·매도가\n"
+            "<b>실계좌</b>에 실제 주문으로 전송됩니다.\n\n"
+            "🔴 중단하려면 비상정지 버튼을 누르세요.",
+            [[{"text": "🔴 비상정지",      "callback_data": "emergency_stop"},
+              {"text": "🏠 메인 메뉴",     "callback_data": "menu"}]]
+        )
+
+    def _trading_mock(self):
+        """🔵 모의투자 전환 — 실계좌 → 모의 복귀"""
+        env_path = _get_env_path()
+        _set_env_value(env_path, "KIWOOM_MOCK", "true")
+
+        import kiwoom_client as _kc
+        _kc._client = None
+
+        tg_btn(
+            "🔵 <b>모의투자 모드로 전환했어요!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "✅ 지금부터 모든 주문이 모의계좌로 전송됩니다.\n"
+            "실계좌에는 영향이 없어요.",
+            [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
+        )
+
+    def _emergency_stop(self):
+        """🔴 비상정지 — 모든 자동 주문 즉시 중단"""
+        global EMERGENCY_STOP
+        EMERGENCY_STOP = True
+        tg_btn(
+            "🔴 <b>비상정지 완료!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "✅ 모든 자동 매수·매도 주문이 중단됐어요.\n"
+            "보유종목은 그대로 유지됩니다.\n\n"
+            "⚠️ 재개하려면 메인 메뉴에서\n"
+            "🟢실제투자 또는 🔵모의투자를 선택하세요.",
+            [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
+        )
+
+    # ════════════════════════════════════════════
     # 유니버스 추가·제거 (텍스트 전용)
     # ════════════════════════════════════════════
     def _add(self, ticker_raw: str):
@@ -3664,6 +4056,7 @@ class EdgeMonitor:
             "sell_price": exit_price,
             "shares":     shares,
             "amount":     amount,
+            "date":       str(date.today()),   # api_performance equity_curve용
             "entry_date": entry_date,
             "exit_date":  str(date.today()),
             "exit_price": exit_price,
@@ -3671,33 +4064,36 @@ class EdgeMonitor:
             "ret":         round(ret, 4),
             "pnl":         round(pnl, 0),
             "reason":      reason,
-            "regime":      getattr(self, "regime", "SIDE"),  # 옵티마이저 국면별 분석용
-            "edge_at_exit": info.get("last_edge", 0),         # 옵티마이저 이월 시뮬레이션용
-            # [New-A] cluster: Optimizer가 종목별 실전 슬리피지를 정확히 계산하도록 저장
+            "regime":      getattr(self, "regime", "SIDE"),
+            "edge_at_exit": info.get("last_edge", 0),
             "cluster":     _cluster_name,
-            # [Fix-BUG-1] atr_mult_orig: Optimizer ATR 역산 오류 수정
-            #       대형주(실제 1.2)/기술대형주(1.5) 손절선 과소평가 → 그리드 서치 왜곡
-            # 수정: 청산 시점 실제 적용된 ATR 배수를 기록 → OPT simulate_params에서 정확히 재스케일
             "atr_mult_orig": get_atr_mult_rt(_cluster_name),
-            # [Fix-BUG-2] carry_over 논리 역전 수정
-            #       그러나 이 조건은 is_friday_hold_ok()=True → 포지션이 청산되지 않는 조건과 동일
-            #       즉 실제 청산 trade_log가 생성되는 시점에는 절대 True가 될 수 없음 (논리 역전)
-            # 수정: 실제 청산 trade_log는 항상 carry_over=False
-            #       RT에는 BT의 "주간이월(보유유지)" 더미 로그 개념 자체가 없음
             "carry_over":   False,
-            # [이월 모순 수정] trail_active 저장
-            # BT/RT 이월 조건: trail_active OR edge >= thr_eff
-            # OPT 이전: edge >= thr_eff 만 사용 → trail_active 기반 이월 과소 추정
-            # 수정: trail_active를 trade_log에 저장 → OPT simulate_params에서 정확히 재현
             "trail_active": bool(info.get("trail_active", False)),
         })
         self.today_exited.add(ticker)   # ③ 당일 재진입 차단
 
-    # ── 보유 종목 체크 (1분, 장중) ─────────────────
-    def check_holdings(self):
-        if not is_market_hour() or not self.positions:
-            return
-
+        # ── 키움 자동 실주문 + 체결 대기 알림 ───────────────
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode   = "모의" if kw._mock else "실계좌"
+                _shares = int(info.get("shares", 0))
+                _bp     = float(info.get("buy_price", 0))
+                _pnl    = (exit_price - _bp) * _shares if _bp > 0 else 0
+                _ret    = (exit_price - _bp) / _bp if _bp > 0 else 0
+                _name   = info.get("name", ticker)
+                if _shares > 0:
+                    _res = kw.sell(ticker, _shares, exit_price, order_type="3")  # 시장가
+                    if _res.get("success"):
+                        tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
+                        _notify_on_fill(
+                            _res.get("order_no", ""), ticker, _name,
+                            action="sell", qty=_shares, price=exit_price,
+                            buy_price=_bp, reason=reason
+                        )
+                    else:
+                        tg(f"⚠️ [{_mode}] 자동매도 실패: {_res.get('error','')}\n종목: {_name}")
         alerts = []
         for ticker, info in list(self.positions.items()):
             name   = info.get("name", resolve_name(ticker))
@@ -3706,13 +4102,11 @@ class EdgeMonitor:
             if cp <= 0 and df is not None:
                 cp = float(df["종가"].iloc[-1])
             if cp <= 0: continue
-
             buy_p  = float(info.get("buy_price", cp))
             shares = int(info.get("shares", 0))
             ret    = (cp - buy_p) / buy_p if buy_p > 0 else 0
             atr    = calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = calc_dynamic_sl(atr, cp, ticker, self.regime)
-
             # [C-2/C-3 수정] atr_alerted / trail_alerted 회복 시 자동 리셋
             # 가격이 손절선 위로 회복되면 alerted 초기화 → 다음 손절 사이클 알림 재활성화
             if info.get("atr_alerted") and ret > dyn_sl + 0.01:
@@ -3729,7 +4123,6 @@ class EdgeMonitor:
                 _sl_price_check = cp * (1 + dyn_sl)
                 if cp > _sl_price_check * 1.02:   # 손절가 대비 2% 이상 회복
                     info.pop(_sl_warn_key, None)
-
             # ── 미매도 후속 분석 ─────────────────────────
             # 손절/트레일링 알림 후 아직 보유 중이면, N분 뒤 추세 재분석
             _sl_at = info.get("sl_alert_time")
@@ -3741,14 +4134,12 @@ class EdgeMonitor:
                     _al_type  = info.get("sl_alert_type", "손절")
                     _chg = (cp - _al_price) / _al_price if _al_price > 0 else 0
                     _pnl_now = (cp - buy_p) * shares
-
                     # 최근 거래량 분석
                     _vol_ratio = 1.0
                     if df is not None and len(df) >= 20:
                         _vol_avg = df["거래량"].iloc[-20:].mean()
                         _vol_now = df["거래량"].iloc[-1]
                         _vol_ratio = _vol_now / _vol_avg if _vol_avg > 0 else 1.0
-
                     if _chg < -0.01:
                         # Case 1: 추가 하락 중
                         _capital_floor = C.get("TOTAL_CAPITAL", 10_000_000) * C.get("CAPITAL_FLOOR_RATIO", 0.70)
@@ -3818,11 +4209,9 @@ class EdgeMonitor:
                             f"🛡️ <b>확인이 늦어져도 시스템이 지키고 있어요</b>\n"
                             f"  다음 체크까지 1분마다 자동 모니터링 중이에요."
                         )
-
                     tg(_advice)
                     info["sl_followup_sent"] = True
                     log.info(f"[후속분석] {name} {_al_type} 후 {_elapsed_min:.0f}분 경과 → {_chg:+.1%}")
-
             # ② 수익 구간별 알림 (익절 통합)
             alerted_steps = info.get("alerted_steps", [])
             for step in C["PROFIT_ALERT_STEPS"]:
@@ -3837,7 +4226,6 @@ class EdgeMonitor:
                                        f"   더 오를 수 있지만 언제든 내릴 수 있어요")
                     else:
                         action_line = f"💡 수익이 나고 있어요! 다음 목표: +{next_target:.0%}"
-
                     trail_hint = (
                         "\n🔺 트레일링이 활성화돼 수익을 자동으로 지키고 있어요"
                         if info.get("trail_active") else
@@ -3858,7 +4246,6 @@ class EdgeMonitor:
                     )
                     alerted_steps.append(step)
             info["alerted_steps"] = alerted_steps
-
             # 트레일링 (trail_alerted = 이미 알림 발송됨 → 매분 반복 방지)
             trail_exit, trail_reason = update_trailing(
                 info, cp, atr, self.regime)
@@ -3899,12 +4286,10 @@ class EdgeMonitor:
                         f"   원칙대로 손절·익절 기준을 지켜주세요"
                     )
                 continue
-
             # ATR 손절
             sl_price_now = cp * (1 + dyn_sl)
             if np.isnan(sl_price_now) or sl_price_now <= 0:
                 sl_price_now = cp * 0.93
-
             # ㊳ 타임스탑 체크 (ATR/트레일링 미발동 상태에서 장기 무변동 시)
             if not info.get("trail_active") and not info.get("atr_alerted"):
                 _entry_ts = info.get("entry_date", "")
@@ -3932,7 +4317,6 @@ class EdgeMonitor:
                     )
                     info["timestop_alerted"] = True
                     self._log_exit(ticker, info, cp, "타임스탑")
-
             if ret <= dyn_sl and not info.get("atr_alerted"):
                 pnl = (cp - buy_p) * shares
                 alerts.append(
@@ -3969,7 +4353,6 @@ class EdgeMonitor:
                        f"💡 연속 손절은 운이 나쁜 게 아니라\n"
                        f"   시장 흐름이 바뀌었다는 신호일 수 있어요")
                     self.today_alerts += 1
-
             # ── 원칙2: 최대 보유일 경고 ──────────────────────────
             # FIX-3: 타임스탑 이미 발동된 종목은 MAX_HOLD 경고 skip (알림 중복 방지)
             _entry_d  = info.get("entry_date", "")
@@ -3990,7 +4373,6 @@ class EdgeMonitor:
                     f"💡 금요일 15:20에 최종 알림이 와요"
                 )
                 info["max_hold_warned"] = True
-
             # ── last_edge 갱신 (옵티마이저 이월 시뮬레이션용) ──
             # [C-1 수정] elif → if 블록 내부로 통합
             # 이전: elif df is not None → 위 if가 True면 영구 미실행
@@ -3999,7 +4381,6 @@ class EdgeMonitor:
                 _ka_le   = fetch_kind_sentiment(ticker)
                 _edge_le = calculate_edge_v27(df, _ka_le, ticker)
                 info["last_edge"] = round(_edge_le, 4)
-
                 # ── AI 점수 급락 매도 경보 (SELL_EDGE_THRESHOLD) ──
                 # 백테스트와 동일: edge < SELL_EDGE_THRESHOLD 시 보유 의미 없음
                 # 이미 계산된 _edge_le 재사용 → API 중복 호출 방지
@@ -4023,7 +4404,6 @@ class EdgeMonitor:
                     info["sell_edge_alerted"] = True
                 elif edge_now >= sell_thr:
                     info.pop("sell_edge_alerted", None)  # 점수 회복 시 초기화
-
             # ── 손절가 95% 접근 사전 경보 ── (독립 if로 분리)
             if cp <= sl_price_now * (1 / 0.95) and cp > sl_price_now:
                 approach_pct = (cp - sl_price_now) / sl_price_now
@@ -4046,20 +4426,17 @@ class EdgeMonitor:
                         f"   스탑로스를 설정해두면 자동으로 보호돼요"
                     )
                     info[warned_key] = True
-
             # 고정 익절 — 수익 구간 알람에 통합됨
             elif (not info.get("trail_active")
                   and ret >= C["TAKE_PROFIT_FIXED"]
                   and C["TAKE_PROFIT_FIXED"] not in info.get("alerted_steps", [])):
                 pass  # 위 수익 구간 알람에서 처리됨
-
             # 거래량 급증 (보유 정보 포함)
             if df is not None and ticker not in self.vol_alerted:
                 surge = check_vol_surge(df, ticker, name, held_info=info)
                 if surge:
                     alerts.append(surge)
                     self.vol_alerted.add(ticker)
-
         # ㊱ 서킷브레이커: 당일 전체 평가손 체크
         if C.get("CIRCUIT_BREAKER_ENABLED", True):
             _total_inv = sum(float(i.get("buy_price",0)) * int(i.get("shares",0))
@@ -4090,9 +4467,7 @@ class EdgeMonitor:
                            f"  ✅ 금요일에 전체 정리 판단을 해드려요\n\n"
                            f"💬 <b>지금 당장 아무것도 안 해도 괜찮아요</b>\n"
                            f"   시스템이 계속 지켜보고 있어요")
-
         save_positions(self.positions)
-
         # 포트폴리오 리스크 (1일 1회만 발송)
         _risk_key = f"_portfolio_risk_{date.today()}"
         if not getattr(self, _risk_key, False):
@@ -4100,24 +4475,20 @@ class EdgeMonitor:
             if risk_alerts:
                 alerts.extend(risk_alerts)
                 setattr(self, _risk_key, True)
-
         for alert in alerts:
             tg(alert); self.today_alerts += 1; time.sleep(0.3)
-
     # ── 유니버스 스캔 (5분, 장중) ──────────────────
     def scan_universe(self, force_notify: bool = False):
         if not is_market_hour() and not force_notify:
             return
-
         now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows         = []
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
             self.regime, "❓")
         drive_lines  = [
-            f"🤖 Edge Score v39.2 ({now})",
+            f"🤖 Edge Score v39.4 ({now})",
             f"국면: {self.regime} | 유니버스: {len(self.universe)}개",
         ]
-
         # 보유 종목 현황
         drive_lines.append("\n[보유 종목]")
         for ticker, info in self.positions.items():
@@ -4134,7 +4505,6 @@ class EdgeMonitor:
             drive_lines.append(
                 f"  • {name}: {cp:,.0f}원 ({ret:+.2f}%) "
                 f"Edge={edge:.3f}{tm} {shares:,}주")
-
         # 유니버스 스캔 → 추천 (③ 당일 청산 종목 제외)
         drive_lines.append("\n[AI 추천]")
         held   = set(self.positions.keys())
@@ -4143,24 +4513,19 @@ class EdgeMonitor:
         _econ_today_dt = date.today()
         _econ_list_cached = C.get("ECON_EVENTS_2025_2026", [])
         _econ_today_flag = (_econ_today_dt.month, _econ_today_dt.day) in [tuple(e) for e in _econ_list_cached]
-
-
         for ticker, name in self.universe.items():
             if ticker in held: continue
             if ticker in self.today_exited: continue   # ③ 재진입 차단
             df = get_ohlcv(ticker, days=60)
             if df is None or len(df) < 20: continue
             time.sleep(0.15)   # [IP 차단 방지] 종목 간 150ms 간격
-
             # [New-C] 신호 생성: 확정봉 데이터만 사용 (장중 미완성봉 배제)
             df_signal = get_closed_df(df)
             if df_signal is None or len(df_signal) < 20: continue
-
             kind_adj        = fetch_kind_sentiment(ticker)
             edge            = calculate_edge_v27(df_signal, kind_adj, ticker)
             cp              = float(df["종가"].iloc[-1])   # 표시용 현재가는 원본 df (최신값)
             slip_ok, exp, req = check_slippage_filter(df_signal, ticker)
-
             # ⑦ Edge 급등 + 매수 타이밍 통합
             prev       = self.prev_edge.get(ticker, edge)
             edge_surge = edge - prev
@@ -4183,7 +4548,6 @@ class EdgeMonitor:
                    f"   수급·기술·모멘텀이 동시에 좋아졌다는 신호예요")
                 self.today_alerts += 1
             self.prev_edge[ticker] = edge
-
             # 거래량 급증 (미보유 종목 — held_info 없음)
             if ticker not in self.vol_alerted:
                 surge_msg = check_vol_surge(df_signal, ticker, name)
@@ -4191,7 +4555,6 @@ class EdgeMonitor:
                     tg(surge_msg)
                     self.vol_alerted.add(ticker)
                     self.today_alerts += 1
-
             # ㉝ RSI 다이버전스 감점
             if df_signal is not None and len(df_signal) > 40:  # FIX-1: RSI rolling(20)+rolling(14) 유효값 확보
                 _rsi = 100 - (100 / (1 + df_signal["종가"].diff().clip(lower=0).rolling(14).mean() /
@@ -4202,7 +4565,6 @@ class EdgeMonitor:
                     _rsi_dec = float(_rsi.iloc[-1]) < float(_rsi.rolling(20).max().iloc[-1])
                 if _price_high and _rsi_dec:
                     edge -= C.get("RSI_DIVERGENCE_PENALTY", 0.08)
-
             # ㉞ 섹터 로테이션 보너스/감점
             _sec = get_sector_for_ticker_rt(ticker)
             # 간이 섹터 모멘텀: 유니버스에서 같은 섹터 종목 평균 edge
@@ -4217,17 +4579,13 @@ class EdgeMonitor:
                     edge += C.get("SECTOR_MOMENTUM_BONUS", 0.05)
                 elif _sec_avg < 0.4:
                     edge -= C.get("SECTOR_MOMENTUM_PENALTY", 0.03)
-
             thr = get_regime_threshold(self.regime)
-
             # ㊶ 경제 이벤트 당일 커트라인 상향 (STEP3: 루프 밖 _econ_today_flag 참조)
             if _econ_today_flag:
                 thr += C.get("ECON_EVENT_EDGE_UPLIFT", 0.10)
-
             # ㊱ 서킷브레이커 (당일 전체 평가 -5% 초과 시 추천 중단)
             if C.get("CIRCUIT_BREAKER_ENABLED", True) and hasattr(self, "_circuit_active") and self._circuit_active:
                 continue
-
             # ㊴ 섹터 집중도 제한
             if C.get("SECTOR_LIMIT_ENABLED", True) and _sec != "기타":
                 _sec_count = sum(1 for _ht, _hi in self.positions.items()
@@ -4235,13 +4593,11 @@ class EdgeMonitor:
                 _sec_max = C.get("SECTOR_MAX_POSITIONS", 2)
                 if _sec_count >= _sec_max:
                     continue  # 섹터 한도 초과 → 추천 제외
-
             # ㉟ 멀티 타임프레임 필터 (FIX-2: 캐시 참조 → 연산 제거)
             if C.get("WEEKLY_TREND_REQUIRED", True):
                 _wt_ok = self._weekly_trend_cache.get(ticker, True)
                 if not _wt_ok:
                     continue  # 주봉 하락추세 → 추천 제외
-
             if edge >= thr and slip_ok:
                 guide = calc_entry_guide(df_signal, ticker, self.regime)
                 scored.append({
@@ -4251,7 +4607,6 @@ class EdgeMonitor:
                     "guide": guide,
                     "df": df_signal,   # 추천 상세 표시용도 — 확정봉 기준 유지
                 })
-
         scored.sort(key=lambda x: x["edge"], reverse=True)
         top5 = scored[:5]
         for i, s in enumerate(top5):
@@ -4265,7 +4620,6 @@ class EdgeMonitor:
             drive_lines.append(
                 f"  {i+1}. {s['name']}: {s['edge']:.3f}점"
                 f" ({s['price']:,.0f}원) 기대{s['expected']:.1%}{split_hint}")
-
         # 구글 시트
         try:
             if self.sheet:
@@ -4277,7 +4631,6 @@ class EdgeMonitor:
         except Exception as e:
             log.error(f"시트 저장 실패: {e}")
             err_tracker.record_fail("구글시트")
-
         # 구글 드라이브
         try:
             DRIVE_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -4285,7 +4638,6 @@ class EdgeMonitor:
                 f.write("\n".join(drive_lines))
         except Exception as e:
             log.error(f"드라이브 저장 실패: {e}")
-
         # 스마트 알림
         raw_str  = "".join(r[3] for r in rows if r[1]=="보유")
         cur_hash = hashlib.md5(raw_str.encode()).hexdigest()
@@ -4318,7 +4670,6 @@ class EdgeMonitor:
                             f"   💰 매수 적정가: {entry_str}\n"
                             f"   🎯 목표가: {target_str}\n"
                             f"   🛑 손절가: {sl_str}\n")
-
             # ── 교체 의견: 보유 종목보다 추천 종목이 훨씬 나을 때 ──
             if top5 and self.positions:
                 switch_msgs = []
@@ -4360,10 +4711,8 @@ class EdgeMonitor:
                 if switch_msgs:
                     msg += "\n━━━━━━━━━━━━━━━━━━\n"
                     msg += "\n".join(switch_msgs)
-
             tg(msg, silent=(not force_notify))
             self.last_hash = cur_hash
-
     # ── 장 외 간단 체크 ───────────────────────────
     def offhours_check(self):
         """
@@ -4375,20 +4724,16 @@ class EdgeMonitor:
         """
         if is_market_hour() or not self.positions:
             return
-
         # 장 시작 전(00:00~15:34)은 전송하지 않음
         # → 새벽에 30분마다 동일 메시지가 반복되는 문제 방지
         now_hhmm = datetime.now().strftime("%H:%M")
         if now_hhmm < "15:35":
             return
-
         lines = [f"💤 <b>현재 보유 현황</b>  (장 마감 후)\n"
                  f"🕐 {datetime.now().strftime('%H:%M')} 기준"]
-
         for ticker, info in self.positions.items():
             name  = info.get("name", resolve_name(ticker))
             buy_p = float(info.get("buy_price", 0))
-
             # 장 외 시간 실시간 가격 조회 시 0원 반환 문제 방지
             # → ohlcv_cache 마지막 종가 우선 사용, 없으면 매수가로 표시
             cp = 0.0
@@ -4397,24 +4742,20 @@ class EdgeMonitor:
                 cp = float(cached["df"]["종가"].iloc[-1])
             if cp <= 0:
                 cp = buy_p   # 마지막 수단: 매수가 표시 (수익률 0%)
-
             ret    = (cp - buy_p) / buy_p if buy_p > 0 else 0
             tm     = " 🔺" if info.get("trail_active") else ""
             r_icon = "✅" if ret >= 0 else "🔴"
             price_note = " (전일 종가)" if cp == buy_p else ""
             lines.append(f"  • {name}  {r_icon} {ret:+.2%}"
                          f"  {cp:,.0f}원{price_note}{tm}")
-
         # 내용 해시 비교 — 변화 없으면 전송 안 함
         content = "\n".join(lines[1:])   # 시간 제외하고 비교
         cur_hash = hashlib.md5(content.encode()).hexdigest()
         if cur_hash == self.last_offhours_hash:
             log.debug("[장외체크] 변화 없음 — 전송 스킵")
             return
-
         self.last_offhours_hash = cur_hash
         tg("\n".join(lines), silent=True)
-
     # ── 일간 결산 리포트 (15:35 통합) ────────────
     def close_report(self):
         if not is_trading_day():
@@ -4425,7 +4766,6 @@ class EdgeMonitor:
         regime_name = {"BULL": "상승장", "SIDE": "보합장", "BEAR": "하락장"}.get(self.regime, "")
         total_pnl  = 0
         total_eval = 0
-
         # 요일 + 남은 거래일 컨텍스트
         _wd_names = {0:"월",1:"화",2:"수",3:"목",4:"금"}
         _wd_today = date.today().weekday()
@@ -4437,12 +4777,10 @@ class EdgeMonitor:
             _day_ctx = "⚠️ 내일(금요일)이 이번 주 마지막 거래일이에요 — 정리 준비하세요"
         else:
             _day_ctx = f"📅 {_wd_str}요일 | 이번 주 남은 거래일: {_remain}일"
-
         msg = (f"📊 <b>오늘 하루 결산</b>  |  {now}\n"
                f"━━━━━━━━━━━━━━━━━━\n"
                f"{regime_icon} {regime_name}  |  오늘 알림 {self.today_alerts}건\n"
                f"{_day_ctx}\n")
-
         if self.positions:
             for ticker, info in self.positions.items():
                 name   = info.get("name", resolve_name(ticker))
@@ -4457,14 +4795,12 @@ class EdgeMonitor:
                 eval_v = cp * shares
                 total_pnl  += pnl
                 total_eval += eval_v
-
                 df_sl    = get_ohlcv(ticker, days=30)
                 atr      = calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
                 sl_price = round(cp * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
                     sl_price = round(cp * 0.93, -1)
-
                 r_icon = "✅" if ret >= 0 else "🔴"
                 tm_str = "  🔺추적중" if info.get("trail_active") else ""
                 msg += (f"\n📌 <b>{name}</b>{tm_str}\n"
@@ -4472,14 +4808,12 @@ class EdgeMonitor:
                         f"   {r_icon} 오늘 손익: {pnl:+,.0f}원 ({ret:.2%})\n"
                         f"   🛑 내일 스탑로스: <b>{sl_price:,.0f}원</b>\n"
                         f"      (트레이딩 앱에 꼭 설정해두세요)\n")
-
             tot_icon = "✅" if total_pnl >= 0 else "🔴"
             msg += (f"━━━━━━━━━━━━━━━━━━\n"
                     f"{tot_icon} 총 평가손익: <b>{total_pnl:+,.0f}원</b>\n"
                     f"💼 평가금액: {total_eval:,.0f}원\n")
         else:
             msg += "\n💵 보유 주식 없음\n   내일 AI 추천 종목을 확인해보세요!\n"
-
         # 내일 주목 예비
         preview = []
         for ticker, name in list(self.universe.items())[:15]:
@@ -4493,9 +4827,7 @@ class EdgeMonitor:
             msg += "\n⭐ <b>내일 주목 종목</b>\n"
             for i, (nm, eg) in enumerate(preview[:3], 1):
                 msg += f"  {i}. {nm}  {int(eg*100)}점\n"
-
         msg += "\n💡 내일 08:40에 상세 전략 보고가 와요"
-
         # ── 미대응 안심 리포트 ─────────────────────
         # 장중 손절/트레일링 알림이 있었는데 아직 보유 중인 종목이 있으면
         # "대응 못 해도 괜찮다"는 안심 메시지 추가 발송
@@ -4508,13 +4840,11 @@ class EdgeMonitor:
                 if _cp <= 0: _cp = _bp
                 _ret = (_cp - _bp) / _bp if _bp > 0 else 0
                 _unacted.append((_nm, _ret))
-
         if _unacted:
             _capital = C.get("TOTAL_CAPITAL", 10_000_000)
             _floor = _capital * C.get("CAPITAL_FLOOR_RATIO", 0.70)
             _wd_today2 = date.today().weekday()
             _fri_left = 4 - _wd_today2 if _wd_today2 < 4 else 0
-
             _safe_msg = (
                 f"\n\n🛡️ <b>오늘 알림에 대응하지 못하셨나요?</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -4523,29 +4853,40 @@ class EdgeMonitor:
             )
             for _nm, _ret in _unacted:
                 _safe_msg += f"  · {_nm}: {_ret:+.2%}\n"
-
             _safe_msg += (
                 f"\n🔒 <b>지금도 작동 중인 안전장치</b>\n"
                 f"  ✅ 추가 매수: 서킷브레이커가 이미 차단했어요\n"
                 f"  ✅ 자본 보호: 최소 {_floor:,.0f}원은 절대 보존돼요\n"
                 f"  ✅ 내일도 1분마다 자동 체크를 이어가요\n"
             )
-
             if _fri_left > 0:
                 _safe_msg += f"  ✅ 금요일까지 {_fri_left}일 남았어요 — 금요일에 전체 정리 판단\n"
             else:
                 _safe_msg += f"  ✅ 오늘이 금요일이에요 — 주간 리포트에서 종목별 정리/이월 안내\n"
-
             _safe_msg += (
                 f"\n💬 <b>급락장에서 가장 나쁜 선택은 패닉셀이에요</b>\n"
                 f"  시장은 항상 회복했어요. 규칙대로 가면 됩니다.\n"
                 f"  시간이 되실 때 천천히 확인하세요."
             )
             tg(_safe_msg)
-
         tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
+        # ── 오늘 체결내역 요약 (SQLite) ───────────
+        _summary = db_daily_summary()
+        if _summary["buy_count"] > 0 or _summary["sell_count"] > 0:
+            _pnl_icon = "✅" if _summary["total_pnl"] >= 0 else "🔴"
+            _trade_msg = (
+                f"📋 <b>오늘 체결내역</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🟢 매수: {_summary['buy_count']}건\n"
+                f"🔴 매도: {_summary['sell_count']}건\n"
+            )
+            if _summary["sell_count"] > 0:
+                _trade_msg += (
+                    f"{_pnl_icon} 실현손익: {_summary['total_pnl']:+,.0f}원\n"
+                    f"🏆 승률: {_summary['win_rate']:.1%}"
+                )
+            tg(_trade_msg)
         self.today_alerts = 0
-
     # ── ⑧ 주간 성과 집계 (금요일 15:35) ─────────
     def weekly_report(self):
         """㊵ 주간 성과 분석 리포트 (강화판)"""
@@ -4559,7 +4900,6 @@ class EdgeMonitor:
                       and t.get("exit_price", 0) > 0]
         week_perf  = calc_performance(this_week)
         total_perf = calc_performance(logs)
-
         # 다음주 주목 예비 (Edge 상위 3)
         preview = []
         for ticker, name in list(self.universe.items())[:15]:
@@ -4569,7 +4909,6 @@ class EdgeMonitor:
             edge = calculate_edge_v27(df)
             preview.append((name, edge))
         preview.sort(key=lambda x: -x[1])
-
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
             self.regime, "❓")
         msg = (f"📅 <b>주간 성과 리포트</b>\n"
@@ -4592,7 +4931,6 @@ class EdgeMonitor:
         carry_over  = {tk: info for tk, info in self.positions.items()
                        if info.get("entry_date","") < _this_mon_s}
         cleared     = len([t for t in this_week])  # 이번 주 청산
-
         if carry_over:
             msg += f"\n📌 <b>다음 주 이월 종목: {len(carry_over)}개</b>\n"
             for tk, info in carry_over.items():
@@ -4604,19 +4942,16 @@ class EdgeMonitor:
                 _ok, _reason = is_friday_hold_ok(tk, info, cp)
                 _tag = "✅ 보유유지" if _ok else "⚠️ 다음주 정리"
                 msg += f"  {_tag} | {nm}  {ret:+.2%}\n"
-
         if preview[:3]:
             msg += "\n⭐ <b>다음주 미리 볼 종목</b>\n"
             for nm, eg in preview[:3]:
                 msg += f"  ⭐ {nm}: {eg:.3f}점\n"
         tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
-
         # ── 월 1회 자동 최적화 (매월 마지막 금요일) ─────────
         today     = date.today()
         next_fri  = today + timedelta(days=7)
         if next_fri.month != today.month:   # 이번달 마지막 금요일
             self._run_auto_optimizer()
-
     # ── 자동 최적화 실행 ─────────────────────────────
     # ── 원칙1+2: 월요일 자본 재계산 + 새 주 시작 알림 (08:35) ──────────
     def monday_reset(self):
@@ -4631,18 +4966,14 @@ class EdgeMonitor:
         if not C.get("WEEKLY_CAPITAL_RESET", True):
             return
         log.info("🗓️ 월요일 자본 재계산")
-
         old_cap = C.get("TOTAL_CAPITAL", 10_000_000)
         new_cap = calc_effective_capital(self.positions)
         new_cap = round(max(new_cap, old_cap * C.get("CAPITAL_FLOOR_RATIO", 0.70)), -4)
-
         _save_cfg_direct("TOTAL_CAPITAL", new_cap)
         C = load_config()
-
         pnl   = new_cap - old_cap
         icon  = "📈" if pnl >= 0 else "📉"
         ret_s = f"{pnl/old_cap:+.2%}" if old_cap > 0 else "+0.00%"
-
         # 전주 성적
         logs    = load_trade_log()
         w_start = str(date.today() - timedelta(days=7))
@@ -4651,7 +4982,6 @@ class EdgeMonitor:
                    and t.get("exit_price", 0) > 0]
         lw_p    = calc_performance(lw)
         regime_e = {"BULL": "📈", "SIDE": "➡️", "BEAR": "📉"}.get(self.regime, "❓")
-
         tg(
             f"🗓️ <b>새로운 한 주 시작!</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -4667,7 +4997,6 @@ class EdgeMonitor:
             f"💪 이번 주도 원칙대로 시작해요!\n"
             f"   (이번 주 보유 종목은 금요일 전에 정리)"
         )
-
     # ── 원칙2: 목요일 사전 정리 경보 (15:00) ────────────────────────────
     # ── 수요일 중간 점검 (15:35) ────────────────────────────
     def wednesday_midcheck(self):
@@ -4675,7 +5004,6 @@ class EdgeMonitor:
         if not is_trading_day() or date.today().weekday() != 2:
             return
         log.info("📊 수요일 중간 점검")
-
         # 이번 주 월요일부터 오늘까지 거래 성적
         logs      = load_trade_log()
         _this_mon = date.today() - timedelta(days=date.today().weekday())  # 이번 주 월요일 (weekday 기반)
@@ -4683,7 +5011,6 @@ class EdgeMonitor:
                      if t.get("exit_date", "") >= str(_this_mon)
                      and t.get("exit_price", 0) > 0]
         wp = calc_performance(this_week)
-
         regime_e = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(self.regime,"❓")
         _remaining = get_remaining_trading_days()   # 공휴일 포함 동적 계산
         msg = (
@@ -4697,7 +5024,6 @@ class EdgeMonitor:
             f"  누적 손익: {wp['total_pnl']:+,.0f}원\n"
             f"━━━━━━━━━━━━━━━━━━\n"
         )
-
         if self.positions:
             msg += "<b>📌 현재 보유 종목</b>\n"
             for ticker, info in self.positions.items():
@@ -4726,9 +5052,7 @@ class EdgeMonitor:
             )
         else:
             msg += "💵 현재 보유 종목 없음\n"
-
         tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
-
     def thursday_warning(self):
         """
         투자원칙 2: 목요일 15:00 — 미청산 종목 사전 경보
@@ -4739,7 +5063,6 @@ class EdgeMonitor:
         if not self.positions or not C.get("FRIDAY_FORCE_EXIT", True):
             return
         log.info("⚠️ 목요일 사전 정리 경보")
-
         lines = [
             "⚠️ <b>내일(금요일)이 마감일이에요!</b>",
             "━━━━━━━━━━━━━━━━━━",
@@ -4755,7 +5078,6 @@ class EdgeMonitor:
             ret  = (cp - buy_p) / buy_p if buy_p > 0 else 0
             pnl  = (cp - buy_p) * shares
             icon = "✅" if ret >= 0 else "🔴"
-
             if info.get("timestop_alerted"):
                 advice = "⏱️ 타임스탑 발동됨 — 즉시 매도 권장"
             elif info.get("trail_active"):
@@ -4766,7 +5088,6 @@ class EdgeMonitor:
                 advice = "⚠️ 손실 중 — 손절선 확인 후 정리"
             else:
                 advice = "💡 내일 장 중 적절한 시점에 정리"
-
             lines.append(
                 f"\n📌 <b>{name}</b>\n"
                 f"   {icon} {ret:+.2%}  ({pnl:+,.0f}원)\n"
@@ -4778,7 +5099,6 @@ class EdgeMonitor:
             "   15:20에 미청산 종목 최종 알림이 와요",
         ]
         tg_btn("\n".join(lines), [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
-
     # ── 원칙2: 금요일 강제 청산 최종 알림 (15:20) ───────────────────────
     def friday_force_exit(self):
         """
@@ -4790,7 +5110,6 @@ class EdgeMonitor:
         if not C.get("FRIDAY_FORCE_EXIT", True):
             return
         log.info("🚨 금요일 강제 청산 최종 알림")
-
         if not self.positions:
             tg(
                 "✅ <b>이번 주 모든 종목 정리 완료!</b>\n"
@@ -4800,7 +5119,6 @@ class EdgeMonitor:
                 "새 자본금과 함께 새롭게 시작해요 💪"
             )
             return
-
         # ── 수정된 원칙2: 보유 유지 / 청산 분류 ──
         hold_tickers   = {}   # 보유 유지 (수익+AI점수 양호)
         exit_tickers   = {}   # 청산 필요
@@ -4812,7 +5130,6 @@ class EdgeMonitor:
                 hold_tickers[ticker] = (info, cp, reason)
             else:
                 exit_tickers[ticker] = (info, cp, reason)
-
         # ── 청산 필요 종목 알림 ──
         if exit_tickers:
             lines = [
@@ -4839,7 +5156,6 @@ class EdgeMonitor:
                 "⏰ 장마감까지 10분! 지금 매도해주세요",
             ]
             tg("\n".join(lines))
-
         # ── 보유 유지 종목 알림 (+ 주말 갭 리스크 경고) ──
         if hold_tickers:
             lines = [
@@ -4870,7 +5186,6 @@ class EdgeMonitor:
                 "  → 월요일 08:40 아침 보고에서 재확인해드려요",
             ]
             tg("\n".join(lines))
-
         # ── 전체 정리 완료 시 ──
         if not exit_tickers and not hold_tickers:
             tg(
@@ -4880,7 +5195,6 @@ class EdgeMonitor:
                 "다음 주 월요일 08:35에\n"
                 "새 자본금과 함께 새롭게 시작해요 💪"
             )
-
     def _run_auto_optimizer(self, dry_run: bool = False):
         """
         실거래 결과 분석 → 파라미터 자동 최적화
@@ -4892,23 +5206,18 @@ class EdgeMonitor:
         if _argv_lock is None:
             self._optimizer_argv_lock = threading.Lock()
             _argv_lock = self._optimizer_argv_lock
-
         def _run():
             try:
                 log.info("🤖 자동 최적화 시작")
                 tg("🤖 <b>월간 자동 최적화 시작...</b>\n실거래 데이터를 분석하고 있어요")
-
                 opt_file = Path(__file__).parent / "edge_optimizer.py"
                 if not opt_file.exists():
                     tg("❌ edge_optimizer.py 파일이 없어요\n같은 폴더에 놓아주세요")
                     return
-
                 import importlib.util
                 import sys as _sys
-
                 spec = importlib.util.spec_from_file_location("optimizer", opt_file)
                 opt  = importlib.util.module_from_spec(spec)
-
                 # [Issue-8 수정] sys.argv 임계구역 — Lock 보호 + 복원 보장
                 with _argv_lock:
                     _orig_argv = _sys.argv[:]           # 원본 보존
@@ -4920,12 +5229,10 @@ class EdgeMonitor:
                         spec.loader.exec_module(opt)    # ← 모듈 수준 argv 읽기 완료 후 즉시 복원
                     finally:
                         _sys.argv = _orig_argv          # 반드시 원복 (예외 발생 시에도)
-
                 trades = opt.load_trades()
                 if not trades:
                     tg("⚠️ 분석할 거래 데이터가 없어요\n거래가 쌓이면 자동으로 실행돼요")
                     return
-
                 stats        = opt.calc_stats(trades)
                 diagnose_sug = opt.diagnose(stats)
                 # BUG-D 수정: current_cfg 로드를 grid_search 전으로 이동
@@ -4935,11 +5242,9 @@ class EdgeMonitor:
                 updates      = opt.merge_recommendations(grid_result, diagnose_sug, current_cfg)
                 updates      = {k: v for k, v in updates.items()
                                 if v is not None and current_cfg.get(k) != v}
-
                 if not updates:
                     tg("✅ <b>자동 최적화 완료</b>\n현재 설정이 이미 최적 상태예요!")
                     return
-
                 if not dry_run:
                     # config.json 업데이트
                     prev_cfg  = opt.update_config(updates)
@@ -4964,13 +5269,10 @@ class EdgeMonitor:
                         lines.append(f"  {k}: {old} → {v}")
                     lines += ["", "✅ 적용하려면 텔레그램에서\n[최적화 적용] 버튼을 눌러주세요"]
                     tg("\n".join(lines))
-
             except Exception as e:
                 log.error(f"자동 최적화 오류: {e}")
                 tg(f"❌ 자동 최적화 중 오류 발생\n{str(e)[:100]}")
-
         threading.Thread(target=_run, daemon=True).start()
-
     # ── 아침 전략 보고 ────────────────────────────
     def morning_report(self):
         # ㊱ 서킷브레이커 매일 해제 + 해제 알림
@@ -4981,7 +5283,6 @@ class EdgeMonitor:
                "안전을 위해 매수를 멈췄었어요\n\n"
                "오늘부터 다시 좋은 종목이 나오면\n"
                "매수 추천을 보내드릴게요 💪")
-
         # FIX-2: 주봉 추세 캐시 갱신 (하루 1회, 아침에 계산)
         self._weekly_trend_cache = {}
         for ticker in self.universe:
@@ -5001,7 +5302,6 @@ class EdgeMonitor:
                 self._weekly_trend_cache[ticker] = True
         log.info(f"  주봉추세 캐시 갱신: {sum(self._weekly_trend_cache.values())}"
                  f"/{len(self._weekly_trend_cache)} 상승추세")
-
         # FIX-4: 유니버스 vs SECTOR_MAP 동기화 검증
         _unmapped = [tk for tk in self.universe
                      if get_sector_for_ticker_rt(tk) == "기타"]
@@ -5020,10 +5320,8 @@ class EdgeMonitor:
                f"미등록: {', '.join(_unmapped[:5])}{'...' if len(_unmapped) > 5 else ''}")
         log.info("🌅 아침 전략 보고")
         self.update_regime()
-
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(self.regime,"❓")
         now_str      = datetime.now().strftime("%m/%d %H:%M")
-
         # ── ① 보유 종목 손절가 안내 ──────────────────────────
         _tp = _fetch_naver_realtime("005930")
         _src_txt = (f"🟢 네이버 실시간 ({_tp:,.0f}원)" if _tp > 0
@@ -5067,18 +5365,15 @@ class EdgeMonitor:
                 if cached and cached["df"] is not None:
                     cp_cached = float(cached["df"]["종가"].iloc[-1])
                 cp = cp_cached if cp_cached > 0 else buy_p
-
                 atr      = calc_atr(df) if df is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
                 sl_price = round(cp * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
                     sl_price = round(cp * 0.93, -1)
-
                 ret      = (cp - buy_p) / buy_p if buy_p > 0 else 0
                 pnl      = (cp - buy_p) * shares
                 r_icon   = "✅" if ret >= 0 else "🔴"
                 trail_str = " 🔺트레일링 중" if info.get("trail_active") else ""
-
                 # 이월 종목 판단 (지난 주 매수)
                 _entry = info.get("entry_date", "")
                 _today = date.today()
@@ -5086,7 +5381,6 @@ class EdgeMonitor:
                 _this_monday = _today - timedelta(days=_today.weekday())
                 _is_carry = (_entry < str(_this_monday)) if _entry else False
                 _carry_tag = " <b>[이월]</b>" if _is_carry else ""
-
                 # 이월 종목 안내 (금요일 판단은 금요일 실시간으로 is_friday_hold_ok 실행)
                 _hold_hint = ""
                 if _is_carry:
@@ -5094,17 +5388,14 @@ class EdgeMonitor:
                         f"\n   📌 이월 종목 — 이번 주 내 정리 예정"
                         f"\n   (금요일 15:20 AI점수 기준으로 자동 판단)"
                     )
-
                 msg += (f"📌 <b>{name}</b>{trail_str}{_carry_tag}\n"
                         f"   산 가격: {buy_p:,.0f}원  현재: {cp:,.0f}원\n"
                         f"   {r_icon} 수익률: {ret:+.2%}  ({pnl:+,.0f}원)\n"
                         f"   🛑 스탑로스 설정가: <b>{sl_price:,.0f}원</b> "
                         f"({dyn_sl:.1%}){_hold_hint}\n\n")
             tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
-
         # ── ② 오늘 주목 종목 (AI점수 + 매수 적정가) ──────────
         self.scan_universe(force_notify=True)
-
         watch = []
         for ticker, name in self.universe.items():
             df = get_ohlcv(ticker, days=60)
@@ -5124,7 +5415,6 @@ class EdgeMonitor:
                     if edge >= step["edge"]:
                         split_label = step["label"]
                 watch.append((name, ticker, edge, exp, kind_adj, split_label, guide))
-
         if watch:
             watch.sort(key=lambda x: -x[2])
             msg = (f"⭐ <b>오늘 AI 주목 종목</b>\n"
@@ -5142,53 +5432,64 @@ class EdgeMonitor:
                         f"   🎯 목표가: {target_str}\n"
                         f"   🛑 손절가: {sl_str}\n")
             tg_btn(msg, [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]])
-
 # ══════════════════════════════════════════════════
 # 실행 진입점
 # ══════════════════════════════════════════════════
-
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.2 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.4 통합 엔진 가동")
     log.info("=" * 55)
-
     monitor = EdgeMonitor()
     monitor.update_regime()
-
     # ── 데이터 소스 진단 ─────────────────────────
     def _diagnose_data_sources():
         status, test_tk = [], "005930"
-        fdr_ok = naver_ok = False
+        kiwoom_ok = fdr_ok = naver_ok = False
+        # ① 키움 현재가
+        try:
+            kw = kiwoom()
+            if kw:
+                _kp = kw.get_price(test_tk)
+                if _kp and _kp > 0:
+                    kiwoom_ok = True
+                    status.append(f"✅ 키움 실시간 ({_kp:,}원)")
+                else:
+                    status.append("⚠️ 키움 실시간 (장 외 또는 접속 불가)")
+            else:
+                status.append("⚠️ 키움 (클라이언트 미연결)")
+        except Exception:
+            status.append("❌ 키움 (오류)")
+        # ② FDR 일봉
         if FDR_OK:
             try:
                 raw = fdr.DataReader(test_tk, (date.today()-timedelta(days=10)).strftime("%Y-%m-%d"))
                 if raw is not None and len(raw) >= 3:
-                    fdr_ok = True; status.append("✅ FDR (일봉)")
+                    fdr_ok = True; status.append("✅ FDR (일봉 폴백)")
                 else: status.append("⚠️ FDR (데이터 부족)")
             except: status.append("❌ FDR (오류)")
         else: status.append("❌ FDR (미설치)")
+        # ③ 네이버
         try:
             p = _fetch_naver_realtime(test_tk)
-            if p > 0: naver_ok = True; status.append(f"✅ 네이버 실시간 ({p:,.0f}원)")
+            if p > 0: naver_ok = True; status.append(f"✅ 네이버 실시간 ({p:,.0f}원, 폴백)")
             else: status.append("⚠️ 네이버 실시간 (장 외 또는 접속 불가)")
         except: status.append("❌ 네이버 실시간 (오류)")
         status.append("✅ pykrx (폴백)" if PYKRX_OK else "⚠️ pykrx (미설치)")
         status.append("✅ yfinance (최종 폴백)" if YF_OK else "⚠️ yfinance (미설치)")
-        primary = "네이버(실시간)" if naver_ok else ("FDR(일봉)" if fdr_ok else "폴백 모드")
+        primary = ("키움(실시간)" if kiwoom_ok
+                   else "네이버(실시간)" if naver_ok
+                   else "FDR(일봉)" if fdr_ok
+                   else "폴백 모드")
         return status, primary, naver_ok, fdr_ok
-
     data_status, primary_source, naver_live, fdr_live = _diagnose_data_sources()
     log.info(f"📡 데이터 소스: {primary_source}")
     for s in data_status: log.info(f"  {s}")
-
     # 텔레그램 명령어 수신
     commander = TelegramCommander(monitor)
     commander.start()
-
     # ⑦ 네트워크 모니터 (복구 시 보유 종목 즉시 체크)
-    net_monitor = NetworkMonitor(on_recover=monitor.check_holdings)
+    net_monitor = NetworkMonitor(on_recover=lambda: monitor.scan_universe(force_notify=False))
     net_monitor.start()
-
     # ⑧ 웹 대시보드 API 서버 (선택적 — Flask 설치 시 활성)
     try:
         from dashboard_api import start_dashboard
@@ -5196,41 +5497,12 @@ if __name__ == "__main__":
         start_dashboard(monitor, port=_dash_port)
     except ImportError:
         log.info("ℹ️ 대시보드 비활성 (flask 미설치 — pip install flask flask-cors)")
-
-    # 첫 보고
-    monitor.scan_universe(force_notify=True)
-
-    # ── 스케줄 ──────────────────────────────────
-    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.check_holdings)
-    schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
-    schedule.every(30).minutes.do(monitor.update_regime)
-    schedule.every(30).minutes.do(monitor.offhours_check)
-    schedule.every().day.at("08:30").do(monitor.do_refresh_universe)
-    schedule.every().day.at("08:40").do(monitor.morning_report)
-    schedule.every().day.at("15:30").do(monitor.close_report)
-    schedule.every().day.at("15:35").do(monitor.weekly_report)   # ⑧ 주간
-    # 투자원칙 1+2
-    schedule.every().day.at("08:35").do(monitor.monday_reset)      # 원칙1: 월요일 자본 재계산
-    schedule.every().day.at("15:00").do(monitor.thursday_warning)  # 원칙2: 목요일 사전 경보
-    schedule.every().day.at("15:20").do(monitor.friday_force_exit)  # 원칙2: 금요일 최종 알림
-    schedule.every().day.at("15:35").do(monitor.wednesday_midcheck) # 수요일 중간 점검
-
-    log.info("스케줄:")
-    log.info(f"  {C['HOLD_CHECK_MIN']}분   → 보유 체크 (장중·거래일만)")
-    log.info(f"  {C['SCAN_CHECK_MIN']}분   → 유니버스 스캔 (장중·거래일만)")
-    log.info("  30분  → 국면갱신 / 장외체크")
-    log.info("  08:30 → 유니버스 자동 갱신")
-    log.info("  08:40 → 아침 전략 보고")
-    log.info("  15:30 → 장 마감 리포트")
-    log.info("  15:35 → 주간 성과 집계 (금요일만)")
-
-    src_icon = "🟢" if naver_live else ("🟡" if fdr_live else "🔴")
+    # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
-
     tg(
-        f"🚀 <b>Edge Score v39.2 가동</b>\n"
+        f"🚀 <b>Edge Score v39.4 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"{src_icon} <b>데이터: {primary_source}</b>\n"
+        f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 유니버스: {len(monitor.universe)}개\n"
@@ -5240,9 +5512,33 @@ if __name__ == "__main__":
         f"📢 수익구간알림 + 당일재진입차단\n"
         f"🧮 켈리공식 + 분할매수가이드\n"
         f"🌐 네트워크 복구 자동 체크\n"
+        f"{'🟢 실제투자 모드' if _os_tg.getenv('KIWOOM_MOCK','true').lower()=='false' else '🔵 모의투자 모드'}\n"
         f"📱 명령어: /help"
     )
-
+    # ── 스케줄 ──────────────────────────────────
+    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.scan_universe)
+    schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
+    schedule.every(30).minutes.do(monitor.update_regime)
+    schedule.every(30).minutes.do(monitor.offhours_check)
+    schedule.every().day.at("08:30").do(monitor.do_refresh_universe)
+    schedule.every().day.at("08:40").do(monitor.morning_report)
+    schedule.every().day.at("15:30").do(monitor.close_report)
+    schedule.every().day.at("15:35").do(monitor.weekly_report)
+    schedule.every().day.at("08:35").do(monitor.monday_reset)
+    schedule.every().day.at("15:00").do(monitor.thursday_warning)
+    schedule.every().day.at("15:20").do(monitor.friday_force_exit)
+    schedule.every().day.at("15:35").do(monitor.wednesday_midcheck)
+    log.info("스케줄:")
+    log.info(f"  {C['HOLD_CHECK_MIN']}분   → 보유 체크 (장중·거래일만)")
+    log.info(f"  {C['SCAN_CHECK_MIN']}분   → 유니버스 스캔 (장중·거래일만)")
+    log.info("  30분  → 국면갱신 / 장외체크")
+    log.info("  08:30 → 유니버스 자동 갱신")
+    log.info("  08:40 → 아침 전략 보고")
+    log.info("  15:30 → 장 마감 리포트")
+    log.info("  15:35 → 주간 성과 집계 (금요일만)")
+    # 첫 보고 — 백그라운드 스레드로 (크래시 방지)
+    threading.Thread(target=monitor.scan_universe,
+                     kwargs={"force_notify": True}, daemon=True).start()
     while True:
         schedule.run_pending()
         time.sleep(1)
