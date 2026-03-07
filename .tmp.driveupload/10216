@@ -848,6 +848,8 @@ _positions_lock = threading.Lock()
 # _do_sell(텔레그램) 진입 시 추가, 완료 시 제거
 # check_holdings/_log_exit에서 해당 종목 있으면 자동매도 스킵
 _pending_sell: set = set()
+# [BUG-FIX] check+add를 원자적으로 처리하는 전용 락 (스레드 경쟁 조건 방지)
+_pending_sell_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
@@ -3188,12 +3190,13 @@ class TelegramCommander:
             )
             return
 
-        # [BUG-FIX-③] 자동매도(_log_exit)와 수동매도(_do_sell) 중복 주문 차단
-        if ticker in _pending_sell:
-            tg(f"⚠️ {ticker} 자동매도 처리 중이에요. 잠시 후 다시 시도해주세요.")
-            return
-        # 수동매도 진행 중 표시 → 자동매도(_log_exit)가 스킵
-        _pending_sell.add(ticker)
+        # [BUG-FIX] check+add를 _pending_sell_lock 안에서 원자적으로 처리
+        # 자동매도 스레드와 수동매도 스레드가 동시에 같은 종목을 팔 수 없도록 보장
+        with _pending_sell_lock:
+            if ticker in _pending_sell:
+                tg(f"⚠️ {ticker} 매도 처리 중이에요. 잠시 후 다시 시도해주세요.")
+                return
+            _pending_sell.add(ticker)
 
         pos = self.monitor.positions.get(ticker)
         if not pos:
@@ -4535,11 +4538,12 @@ class EdgeMonitor:
 
     def _log_exit(self, ticker: str, info: dict,
                   exit_price: float, reason: str):
-        # [BUG-FIX-③] 수동매도(_do_sell)가 이미 처리 중이면 자동매도 스킵
-        # 같은 종목에 수동+자동 매도 주문이 동시에 나가는 경쟁조건 방지
-        if ticker in _pending_sell:
-            log.warning(f"[중복매도차단] {ticker} 수동매도 진행 중 — 자동매도({reason}) 스킵")
-            return
+        # [BUG-FIX] check+add를 _pending_sell_lock 안에서 원자적으로 처리
+        with _pending_sell_lock:
+            if ticker in _pending_sell:
+                log.warning(f"[중복매도차단] {ticker} 매도 진행 중 — 자동매도({reason}) 스킵")
+                return
+            _pending_sell.add(ticker)  # kw.sell() 직전 선점 → 경쟁 창구 완전 차단
         buy_price  = float(info.get("buy_price", 0))
         shares     = int(info.get("shares", 0))
         amount     = buy_price * shares
@@ -4600,7 +4604,6 @@ class EdgeMonitor:
                             "_is_partial":  False,
                             "_total_shares": shares,
                         }
-                        _pending_sell.add(ticker)  # [BUG-FIX] 자동매도 진행 중 → 중복주문 차단
                         _auto_sell_deferred = True
                         _notify_on_fill(
                             _res.get("order_no", ""), ticker, _name,
@@ -4622,13 +4625,12 @@ class EdgeMonitor:
                         )
 
         if not _kw_order_ok:
-            _pending_sell.discard(ticker)  # [BUG-FIX] 주문 실패 → 잠금 해제, 다음 체크 재시도 허용
+            _pending_sell.discard(ticker)  # 주문 실패 → 잠금 해제, 다음 체크 재시도 허용
             return   # 포지션·trade_log 모두 유지
 
         # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
+        # deferred=True → _notify_on_fill에서 체결/타임아웃/예외 모든 경로에 discard 보장
         if _auto_sell_deferred:
-            # [BUG-FIX] today_exited는 체결 확인 후 _notify_on_fill에서 추가
-            # 미체결/취소 시 당일 재진입이 불필요하게 막히는 문제 방지
             log.info(f"[자동매도] {_name} 접수 → 체결 대기 중 (사유: {reason})")
             return
 
@@ -4660,6 +4662,7 @@ class EdgeMonitor:
         # [BUG-FIX-①] _log_exit 내부 _positions_lock 제거 — 데드락 방지
         self.positions.pop(ticker, None)
         save_positions(self.positions)
+        _pending_sell.discard(ticker)  # 키움 미연결 fallback 완료
 
     # ── 보유 종목 체크 (1분, 장중) ──────────────────────
     def check_holdings(self):
