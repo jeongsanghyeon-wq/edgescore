@@ -3619,6 +3619,7 @@ class TelegramCommander:
              [{"text": f"📰 공시 보정값  {kadj:.2f}",       "callback_data": "set_mult:KIND_EDGE_ADJ:0.03,0.05,0.08:ai"},
               {"text": f"🔗 상관관계 경고  {corr:.0%}",     "callback_data": "set_pct:CORR_HIGH_THRESHOLD:60,75,85:ai"}],
              [{"text": f"🎚️ 슬리피지 필터  {slip:.1f}×",   "callback_data": "set_mult:SLIPPAGE_FILTER_RATIO:2.0,3.0,4.0:ai"}],
+             [{"text": f"📊 종목당 최대비중  {C.get('MAX_POSITION_RATIO',0.20):.0%}", "callback_data": "set_pct:MAX_POSITION_RATIO:10,15,20,25,30:ai"}],
              [{"text": "🔙 설정으로", "callback_data": "settings"}]]
         )
 
@@ -3659,6 +3660,7 @@ class TelegramCommander:
             "EDGE_SURGE_THRESHOLD":  "🚀 AI점수 급등 기준",
             "CORR_HIGH_THRESHOLD":   "🔗 상관관계 경고",
             "SLIPPAGE_FILTER_RATIO": "🎚️ 슬리피지 필터",
+            "MAX_POSITION_RATIO":    "📊 종목당 최대비중",
         }
         lbl  = label_map.get(key, key)
         btns = []
