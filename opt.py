@@ -683,8 +683,9 @@ def update_config(updates: dict) -> dict:
         _rt   = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_rt)
         _base = getattr(_rt, "DEFAULT_CONFIG", {})
-    except Exception:
-        pass
+    except Exception as _e:
+        # [BUG-FIX] 조용히 삼키지 않고 명시적 경고 — baseline 불일치 방지
+        print(f"⚠️  [optimizer] rt.py DEFAULT_CONFIG 로드 실패 ({_e}) — 빈 baseline으로 진행")
     cfg  = dict(_base)
     cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
 
@@ -744,6 +745,9 @@ def update_backtest_source(updates: dict) -> list:
         "CORR_HIGH_THRESHOLD": (r"(CORR_HIGH_THRESHOLD\s*=\s*)[\d.]+",    "{:.3f}"),
         "FRIDAY_HOLD_EDGE_THR":(r"(FRIDAY_HOLD_EDGE_THR\s*=\s*)[\d.]+",   "{:.3f}"),
         "CAPITAL_FLOOR_RATIO": (r"(CAPITAL_FLOOR_RATIO\s*=\s*)[\d.]+",    "{:.3f}"),
+        # [BUG-FIX] RT에서 업데이트되는 파라미터가 BT에 미반영되는 괴리 수정
+        "TIME_STOP_DAYS":      (r"(TIME_STOP_DAYS\s*=\s*)\d+",             "{:d}"),
+        "VOL_TARGET_DAILY":    (r"(VOL_TARGET_DAILY\s*=\s*)[\d.]+",        "{:.4f}"),
     }
     for cfg_key, (pattern, fmt) in simple_map.items():
         if cfg_key not in updates:

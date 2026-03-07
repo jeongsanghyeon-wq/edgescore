@@ -182,11 +182,33 @@ try:
 except ImportError:
     BS4_OK = False
 
+# ══════════════════════════════════════════════════
+# 로깅 — load_config()보다 먼저 초기화 (BUG-FIX: log 미정의 NameError 방지)
+# ══════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("realtime.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ]
+)
+log = logging.getLogger("EdgeRT")
+for _noisy_logger in ["pykrx", "pykrx.stock", "pykrx.website",
+                       "pykrx.website.krx", "pykrx.website.krx.market",
+                       "urllib3", "requests",
+                       "FinanceDataReader", "finance_datareader"]:
+    logging.getLogger(_noisy_logger).setLevel(logging.CRITICAL)
+
 # ═══════════════════════════════════════════════════
 # ④ config.json 통합 관리
 # ═══════════════════════════════════════════════════
 
-CONFIG_FILE = Path("config.json")
+# [BUG-FIX] 상대경로 → __file__ 기준 절대경로 통일
+# cwd가 달라도 항상 스크립트 위치 기준으로 파일 접근
+_BASE_DIR = Path(__file__).parent
+CONFIG_FILE = _BASE_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     # ── 유니버스 ──────────────────────────────
@@ -365,9 +387,9 @@ TELEGRAM = {
     "chat_id": _os_tg.getenv("TELEGRAM_CHAT_ID", ""),
 }
 
-POSITIONS_FILE   = Path("positions.json")
-UNIVERSE_FILE    = Path("universe_cache.json")
-TRADE_LOG_FILE   = Path("trade_log.json")
+POSITIONS_FILE   = _BASE_DIR / "positions.json"
+UNIVERSE_FILE    = _BASE_DIR / "universe_cache.json"
+TRADE_LOG_FILE   = _BASE_DIR / "trade_log.json"
 TRADE_DB_FILE    = Path("trade_history.db")
 ALERTS_FILE      = Path("alerts_today.json")   # 대시보드 /api/alerts 연동
 
@@ -468,26 +490,6 @@ REGIME_EDGE_THRESHOLD = {
 def get_regime_threshold(regime: str) -> float:
     return REGIME_EDGE_THRESHOLD.get(regime, 0.60)
 
-# ══════════════════════════════════════════════════
-# 로깅
-# ══════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("realtime.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ]
-)
-log = logging.getLogger("EdgeRT")
-# [BUG-FIX] pykrx 내부 logger가 JSONDecodeError 로깅 시 Formatter 크래시 유발
-# → CRITICAL로 완전 차단하여 연쇄 크래시 방지
-for _noisy_logger in ["pykrx", "pykrx.stock", "pykrx.website",
-                       "pykrx.website.krx", "pykrx.website.krx.market",
-                       "urllib3", "requests",
-                       "FinanceDataReader", "finance_datareader"]:
-    logging.getLogger(_noisy_logger).setLevel(logging.CRITICAL)
 
 # [BUG-FIX] pykrx가 root logger로 직접 logging.info(args, kwargs)를 호출하여
 # Python logging Formatter가 % 포매팅 크래시. root logger에 필터를 추가하여 차단.
