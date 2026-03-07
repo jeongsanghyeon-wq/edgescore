@@ -3253,7 +3253,12 @@ class TelegramCommander:
         _sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
         if not EMERGENCY_STOP:
             kw = kiwoom()
-            if kw:
+            if kw is None:
+                # [BUG-FIX] kw=None은 의도된 오프라인이 아닌 클라이언트 오류일 수 있음
+                # fallback 즉시청산 대신 주문 실패로 처리 → positions 보존
+                _kw_order_ok = False
+                tg(f"🚨 키움 클라이언트 연결 실패 — {name} 매도 취소\n직접 확인 후 재시도해주세요.")
+            elif kw:
                 _mode = "모의" if kw._mock else "실계좌"
                 _res  = kw.sell(ticker, sell_shares, sell_price, order_type="0")
                 if _res.get("success"):
@@ -3309,7 +3314,7 @@ class TelegramCommander:
             log.info(f"[매도] {name} 접수 → 체결 대기 중 (order_no={_res.get('order_no','')})")
             return
 
-        # ── 키움 미연결(모의/오프라인) fallback → 즉시 기록 ─────────
+        # ── EMERGENCY_STOP 시 즉시 기록 (kw=None은 위에서 실패 처리됨) ─────────
         append_trade_log({
             "action": "sell", "ticker": ticker, "name": name,
             "buy_price": buy_price, "sell_price": sell_price,
@@ -4561,12 +4566,17 @@ class EdgeMonitor:
         _name         = info.get("name", ticker)
 
         # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
-        # 키움 미연결(kw=None)이면 True로 유지 → 모의/오프라인 모드 기존 동작 유지
         _kw_order_ok = True
         _auto_sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
         if not EMERGENCY_STOP:
             kw = kiwoom()
-            if kw:
+            if kw is None:
+                # [BUG-FIX] kw=None은 클라이언트 오류일 수 있음 → 주문 실패로 처리
+                # positions 보존, 다음 1분 체크에서 재시도
+                _kw_order_ok = False
+                log.error(f"[자동매도실패] {_name}({ticker}) 키움 클라이언트 None — 사유:{reason}, 다음 체크 재시도")
+                tg(f"🚨 키움 클라이언트 연결 실패 — {_name} 자동매도({reason}) 취소\n다음 체크에서 재시도합니다.")
+            elif kw:
                 _mode = "모의" if kw._mock else "실계좌"
                 _bp   = float(info.get("buy_price", 0))
                 _ret  = (exit_price - _bp) / _bp if _bp > 0 else 0
@@ -4634,7 +4644,7 @@ class EdgeMonitor:
             log.info(f"[자동매도] {_name} 접수 → 체결 대기 중 (사유: {reason})")
             return
 
-        # ── 키움 미연결(모의/오프라인) fallback → 즉시 기록 ─────────
+        # ── EMERGENCY_STOP 시 즉시 기록 (kw=None은 위에서 실패 처리됨) ─────────
         append_trade_log({
             "action":      "sell",
             "ticker":      ticker,
