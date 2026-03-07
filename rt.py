@@ -2002,16 +2002,25 @@ def db_daily_summary(target_date: str = None) -> dict:
         return {"buy_count": 0, "sell_count": 0, "total_pnl": 0, "win_rate": 0}
 
 def append_trade_log(entry: dict):
-    # [BUG-FIX-C] threading.Lock으로 read-modify-write 경쟁 조건 방지
-    # check_holdings(스케줄 스레드) + _do_buy/_do_sell(텔레그램 스레드) 동시 호출 시 로그 유실 방지
+    # [BUG-FIX-C] threading.Lock + os.replace() 원자적 저장
+    # ① Lock: write-write 경쟁 조건 방지 (텔레그램 스레드 vs 스케줄 스레드)
+    # ② temp + os.replace(): write-read 경쟁 조건 방지
+    #    - 기존: "w"로 열면 즉시 truncate → 다른 스레드가 빈 파일 또는 partial JSON 읽을 수 있음
+    #    - 수정: .tmp에 완성 후 os.replace()로 원자적 교체 → 읽는 쪽은 항상 완전한 JSON을 봄
     with _trade_log_lock:
         logs = load_trade_log()
         logs.append(entry)
         try:
-            with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+            _tmp = TRADE_LOG_FILE.with_suffix(".json.tmp")
+            with open(_tmp, "w", encoding="utf-8") as f:
                 json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
+            os.replace(_tmp, TRADE_LOG_FILE)   # POSIX 원자적 교체 (Windows도 지원)
         except Exception as e:
             log.error(f"거래로그 저장 실패: {e}")
+            try:
+                _tmp.unlink(missing_ok=True)   # 실패 시 tmp 정리
+            except Exception:
+                pass
     # SQLite는 자체 락 보유 — Lock 밖에서 호출 (교착방지)
     _db_insert(entry)
 

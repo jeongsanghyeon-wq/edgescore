@@ -263,7 +263,7 @@ export default function Dashboard(){
           <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(3,1fr)",gap:mobile?8:10,marginBottom:8}}>
             {[{l:"평가금",v:`₩${fmt(sm.total_eval)}`,s:`원금 ₩${fmt(sm.total_invested)}`,c:"#3b82f6"},
               {l:"손익",v:`₩${fmt(sm.total_pnl)}`,s:pct(sm.total_ret||0),c:(sm.total_pnl||0)>=0?"#22c55e":"#ef4444"},
-              {l:"가용현금(추정)",v:`₩${fmt(sm.available_cash)}`,s:`실예수금 ₩${fmt(account?.deposit||0)}`,c:"#f59e0b"}].map((c,i)=>
+              {l:"가용현금(추정)",v:`₩${fmt(sm.available_cash)}`,s:`실예수금 ₩${fmt(sm.deposit_actual??account?.deposit??0)}`,c:"#f59e0b"}].map((c,i)=>
               <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>
                 <div style={{fontSize:mobile?15:18,fontWeight:700,color:c.c,marginTop:1}}>{c.v}</div>
@@ -271,7 +271,7 @@ export default function Dashboard(){
               </div>)}
           </div>
           <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(2,1fr)",gap:mobile?8:10,marginBottom:12}}>
-            {[{l:"하한선",v:`₩${fmt(sm.floor)}`,s:`여유 ₩${fmt(sm.floor_remaining)}`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
+            {[{l:"하한선",v:`₩${fmt(sm.floor)}`,s:`여유 ₩${fmt(sm.floor_remaining)} (총자산 ₩${fmt(sm.total_asset||sm.total_eval)})`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
               {l:"보유",v:`${sm.count||0}개`,s:`트레일링 ${sm.trail_active_count||0}`,c:"#8b5cf6"}].map((c,i)=>
               <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>

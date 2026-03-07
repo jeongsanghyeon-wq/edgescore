@@ -49,6 +49,28 @@ _cache = {}
 _CACHE_TTL = 3
 _CACHE_TTL_ACCOUNT = 30   # [v1.9] api_account 전용 30초 캐시 (키움 API 과호출 방지)
 
+# [BUG-FIX-2] deposit 공유 캐시 — api_portfolio / api_risk / api_account가 각자
+# get_deposit()을 호출하면 대시보드 5초 폴링 기준 분당 최대 ~40회 키움 API 호출 발생
+# → 30초 TTL 공유 캐시로 단일화: 모든 엔드포인트가 같은 값 재사용
+_deposit_cache: dict = {"value": 0, "ts": 0.0}
+_DEPOSIT_CACHE_TTL = 30  # 초
+
+def _get_deposit_cached(rt) -> int:
+    """deposit 공유 캐시 — 30초 TTL, 모든 API 엔드포인트 공유"""
+    now = _time.time()
+    if now - _deposit_cache["ts"] < _DEPOSIT_CACHE_TTL:
+        return _deposit_cache["value"]
+    try:
+        kw = rt.kiwoom() if hasattr(rt, "kiwoom") else None
+        if kw:
+            dep = kw.get_deposit()
+            _deposit_cache["value"] = dep
+            _deposit_cache["ts"]    = now
+            return dep
+    except Exception:
+        pass
+    return _deposit_cache["value"]   # 실패 시 이전 값 반환
+
 
 def _cached(endpoint_key, ttl=None):
     # [v1.9 BUG-FIX] ttl 파라미터 지원 추가 — api_account의 @_cached("account", ttl=_CACHE_TTL_ACCOUNT) TypeError 수정
@@ -202,6 +224,11 @@ def _create_app():
         total_eval = sum(h["current_price"] * h["shares"] for h in holdings)
         capital = C.get("TOTAL_CAPITAL", 10_000_000)
         floor = capital * C.get("CAPITAL_FLOOR_RATIO", 0.70)
+        # [BUG-FIX-D2] 실제 예수금(deposit) 조회 → 총자산 = 주식평가 + 실예수금
+        # [BUG-FIX-2] 공유 캐시 _get_deposit_cached() 사용 (분당 ~40회 → 2회/분 수준으로 감소)
+        _deposit_actual = _get_deposit_cached(rt)
+        _total_asset = total_eval + _deposit_actual   # 실제 총자산 (주식평가 + 예수금)
+
         return {
             "holdings": holdings,
             "summary": {
@@ -209,11 +236,12 @@ def _create_app():
                 "total_pnl": round(total_eval - total_inv),
                 "total_ret": round((total_eval - total_inv) / total_inv, 4) if total_inv > 0 else 0,
                 "capital": capital, "floor": floor,
-                "floor_remaining": round(max(0, total_eval - floor)),
-                # [BUG-FIX-D] available_cash: 이론적 추정값 (capital - total_eval)
-                # 실제 주문가능예수금은 미체결/수수료/세금 반영으로 다를 수 있음
-                # → Dashboard에서 account.deposit(실제 예수금)과 나란히 표시 권장
+                # [BUG-FIX-D2] floor_remaining: 총자산(주식+예수금) 기준으로 계산
+                # 이전: total_eval만 → 예수금 무시로 여유자금 과소 표시
+                "floor_remaining": round(max(0, _total_asset - floor)),
                 "available_cash": round(max(0, capital - total_eval)),   # 이론적 여유자금 (추정)
+                "deposit_actual": _deposit_actual,                        # 실제 키움 예수금
+                "total_asset": round(_total_asset),                       # 실제 총자산 (주식+예수금)
                 "count": len(holdings),
                 "trail_active_count": sum(1 for h in holdings if h["trail_active"]),
             }
@@ -495,11 +523,17 @@ def _create_app():
         total_eval = sum(h["value"] for h in holdings)
         capital = C.get("TOTAL_CAPITAL", 10_000_000)
         floor = capital * C.get("CAPITAL_FLOOR_RATIO", 0.70)
+        # [BUG-FIX-D2] risk gauge: 실제 총자산 = 주식평가 + 실예수금 기준
+        # [BUG-FIX-2] 공유 캐시 _get_deposit_cached() 사용 (api_portfolio와 동일 값 재사용)
+        _dep_risk = _get_deposit_cached(rt)
+        _total_asset_risk = total_eval + _dep_risk
         gauge = {
-            "current": total_eval, "capital": capital, "floor": floor,
-            "pct": round(total_eval / capital, 4) if capital > 0 else 0,
+            "current": _total_asset_risk, "capital": capital, "floor": floor,
+            "pct": round(_total_asset_risk / capital, 4) if capital > 0 else 0,
             "floor_pct": C.get("CAPITAL_FLOOR_RATIO", 0.70),
-            "danger": total_eval < floor * 1.1,
+            "danger": _total_asset_risk < floor * 1.1,
+            "deposit": _dep_risk,           # 실예수금 (별도 표시용)
+            "eval_only": total_eval,        # 주식평가금 (참고용)
         }
 
         price_data = {}
@@ -791,6 +825,10 @@ def _create_app():
                 result["host"]      = kw._host
                 try:
                     dep = kw.get_deposit()
+                    # [BUG-FIX-2] api_account에서 조회한 실값으로 공유 캐시도 갱신
+                    import time as _t_dep
+                    _deposit_cache["value"] = dep
+                    _deposit_cache["ts"]    = _t_dep.time()
                     result["deposit"]     = dep
                     result["deposit_str"] = f"{dep:,}원"
                 except Exception:
