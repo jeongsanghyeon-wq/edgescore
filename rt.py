@@ -2216,6 +2216,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                     pos["peak_price"] = cntr_uv
                                 if pos.get("trail_price", 0) < cntr_uv:
                                     pos["trail_price"] = cntr_uv
+                                pos.pop("_restore_pos", None)  # 내부 복원용 메타키 제거
                                 save_positions(monitor.positions)
                         # 체결 확인 후 trade_log 기록 (실체결 기준 — 추가매수 이력용)
                         if buy_log_data:
@@ -2296,21 +2297,40 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
 
         if action == "buy":
             # [BUG-FIX] pending 고착 방지 — kw 연결 실패여도 반드시 롤백
+            # 추가매수 실패 시: 기존 포지션 복원 (신규매수 실패: pop)
             if monitor and hasattr(monitor, "positions"):
                 with _positions_lock:
                     if ticker in monitor.positions and                        monitor.positions[ticker].get("pending"):
-                        monitor.positions.pop(ticker, None)
-                        save_positions(monitor.positions)
-                        log.warning(f"[미체결롤백] {name}({ticker}) {_fail_reason} → positions 자동 제거")
-                        tg(
-                            f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 자동 취소</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 종목: {name} ({ticker})\n"
-                            f"주문번호: {order_no}\n"
-                            f"원인: {_fail_reason}\n\n"
-                            f"내부 포지션을 취소했어요.\n"
-                            f"실계좌 주문 상태를 직접 확인해주세요."
-                        )
+                        _restore = monitor.positions[ticker].get("_restore_pos")
+                        if _restore:
+                            # 추가매수 미체결 → 기존 보유 복원
+                            _restore.pop("_restore_pos", None)
+                            monitor.positions[ticker] = _restore
+                            save_positions(monitor.positions)
+                            log.warning(f"[추가매수롤백] {name}({ticker}) {_fail_reason} → 기존 포지션 복원")
+                            tg(
+                                f"⚠️ <b>[{_mode}] 추가매수 미체결 — 기존 포지션 복원</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"📌 종목: {name} ({ticker})\n"
+                                f"주문번호: {order_no}\n"
+                                f"원인: {_fail_reason}\n\n"
+                                f"기존 보유 포지션으로 복원됐어요.\n"
+                                f"실계좌 주문 상태를 직접 확인해주세요."
+                            )
+                        else:
+                            # 신규매수 미체결 → 포지션 제거
+                            monitor.positions.pop(ticker, None)
+                            save_positions(monitor.positions)
+                            log.warning(f"[신규매수롤백] {name}({ticker}) {_fail_reason} → positions 제거")
+                            tg(
+                                f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 취소</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"📌 종목: {name} ({ticker})\n"
+                                f"주문번호: {order_no}\n"
+                                f"원인: {_fail_reason}\n\n"
+                                f"내부 포지션을 취소했어요.\n"
+                                f"실계좌 주문 상태를 직접 확인해주세요."
+                            )
                         return
             tg(
                 f"⚠️ <b>[{_mode}] 매수 미체결</b>\n"
@@ -3029,6 +3049,11 @@ class TelegramCommander:
                     # [BUG-FIX-②] pending=True: 체결 확인 전 임시 상태 표시
                     # _notify_on_fill이 체결 확인 후 제거 or 롤백
                     _new_position["pending"] = True
+                    # [BUG-FIX] 추가매수 미체결 시 기존 포지션 복원을 위해 스냅샷 보존
+                    # 신규매수면 None → rollback 시 pop, 추가매수면 기존 pos → rollback 시 복원
+                    _new_position["_restore_pos"] = (
+                        {k: v for k, v in existing.items()} if is_add and existing else None
+                    )
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
                     _notify_on_fill(
