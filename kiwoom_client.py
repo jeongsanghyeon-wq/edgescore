@@ -253,7 +253,7 @@ class KiwoomClient:
         return []
 
     # ══════════════════════════════════════════════════════════
-    # ⑧ 유틸
+    # ⑧ 유틸리티 (내부 헬퍼)
     # ══════════════════════════════════════════════════════════
 
     @staticmethod
@@ -264,7 +264,7 @@ class KiwoomClient:
         return max(1, budget // price)
 
     # ══════════════════════════════════════════════════════════
-    # ⑧ 일봉 조회  ka10081 → /api/dostk/chart
+    # ⑨ 일봉 조회  ka10081 → /api/dostk/chart
     #    응답: stk_dt_pole_chart_qry[] 리스트
     #    필드: dt(날짜 YYYYMMDD), opn_prc(시가), high_prc(고가),
     #          low_prc(저가), close_prc(종가), trde_qty(거래량)
@@ -323,7 +323,7 @@ class KiwoomClient:
         return result[-days:]
 
     # ══════════════════════════════════════════════════════════
-    # ⑨ 체결 확인  kt00009 → /api/dostk/acnt
+    # ⑩ 체결 확인  kt00009 → /api/dostk/acnt
     #    cntr_qty(체결수량), cntr_uv(체결단가)
     # ══════════════════════════════════════════════════════════
 
@@ -386,7 +386,7 @@ if __name__ == "__main__":
     client = KiwoomClient()
 
     print("\n" + "="*55)
-    print("  키움 REST API 연결 테스트 v1.2")
+    print("  키움 REST API 연결 테스트 v1.3")
     print("="*55)
 
     print("\n[1] 토큰 발급...")

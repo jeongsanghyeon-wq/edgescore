@@ -1,5 +1,5 @@
 """
-Edge Score v39.6 — Dashboard API Server v1.8
+Edge Score v39.7 — Dashboard API Server v1.8
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -105,7 +105,7 @@ def start_dashboard(monitor, port=5000):
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API v1.5 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API v1.8 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -115,7 +115,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.5",
+        return jsonify({"status": "ok", "version": "v1.8",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
@@ -123,7 +123,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "v39.6", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.7", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -538,8 +538,8 @@ def _create_app():
             name = positions.get(ticker, {}).get("name", universe.get(ticker, ticker))
             try:
                 df = rt.get_ohlcv(ticker, days=10)
-                if df is not None and "외국인" in df.columns:
-                    foreign = df["외국인"].tail(5).sum()
+                if df is not None and "foreign_net" in df.columns:
+                    foreign = df["foreign_net"].tail(5).sum()
                     supply.append({"ticker": ticker, "name": name, "foreign_5d": int(foreign)})
             except:
                 pass

@@ -1,6 +1,25 @@
 """
-Edge Score v39.7 — 완전 통합 엔진
+Edge Score v39.8 — 완전 통합 엔진
 =====================================================
+v39.8 패치:
+
+  [버그수정] ① _dash_alert 필드명 불일치 수정
+    - 기존: kind/message 저장 → Dashboard.jsx 알림 탭 무효화
+    - 수정: type/icon/msg/timestamp 필드 추가 (Dashboard.jsx 호환)
+    - kind→type 매핑: buy→success, sell→danger, warning→warning, info→info
+    - kind→icon 매핑: buy→📈, sell→📤, warning→⚠️, info→ℹ️
+    - 기존 kind/ticker 필드 유지 (하위 호환)
+
+  [버그수정] ② monday_reset 스케줄 08:35→08:34 변경
+    - 기존: daily_capital_sync(08:35)와 동시 실행
+    - schedule은 등록 순서대로 실행 → daily_capital_sync 먼저 실행
+    - monday_reset의 _pre_cap가 이미 sync된 값 → 주간 PnL 항상 0 오류
+    - 수정: monday_reset 08:34 실행 → _pre_cap 전주 자본 정확히 캡처
+
+  [개선] ③ scan_universe _dash_alert ticker 실제 코드 전달
+    - 기존: ticker="" 하드코딩 → 대시보드 종목별 필터 불가
+    - 수정: rows에 ticker 필드(인덱스6) 추가 → 실제 종목 코드 전달
+
 v37.1 패치:
 
   [버그수정] 장외 보유현황 반복 스팸 수정
@@ -323,6 +342,7 @@ POSITIONS_FILE   = Path("positions.json")
 UNIVERSE_FILE    = Path("universe_cache.json")
 TRADE_LOG_FILE   = Path("trade_log.json")
 TRADE_DB_FILE    = Path("trade_history.db")
+ALERTS_FILE      = Path("alerts_today.json")   # 대시보드 /api/alerts 연동
 
 # ── 수수료/세금 상수 ─────────────────────────────────
 COMMISSION_RATE  = 0.00015   # 키움 매매수수료 (매수+매도 각 0.015%)
@@ -2233,6 +2253,59 @@ def _ds_footer() -> str:
     icon = "🟢" if ok else "🔴"
     return f"\n<i>{icon} 데이터: {src}</i>"
 
+def _dash_alert(text: str, kind: str = "info", ticker: str = "") -> None:
+    """
+    대시보드 /api/alerts 연동 — alerts_today.json 에 알림 저장
+    kind: 'buy' | 'sell' | 'warning' | 'info'
+    오늘 날짜가 바뀌면 자동 초기화
+
+    Dashboard.jsx 호환 필드:
+      - type  : 'success'(매수) | 'danger'(매도) | 'warning' | 'info'
+      - icon  : 이모지
+      - msg   : 표시 메시지
+      - time  : HH:MM
+      - timestamp : ISO 문자열
+    """
+    # kind → Dashboard 호환 type/icon 매핑
+    _TYPE_MAP = {"buy": "success", "sell": "danger",
+                 "warning": "warning", "info": "info"}
+    _ICON_MAP = {"buy": "📈", "sell": "📤",
+                 "warning": "⚠️", "info": "ℹ️"}
+    _type = _TYPE_MAP.get(kind, "info")
+    _icon = _ICON_MAP.get(kind, "ℹ️")
+
+    try:
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        alerts: list = []
+        if ALERTS_FILE.exists():
+            try:
+                raw = json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
+                # 날짜가 다르면 초기화 (자정 자동 리셋)
+                if raw and isinstance(raw, list) and raw[0].get("date", "") == today:
+                    alerts = raw
+            except Exception:
+                pass
+        alerts.append({
+            # ── Dashboard.jsx 호환 필드 ──────────────────
+            "time":      now.strftime("%H:%M"),
+            "icon":      _icon,
+            "msg":       text[:200],
+            "type":      _type,
+            "responded": False,
+            "timestamp": now.isoformat(),
+            # ── 추가 메타 (내부 조회용) ──────────────────
+            "date":      today,
+            "kind":      kind,
+            "ticker":    ticker,
+        })
+        ALERTS_FILE.write_text(
+            json.dumps(alerts[-200:], ensure_ascii=False, indent=2),  # 최대 200건 유지
+            encoding="utf-8"
+        )
+    except Exception as e:
+        log.debug(f"[대시보드] 알림 저장 실패: {e}")
+
 def tg(text: str, silent: bool = False, no_menu: bool = False):
     if len(TELEGRAM["token"]) < 20 or "여기에" in TELEGRAM["token"]:
         log.warning("[TG 미설정] " + text[:60]); return
@@ -2764,7 +2837,7 @@ class TelegramCommander:
 
         # 분할매수 안내
         df_tmp   = get_ohlcv(ticker, days=60)
-        edge_now = calculate_edge_v27(df_tmp) if df_tmp is not None else 0.5
+        edge_now = calculate_edge_v27(df_tmp, 0.0, ticker) if df_tmp is not None else 0.5
         split_line = ""
         for step in C["SPLIT_BUY_STEPS"]:
             if edge_now >= step["edge"]:
@@ -4225,6 +4298,10 @@ class EdgeMonitor:
                 if _shares > 0:
                     _res = kw.sell(ticker, _shares, exit_price, order_type="3")  # 시장가
                     if _res.get("success"):
+                        _dash_alert(
+                            f"자동매도 접수: {_name} | {reason} | {_ret:+.2%}",
+                            kind="sell", ticker=ticker
+                        )
                         tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
                         _notify_on_fill(
                             _res.get("order_no", ""), ticker, _name,
@@ -4632,6 +4709,11 @@ class EdgeMonitor:
                 alerts.extend(risk_alerts)
                 setattr(self, _risk_key, True)
         for alert in alerts:
+            # 알림 종류 분류 (대시보드 연동)
+            _ak = ("sell"    if any(k in alert for k in ["매도", "손절", "청산", "타임스탑"])
+                   else "buy"  if any(k in alert for k in ["매수", "추가매수"])
+                   else "warning")
+            _dash_alert(alert, kind=_ak)
             tg(alert); self.today_alerts += 1; time.sleep(0.3)
     # ── 유니버스 스캔 (5분, 장중) ──────────────────
     def scan_universe(self, force_notify: bool = False):
@@ -4804,7 +4886,7 @@ class EdgeMonitor:
         top5 = scored[:5]
         for i, s in enumerate(top5):
             rows.append([now, f"추천{i+1}", s["name"],
-                         f"{s['price']:,.0f}", "-", s["edge"]])
+                         f"{s['price']:,.0f}", "-", s["edge"], s["ticker"]])
         # 스마트 알림
         raw_str  = "".join(r[3] for r in rows if r[1]=="보유")
         cur_hash = hashlib.md5(raw_str.encode()).hexdigest()
@@ -4893,6 +4975,11 @@ class EdgeMonitor:
                     msg += "\n━━━━━━━━━━━━━━━━━━\n"
                     msg += "\n".join(switch_msgs)
             tg(msg, silent=(not force_notify))
+            # 대시보드 알림 연동 — 매수 추천 종목 저장
+            for s in rows:
+                if str(s[1]).startswith("추천"):   # "추천1" ~ "추천5"
+                    _dash_alert(f"매수 추천: {s[2]} (Edge {float(s[5]):.2f})",
+                                kind="buy", ticker=s[6] if len(s) > 6 else "")
             self.last_hash = cur_hash
     # ── 장 외 간단 체크 ───────────────────────────
     def offhours_check(self):
@@ -5182,7 +5269,7 @@ class EdgeMonitor:
             if ticker in self.positions: continue
             df = get_ohlcv(ticker, days=60)
             if df is None: continue
-            edge = calculate_edge_v27(df)
+            edge = calculate_edge_v27(df, 0.0, ticker)
             preview.append((name, edge))
         preview.sort(key=lambda x: -x[1])
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
@@ -5358,11 +5445,12 @@ class EdgeMonitor:
         if not C.get("WEEKLY_CAPITAL_RESET", True):
             return
         log.info("🗓️ 월요일 자본 재계산")
+        _pre_cap = C.get("TOTAL_CAPITAL", 10_000_000)   # sync 전 자본 기억
         self.daily_capital_sync()   # 키움 잔고 동기화 (매일 08:35 공통 함수)
         C = load_config()
-        old_cap = C.get("TOTAL_CAPITAL", 10_000_000)
-        new_cap = old_cap
-        pnl   = 0
+        new_cap = C.get("TOTAL_CAPITAL", _pre_cap)      # sync 후 갱신된 자본
+        old_cap = _pre_cap                               # 전주 기준 자본
+        pnl   = new_cap - old_cap
         icon  = "📈" if pnl >= 0 else "📉"
         ret_s = f"{pnl/old_cap:+.2%}" if old_cap > 0 else "+0.00%"
         # 전주 성적
@@ -5836,7 +5924,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.6 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.8 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -5918,7 +6006,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.6 가동</b>\n"
+        f"🚀 <b>Edge Score v39.8 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
@@ -5943,8 +6031,8 @@ if __name__ == "__main__":
     schedule.every().day.at("08:40").do(monitor.morning_report)
     schedule.every().day.at("15:30").do(monitor.close_report)
     schedule.every().day.at("15:35").do(monitor.weekly_report)
+    schedule.every().day.at("08:34").do(monitor.monday_reset)   # [BUG-FIX] 08:35 daily_capital_sync 이전 실행 → _pre_cap 전주 자본 정확히 캡처
     schedule.every().day.at("08:35").do(monitor.daily_capital_sync)
-    schedule.every().day.at("08:35").do(monitor.monday_reset)
     schedule.every().day.at("15:00").do(monitor.thursday_warning)
     schedule.every().day.at("15:20").do(monitor.friday_force_exit)
     schedule.every().day.at("15:35").do(monitor.wednesday_midcheck)
