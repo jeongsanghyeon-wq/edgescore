@@ -1,11 +1,15 @@
 """
-EQS V1.0 (Edge Quant Signal) — 백테스트 엔진 v28.1
+EQS V1.1 백테스트 (Edge Quant Signal)
 =====================================================
-v28.0 → v28.1 변경사항:
-  [1] env 적용 — EMAIL_CONFIG를 .env 파일 기반 환경변수로 전환
-      (python-dotenv 없어도 자동 파싱, GitHub에 민감정보 노출 방지)
+EQS V1.0 → V1.1 변경사항:
+  [1] ㊷ 코스피200 동적 유니버스 — 기존 고정 8종목에서 코스피200 전체로 확대
+      - pykrx로 기준일 코스피200 구성종목 자동 조회
+      - 시가총액+KRX업종 기반 클러스터 자동 분류 (대형가치/기술대형/금융/중소형성장)
+      - 슬리피지 시총 기준 자동 결정 (대형0.003/중형0.005/소형0.008)
+      - SECTOR_MAP 동적 구성
+      - pykrx 미설치 또는 조회 실패 시 기존 8종목 폴백
 
-v27.1 대비 신규 추가:
+EQS V1.0 대비 신규 추가 (V1.1):
   ㉝ RSI 다이버전스 감지 — 주가 신고가 + RSI 하락 시 Edge 감점
   ㉞ 섹터 로테이션 가중치 — 강세 섹터 소속 종목 Edge 보너스
   ㉟ 멀티 타임프레임 필터 — 주봉 추세 ≠ 일봉 신호 시 진입 차단
@@ -44,10 +48,10 @@ v26.0 유지:
                 beautifulsoup4 openpyxl schedule
 
 실행 (즉시):
-    python edge_score_backtest_v27.py
+    python eqs_backtest_v1_1.py
 
 실행 (스케줄러):
-    python edge_score_backtest_v27.py --scheduler
+    python eqs_backtest_v1_1.py --scheduler
 """
 
 import sys, os, json
@@ -219,14 +223,7 @@ RSI_DIVERGENCE_PENALTY = 0.08   # 다이버전스 감지 시 Edge 감점
 SECTOR_MOMENTUM_WINDOW = 20     # 섹터 모멘텀 산출 윈도우 (거래일)
 SECTOR_MOMENTUM_BONUS  = 0.05   # 강세 섹터 Edge 보너스
 SECTOR_MOMENTUM_PENALTY= 0.03   # 약세 섹터 Edge 감점
-SECTOR_MAP = {
-    "반도체":  ["005930","000660","031980"],
-    "자동차":  ["005380","000270"],
-    "금융":    ["105560","055550","032830","316140","138930"],
-    "소재":    ["005490","373220"],
-    "IT서비스":["035420","068270"],
-    "기타":    ["066570","112610","051910"],
-}
+SECTOR_MAP = {}  # ㊷ build_kospi200_universe() 실행 후 아래에서 덮어씀
 
 # ㉟ 멀티 타임프레임 필터
 WEEKLY_MA_PERIOD       = 10     # 주봉 이동평균 기간 (10주 = 약 50거래일)
@@ -268,57 +265,193 @@ EMAIL_CONFIG = {
     "port":     int(os.environ.get("EMAIL_PORT", "587")),
 }
 
-TICKERS = {
-    # ── 기존 4종목 ──
-    "삼성전자":         "005930",
-    "현대차":           "005380",
-    "KB금융":           "105560",
-    "피에스케이홀딩스": "031980",
-    # ── ㉙ 대안 후보군 확대 (4종목 추가) ──
-    "SK하이닉스":       "000660",
-    "카카오":           "035720",
-    "POSCO홀딩스":      "005490",
-    "LG에너지솔루션":   "373220",
+# ══════════════════════════════════════════════════════
+# ㊷ 코스피200 동적 유니버스 (EQS V1.1)
+# ──────────────────────────────────────────────────────
+# pykrx로 코스피200 종목을 실시간 조회하고
+# 시가총액 + KRX 업종코드 기반으로 클러스터를 자동 분류한다.
+#
+# 클러스터 분류 규칙:
+#   ① KRX 업종 → 금융 계열               → "금융주"
+#   ② KRX 업종 → IT/반도체 + 시총 상위   → "기술대형주"
+#   ② KRX 업종 → IT/반도체 + 시총 하위   → "중소형성장주"
+#   ③ 시총 상위 (비금융/비IT)             → "대형가치주"
+#   ④ 나머지                              → "중소형성장주"
+#
+# 슬리피지: 시총 기준 자동 결정
+#   시총 10조 이상  → 0.003  (대형)
+#   시총 1~10조     → 0.005  (중형)
+#   시총 1조 미만   → 0.008  (소형)
+# ══════════════════════════════════════════════════════
+
+KOSPI200_REFERENCE_DATE = "20150102"              # 분류 기준 시점 (백테스트 시작 직전)
+LARGE_CAP_THRESHOLD_KRW = 10_000_000_000_000      # 10조 이상 → 대형
+MID_CAP_THRESHOLD_KRW   =  1_000_000_000_000      #  1조 이상 → 중형
+
+# KRX 업종명 → EQS 섹터명 매핑
+_KRX_SECTOR_TO_EQS = {
+    "금융": "금융", "은행": "금융", "증권": "금융", "보험": "금융", "기타금융": "금융",
+    "전기전자": "IT전자", "반도체": "IT전자", "IT": "IT전자",
+    "소프트웨어": "IT서비스", "통신": "IT서비스",
+    "자동차": "자동차", "운수장비": "자동차",
+    "철강금속": "소재", "화학": "소재", "에너지": "소재",
+    "의약": "헬스케어", "의료정밀": "헬스케어",
 }
 
-TOP_TICKERS_MEDVOL = [
-    "005930","000660","005380","035420","051910",
-    "006400","068270","105560","055550","032830",
-]
-
+# 클러스터별 파라미터 (tickers 리스트는 build_kospi200_universe()에서 채워짐)
 CLUSTER_PARAMS = {
     "대형가치주": {
-        # [Issue-3 수정] 000270(기아) RT 대형가치주와 동일하게 추가 (이전: 기타 → slippage/ATR 불일치)
-        "tickers":  ["005930","005380","105560","055550","032830","000270"],
-        "W_MF":0.4,"W_TECH":0.3,"W_MOM":0.3,
-        "T_DOF":7,"ASYM_BASE":1.2,"MF_CAP":0.08,"TECH_CAP":0.015,
+        "tickers": [],
+        "W_MF":0.4, "W_TECH":0.3, "W_MOM":0.3,
+        "T_DOF":7, "ASYM_BASE":1.2, "MF_CAP":0.08, "TECH_CAP":0.015,
     },
     "중소형성장주": {
-        # [Issue-3 수정] 112610(씨에스윈드) RT 중소형성장주와 동일하게 추가 (이전: 기타 → slippage 0.005 오적용)
-        "tickers":  ["031980","035420","068270","051910","112610"],
-        "W_MF":0.3,"W_TECH":0.25,"W_MOM":0.45,
-        "T_DOF":3,"ASYM_BASE":1.5,"MF_CAP":0.12,"TECH_CAP":0.03,
+        "tickers": [],
+        "W_MF":0.3, "W_TECH":0.25, "W_MOM":0.45,
+        "T_DOF":3, "ASYM_BASE":1.5, "MF_CAP":0.12, "TECH_CAP":0.03,
     },
     "금융주": {
-        # [Bug-2 수정] 105560·055550·032830은 대형가치주와 중복 등록 → 첫매칭 반환으로 항상 대형가치주 분류
-        # [Issue-3 수정] 138930(IBK기업은행) RT 금융주와 동일하게 추가 (이전: 기타 → slippage/W_MF 불일치)
-        "tickers":  ["316140","138930"],
-        "W_MF":0.45,"W_TECH":0.3,"W_MOM":0.25,
-        "T_DOF":6,"ASYM_BASE":1.3,"MF_CAP":0.08,"TECH_CAP":0.012,
+        "tickers": [],
+        "W_MF":0.45, "W_TECH":0.3, "W_MOM":0.25,
+        "T_DOF":6, "ASYM_BASE":1.3, "MF_CAP":0.08, "TECH_CAP":0.012,
     },
-    # [H-2 수정] RT '기술대형주' 클러스터와 동기화
     "기술대형주": {
-        "tickers":  ["000660","066570","005490","373220"],
-        "W_MF":0.35,"W_TECH":0.35,"W_MOM":0.30,
-        "T_DOF":5,"ASYM_BASE":1.3,"MF_CAP":0.10,"TECH_CAP":0.020,
+        "tickers": [],
+        "W_MF":0.35, "W_TECH":0.35, "W_MOM":0.30,
+        "T_DOF":5, "ASYM_BASE":1.3, "MF_CAP":0.10, "TECH_CAP":0.020,
     },
 }
+
+def _classify_cluster(market_cap: int, krx_sector: str) -> str:
+    """시가총액 + KRX 업종으로 EQS 클러스터 자동 결정."""
+    eqs_sec  = _KRX_SECTOR_TO_EQS.get(krx_sector, "기타")
+    is_large = market_cap >= LARGE_CAP_THRESHOLD_KRW
+    if eqs_sec == "금융":
+        return "금융주"
+    if eqs_sec in ("IT전자", "IT서비스"):
+        return "기술대형주" if is_large else "중소형성장주"
+    if is_large:
+        return "대형가치주"
+    return "중소형성장주"
+
+def _auto_slippage(market_cap: int) -> float:
+    """시가총액 기준 슬리피지 자동 결정."""
+    if market_cap >= LARGE_CAP_THRESHOLD_KRW:
+        return 0.003
+    if market_cap >= MID_CAP_THRESHOLD_KRW:
+        return 0.005
+    return 0.008
+
+def build_kospi200_universe():
+    """
+    코스피200 유니버스를 동적 구성.
+    TICKERS, CLUSTER_PARAMS["tickers"], SECTOR_MAP, SLIPPAGE_BY_CLUSTER 를 채운다.
+    pykrx 미설치 또는 조회 실패 시 기존 8종목으로 폴백.
+    """
+    # 각 클러스터 tickers 초기화
+    for cp in CLUSTER_PARAMS.values():
+        cp["tickers"] = []
+
+    _fallback_tickers = {
+        "삼성전자": "005930", "현대차": "005380", "KB금융": "105560",
+        "피에스케이홀딩스": "031980", "SK하이닉스": "000660",
+        "카카오": "035720", "POSCO홀딩스": "005490", "LG에너지솔루션": "373220",
+    }
+    _fallback_cluster = {
+        "005930":"기술대형주","000660":"기술대형주","005490":"기술대형주","373220":"기술대형주",
+        "005380":"대형가치주","105560":"금융주","031980":"중소형성장주","035720":"중소형성장주",
+    }
+    _fallback_sector = {
+        "반도체": ["005930","000660","031980"],
+        "자동차": ["005380"],
+        "금융":   ["105560"],
+        "소재":   ["005490","373220"],
+        "IT서비스":["035720"],
+    }
+
+    def _apply_fallback():
+        for code, cluster in _fallback_cluster.items():
+            CLUSTER_PARAMS[cluster]["tickers"].append(code)
+        return _fallback_tickers, _fallback_sector
+
+    if not PYKRX_AVAILABLE:
+        print("  ⚠️  pykrx 미설치 → 기존 8종목 폴백")
+        return _apply_fallback()
+
+    try:
+        print(f"  ▶ 코스피200 유니버스 조회 중 (기준일: {KOSPI200_REFERENCE_DATE})...")
+
+        # ① 코스피200 구성 종목
+        try:
+            kospi200_codes = stock.get_index_portfolio_deposit_file("1028")
+        except Exception:
+            kospi200_codes = []
+        if not kospi200_codes or len(kospi200_codes) < 10:
+            cap_df_tmp = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
+            kospi200_codes = cap_df_tmp.sort_values("시가총액", ascending=False).head(200).index.tolist()
+
+        # ② 시가총액
+        cap_df = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
+
+        # ③ 업종 정보
+        try:
+            sector_df = stock.get_market_sector_classifications(KOSPI200_REFERENCE_DATE, market="KOSPI")
+        except Exception:
+            sector_df = None
+
+        tickers_dict = {}
+        sector_map   = {}
+        slip_totals  = {k: [] for k in CLUSTER_PARAMS}
+
+        for code in kospi200_codes:
+            code = str(code).zfill(6)
+            try:
+                name = stock.get_market_ticker_name(code)
+            except Exception:
+                name = code
+
+            mktcap  = int(cap_df.loc[code, "시가총액"]) if code in cap_df.index else 0
+            krx_sec = "기타"
+            if sector_df is not None and code in sector_df.index:
+                krx_sec = str(sector_df.loc[code].get("업종명", "기타"))
+
+            cluster  = _classify_cluster(mktcap, krx_sec)
+            eqs_sec  = _KRX_SECTOR_TO_EQS.get(krx_sec, "기타")
+            slip     = _auto_slippage(mktcap)
+
+            tickers_dict[name] = code
+            CLUSTER_PARAMS[cluster]["tickers"].append(code)
+            sector_map.setdefault(eqs_sec, []).append(code)
+            slip_totals[cluster].append(slip)
+
+        # SLIPPAGE_BY_CLUSTER 클러스터별 중앙값으로 갱신
+        for cname, slips in slip_totals.items():
+            if slips:
+                SLIPPAGE_BY_CLUSTER[cname] = float(np.median(slips))
+
+        print(f"  ✅ 코스피200 유니버스 구성 완료: {len(tickers_dict)}종목")
+        for cname, cp in CLUSTER_PARAMS.items():
+            print(f"     {cname}: {len(cp['tickers'])}종목")
+
+        return tickers_dict, sector_map
+
+    except Exception as e:
+        print(f"  ⚠️  코스피200 조회 실패 ({e}) → 기존 8종목 폴백")
+        for cp in CLUSTER_PARAMS.values():
+            cp["tickers"] = []
+        return _apply_fallback()
+
+# ── 유니버스 빌드 (모듈 임포트 시 자동 실행) ──────────────
+TICKERS, _built_sector_map = build_kospi200_universe()
+SECTOR_MAP.update(_built_sector_map)  # ㊷ 동적 섹터맵 반영
+TOP_TICKERS_MEDVOL = list(TICKERS.values())[:10]
 
 def get_cluster_params(ticker):
     for name, p in CLUSTER_PARAMS.items():
         if ticker in p["tickers"]: return name, p
     return "기타", {"W_MF":0.4,"W_TECH":0.3,"W_MOM":0.3,
                     "T_DOF":5,"ASYM_BASE":1.3,"MF_CAP":0.1,"TECH_CAP":0.02}
+
 
 
 # ══════════════════════════════════════════════════════
@@ -1999,13 +2132,13 @@ def _cell(ws, row, col, val, fmt=None, fill=None):
     return c
 
 def build_excel_report(all_res, port_pnl, risk,
-                       filename="edge_score_v27_report.xlsx"):
+                       filename="eqs_v1_1_report.xlsx"):
     wb = Workbook()
 
     # ── 시트1: 요약 ──
     ws = wb.active; ws.title = "요약 대시보드"
     ws.merge_cells("A1:O1")
-    c = ws["A1"]; c.value = "Edge Score v27.0 백테스트 요약"
+    c = ws["A1"]; c.value = "EQS V1.1 백테스트 요약"
     c.font = Font(bold=True, size=14, color="1F4E79", name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
@@ -2037,7 +2170,7 @@ def build_excel_report(all_res, port_pnl, risk,
         "v24: ㉓ATR 트레일링 스탑/㉔대안 종목 자동 재배치",
         "v25: ㉕누적슬리피지 체크/㉖대안 전용 엄격 필터(3.5)",
         "v26: ㉗TrailingStop BEAR 가중/㉘기회비용 현실화(0.00014)/㉙후보군 효율+8종목 확대",
-        "v27: ㉚ALT_FILTER 국면 연동(BULL3.0/SIDE3.5/BEAR4.0)/㉛교체마찰비용",
+        "v1.1: ㊷코스피200 동적 유니버스 (200종목 자동 분류)",
     ]):
         ws.merge_cells(f"A{sr+i}:O{sr+i}")
         ws[f"A{sr+i}"].value = line
@@ -2285,7 +2418,7 @@ def plot_results(all_res, port_pnl):
     n   = len(all_res)
     fig = plt.figure(figsize=(14, n*4+9))
     gs  = fig.add_gridspec(n+2, 2, hspace=0.45, wspace=0.3)
-    fig.suptitle("Edge Score v24.0 Backtest", fontsize=13, fontweight="bold")
+    fig.suptitle("EQS V1.1 Backtest", fontsize=13, fontweight="bold")
 
     for i, r in enumerate(all_res):
         ax   = fig.add_subplot(gs[i,:])
@@ -2358,8 +2491,8 @@ def plot_results(all_res, port_pnl):
     ax_ev.set_title("㉑㉓㉔ 이벤트 발생 현황", fontsize=10)
     ax_ev.legend(fontsize=8)
 
-    plt.savefig("backtest_v27_result.png", dpi=150, bbox_inches="tight")
-    print("  📊 차트 저장: backtest_v27_result.png")
+    plt.savefig("eqs_v1_1_backtest_result.png", dpi=150, bbox_inches="tight")
+    print("  📊 차트 저장: eqs_v1_1_backtest_result.png")
     plt.close()
 
 
@@ -2371,7 +2504,7 @@ def send_email_report(all_res, port_pnl, excel_file):
     try:
         msg = MIMEMultipart()
         msg["From"] = EMAIL_CONFIG["sender"]; msg["To"] = EMAIL_CONFIG["receiver"]
-        msg["Subject"] = f"Edge Score v27.0 리포트 ({END_DATE})"
+        msg["Subject"] = f"EQS V1.1 리포트 ({END_DATE})"
         lines = [
             f"포트폴리오: {port_pnl['total_ret']:+.1%} | 알파: {port_pnl['alpha']:+.1%}",
             f"㉓ 트레일링발동: {len(port_pnl['trail_log'])}건 | "
@@ -2404,7 +2537,7 @@ def scheduled_job():
     if not all_res: return
     risk     = calc_portfolio_risk(all_res)
     port_pnl = calc_portfolio_pnl(all_res, all_res[0]["regime_ser"], risk["is_high_corr"])
-    fname    = f"edge_score_v27_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx"
+    fname    = f"eqs_v1_1_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx"
     ef       = build_excel_report(all_res, port_pnl, risk, fname)
     send_email_report(all_res, port_pnl, ef)
 
@@ -2423,7 +2556,7 @@ def main():
     if "--scheduler" in sys.argv: run_scheduler(); return
 
     print("\n" + "="*62)
-    print("  📊 Edge Score v27.0 백테스트")
+    print("  📊 EQS V1.1 백테스트 (Edge Quant Signal) (코스피200 동적 유니버스)")
     print("="*62)
     print(f"  기간: {START_DATE} ~ {END_DATE}")
     print(f"  ①~㉙ v26.0 전 기능 유지")
@@ -2495,10 +2628,10 @@ def main():
 
     print(f"\n{'='*62}")
     print("  엑셀 리포트 생성 중...")
-    build_excel_report(all_res, port_pnl, risk, "edge_score_v27_report.xlsx")
+    build_excel_report(all_res, port_pnl, risk, "eqs_v1_1_report.xlsx")
 
     print(f"\n{'='*62}")
-    print("  ✅ v27.0 백테스트 완료")
+    print("  ✅ EQS V1.1 백테스트 완료")
     print(f"{'='*62}")
     print("\n  [실전 전환 체크리스트]")
     print("  □ pip install pykrx                → 실제 KRX 고저가 포함")
@@ -2506,7 +2639,7 @@ def main():
     print(f"  □ HOLD_FRICTION_MULT 조정          → 현재 {HOLD_FRICTION_MULT} (높일수록 교체 억제)")
     print(f"  □ HOLD_FRICTION_EDGE_GAP_MULT 조정 → 현재 {HOLD_FRICTION_EDGE_GAP_MULT}")
     print(f"  □ ALT_OPPORTUNITY_COST 조정        → 현재 {ALT_OPPORTUNITY_COST:.5f}/일 = 연{ALT_OPPORTUNITY_COST*250:.1%}")
-    print("  □ TICKERS 추가                     → 현재 8종목")
+    print(f"  □ 유니버스                          → {len(TICKERS)}종목 (코스피200)")
     print("  □ USE_KIND_API = True              → 공시 감성 연동")
     print("  □ --scheduler                      → 자동 실행")
 

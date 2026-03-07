@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5
+EQS V1.1 (Edge Quant Signal) — Auto Optimizer
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 실거래 결과(trade_log.json)를 분석해서
   1) 최적 파라미터를 그리드 서치로 도출
@@ -916,7 +916,7 @@ def build_report(stats: dict, updates: dict, prev_cfg: dict,
 # ════════════════════════════════════════════════
 def main():
     print("\n" + "=" * 55)
-    print("  🤖 EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5")
+    print("  🤖 EQS V1.1 (Edge Quant Signal) — Auto Optimizer")
     print("=" * 55)
     print(f"  모드: {'미리보기 (DRY RUN)' if DRY_RUN else '🔴 실제 적용'}")
     print(f"  텔레그램: {'ON' if SEND_TG else 'OFF'}")

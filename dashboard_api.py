@@ -1,16 +1,16 @@
 """
-EQS V1.0 (Edge Quant Signal) — Dashboard API Server v1.9.2
+EQS V1.1 (Edge Quant Signal) — Dashboard API Server
 =============================================================
-v1.0 → v1.5 변경사항:
+EQS V1.0 → EQS V1.1 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
   [2] 스레드 안전성 — _monitor 접근 시 Lock + 스냅샷(deepcopy)
   [3] 텔레그램 알림 — 캐시 히트율 이상 시 알림
 
-v1.9.2 수정사항:
+EQS V1.1 수정사항:
   [BUG-FIX] api_portfolio summary에 available_cash 키 추가
             (총자본 - 평가금) → Dashboard 가용현금 패널 항상 ₩0 버그 수정
 
-v1.9.1 수정사항:
+EQS V1.1-rc 수정사항:
   [BUG-FIX] _cached() 데코레이터 ttl 파라미터 미지원 → TypeError 크래시 수정
             api_account(@_cached("account", ttl=_CACHE_TTL_ACCOUNT)) 정상 동작
 
@@ -59,7 +59,7 @@ def _get_alerts_path():
 # ══════════════════════════════════════════
 _cache = {}
 _CACHE_TTL = 3
-_CACHE_TTL_ACCOUNT = 30   # [v1.9] api_account 전용 30초 캐시 (키움 API 과호출 방지)
+_CACHE_TTL_ACCOUNT = 30   # [EQS V1.1] api_account 전용 30초 캐시 (키움 API 과호출 방지)
 
 # [BUG-FIX-2] deposit 공유 캐시 — api_portfolio / api_risk / api_account가 각자
 # get_deposit()을 호출하면 대시보드 5초 폴링 기준 분당 최대 ~40회 키움 API 호출 발생
@@ -85,7 +85,7 @@ def _get_deposit_cached(rt) -> int:
 
 
 def _cached(endpoint_key, ttl=None):
-    # [v1.9 BUG-FIX] ttl 파라미터 지원 추가 — api_account의 @_cached("account", ttl=_CACHE_TTL_ACCOUNT) TypeError 수정
+    # [EQS V1.1 BUG-FIX] ttl 파라미터 지원 추가 — api_account의 @_cached("account", ttl=_CACHE_TTL_ACCOUNT) TypeError 수정
     _ttl = ttl if ttl is not None else _CACHE_TTL
     def decorator(fn):
         @wraps(fn)
@@ -159,7 +159,7 @@ def start_dashboard(monitor, rt_module=None, port=5000):
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API v1.9.2 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API EQS V1.1 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -169,7 +169,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.9.2",
+        return jsonify({"status": "ok", "version": "EQS V1.1",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
@@ -177,7 +177,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "v40.0", "regime": _safe_attr("regime", "SIDE"),
+            "version": "EQS V1.1", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -206,7 +206,7 @@ def _create_app():
                 df_sl = rt.get_ohlcv(ticker, days=30)
                 atr = rt.calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl = rt.calc_dynamic_sl(atr, cp, ticker, _safe_attr("regime", "SIDE"))
-                # [v1.9 BUG-FIX] 손절가 표시를 실제 트리거와 동일하게 매수가 기준으로
+                # [EQS V1.1 BUG-FIX] 손절가 표시를 실제 트리거와 동일하게 매수가 기준으로
                 _sl_base = buy_p if buy_p > 0 else cp
                 sl_price = round(_sl_base * (1 + dyn_sl), -1)
                 df_edge = rt.get_ohlcv(ticker, days=60)
@@ -436,7 +436,7 @@ def _create_app():
                 "current_price": round(cp), "ret": round(ret, 4),
                 "edge": round(edge * 100), "hold_days": hold_days,
                 "action": action, "reasons": reasons,
-                # [v1.9 BUG-FIX] 매수가 기준 손절가 표시 (실제 트리거와 동일)
+                # [EQS V1.1 BUG-FIX] 매수가 기준 손절가 표시 (실제 트리거와 동일)
                 "sl_price": round((buy_p if buy_p > 0 else cp) * (1 + dyn_sl), -1),
                 "trail_active": trail,
             })
@@ -818,7 +818,7 @@ def _create_app():
 
     # ── ⑥⑦ 투자 모드 + 예수금 ────────────────────────────
     @app.route("/api/account")
-    @_cached("account", ttl=_CACHE_TTL_ACCOUNT)   # [v1.9] 30초 캐시
+    @_cached("account", ttl=_CACHE_TTL_ACCOUNT)   # [EQS V1.1] 30초 캐시
     def api_account():
         rt = _rt_module
         result = {
@@ -859,7 +859,7 @@ def _create_app():
 
 # ── 유틸 ────────────────────────────────────
 def _get_sector(ticker):
-    """섹터 조회 — rt.SECTOR_MAP_RT 기준으로 위임 (v1.9: dashboard 독립 맵 제거, 불일치 해소)"""
+    """섹터 조회 — rt.SECTOR_MAP_RT 기준으로 위임 (EQS V1.1: dashboard 독립 맵 제거, 불일치 해소)"""
     try:
         if _rt_module is not None and hasattr(_rt_module, "get_sector_for_ticker_rt"):
             return _rt_module.get_sector_for_ticker_rt(ticker)
