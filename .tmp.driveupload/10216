@@ -2470,6 +2470,130 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
     threading.Thread(target=_wait_and_notify, daemon=True).start()
 
 
+def _recover_pending_on_startup(monitor) -> None:
+    """재시작 시 미체결/pending 주문 상태를 실계좌 기준으로 복구.
+
+    복구 대상:
+    ① positions에 pending=True가 남아 있는 종목
+       → 실계좌 미체결 주문 조회 후 order_no 매핑
+       → _pending_buy/_pending_sell 복원 + orphan watcher 재기동
+    ② 실계좌에 미체결 주문이 있지만 내부 positions에 흔적이 없는 경우
+       → 경고만 발송 (자동 처리 불가 — 운영자 확인 필요)
+    """
+    try:
+        kw = kiwoom()
+        if kw is None:
+            log.warning("[재시작복구] kiwoom() None — pending 복구 건너뜀")
+            return
+
+        # ① 실계좌 미체결 주문 목록 조회
+        live_orders = kw.get_pending_orders()  # [{order_no, ticker, action, ...}]
+        live_by_ticker = {}
+        for o in live_orders:
+            live_by_ticker.setdefault(o["ticker"], []).append(o)
+
+        _recovered_buy  = []
+        _recovered_sell = []
+        _orphan_warn    = []
+
+        # ② positions에 pending=True 종목 처리
+        pending_tickers = [
+            tk for tk, info in monitor.positions.items()
+            if info.get("pending") or info.get("pending_sell")
+        ]
+        for ticker in pending_tickers:
+            info = monitor.positions.get(ticker, {})
+            name = info.get("name", ticker)
+            is_buy_pending  = bool(info.get("pending"))
+            is_sell_pending = bool(info.get("pending_sell"))
+
+            matched = live_by_ticker.get(ticker, [])
+            if not matched:
+                # 실계좌에 미체결 주문 없음 → 재시작 전에 이미 체결/취소됨
+                # pending 플래그만 정리 (체결은 다음 잔고 대조에서 자동 보정)
+                with _positions_lock:
+                    monitor.positions[ticker].pop("pending", None)
+                    monitor.positions[ticker].pop("pending_sell", None)
+                    monitor.positions[ticker].pop("_restore_pos", None)
+                    save_positions(monitor.positions)
+                log.info(f"[재시작복구] {name}({ticker}) 미체결 주문 없음 → pending 플래그 정리")
+                continue
+
+            # 미체결 주문 있음 → pending 복원 + orphan watcher 재기동
+            for o in matched:
+                order_no   = o["order_no"]
+                action     = o["action"]
+                cntr_qty   = o["cntr_qty"]
+                ord_qty    = o["ord_qty"]
+                remaining  = o["remaining_qty"]
+
+                if action == "buy" and is_buy_pending:
+                    with _pending_buy_lock:
+                        _pending_buy.add(ticker)
+                    _recovered_buy.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
+                    log.info(f"[재시작복구] {name}({ticker}) 매수 _pending_buy 복원 + watcher 재기동")
+                    # 이미 부분체결분은 positions에 반영됐다고 전제
+                    _start_orphan_watcher(
+                        order_no, ticker, name, "buy",
+                        confirmed_qty=cntr_qty,
+                        confirmed_uv=int(monitor.positions.get(ticker, {}).get("buy_price", 0)),
+                        monitor=monitor,
+                        buy_log_data={
+                            "action": "buy", "ticker": ticker, "name": name,
+                            "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
+                            "shares": cntr_qty, "amount": 0,
+                            "reason": "재시작복구(잔량추적)",
+                        },
+                    )
+                elif action == "sell" and is_sell_pending:
+                    with _pending_sell_lock:
+                        _pending_sell.add(ticker)
+                    _recovered_sell.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
+                    log.info(f"[재시작복구] {name}({ticker}) 매도 _pending_sell 복원 + watcher 재기동")
+                    sell_data = {
+                        "action": "sell", "ticker": ticker, "name": name,
+                        "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
+                        "shares": cntr_qty, "amount": 0,
+                        "_total_shares": ord_qty,
+                        "reason": "재시작복구(잔량추적)",
+                    }
+                    _start_orphan_watcher(
+                        order_no, ticker, name, "sell",
+                        confirmed_qty=cntr_qty,
+                        confirmed_uv=0,
+                        monitor=monitor,
+                        sell_log_data=sell_data,
+                    )
+
+        # ③ 실계좌에 미체결 주문이 있지만 내부 positions에 흔적 없음 → 경고
+        for ticker, orders in live_by_ticker.items():
+            if ticker not in monitor.positions:
+                for o in orders:
+                    _orphan_warn.append(
+                        f"  ❓ {ticker} {o['action']} 주문:{o['order_no']} "
+                        f"(내부 포지션 없음 — 수동 확인 필요)"
+                    )
+
+        # ④ 복구 결과 텔레그램 발송
+        if _recovered_buy or _recovered_sell or _orphan_warn:
+            _parts = ["🔄 <b>[재시작 복구] pending 주문 상태 복원</b>", "━━━━━━━━━━━━━━━━━━"]
+            if _recovered_buy:
+                _parts.append(f"✅ 매수 재추적 ({len(_recovered_buy)}건)")
+                _parts += _recovered_buy
+            if _recovered_sell:
+                _parts.append(f"✅ 매도 재추적 ({len(_recovered_sell)}건)")
+                _parts += _recovered_sell
+            if _orphan_warn:
+                _parts.append("⚠️ 실계좌 주문 / 내부 불일치 (수동확인)")
+                _parts += _orphan_warn
+            tg("\n".join(_parts))
+        else:
+            log.info("[재시작복구] 복구 대상 없음 — 정상 시작")
+
+    except Exception as e:
+        log.error(f"[재시작복구] 오류: {e}")
+
+
 def _release_pending(
     action: str, ticker: str, name: str, monitor,
     is_final: bool, prev_qty: int,
@@ -5864,6 +5988,54 @@ class EdgeMonitor:
                 pass
         log.info(f"[백업] {', '.join(backed)} → backup/")
 
+    def intraday_reconcile(self):
+        """장중 30분 주기 계좌 잔고 ↔ 내부 포지션 대조.
+        orphan watcher가 놓친 케이스를 장마감 전에 선제 포착.
+        [35차-FIX] 장중에만 실행, pending 종목은 스킵 (추적 중이므로)
+        """
+        from datetime import time as dtime
+        now = datetime.now().time()
+        if not (dtime(9, 0) <= now <= dtime(15, 30)):
+            return   # 장중에만 실행
+        try:
+            kw = kiwoom()
+            if not kw or not self.positions:
+                return
+            _bal = kw.get_balance()
+            if not _bal:
+                return
+            _real = {b["ticker"]: int(b.get("qty", 0)) for b in _bal if b.get("ticker")}
+            _mismatch = []
+            for tk, info in self.positions.items():
+                if info.get("pending") or info.get("pending_sell"):
+                    continue   # watcher 추적 중 → 스킵
+                internal_qty = int(info.get("shares", 0))
+                real_qty = _real.get(tk, 0)
+                if real_qty != internal_qty:
+                    nm = info.get("name", tk)
+                    if real_qty > internal_qty:
+                        # 실계좌 > 내부 → 자동 보정 (잔량 추가체결 누락 가능성)
+                        _bp = float(info.get("buy_price", 0))
+                        with _positions_lock:
+                            self.positions[tk]["shares"] = real_qty
+                            self.positions[tk]["amount"] = _bp * real_qty
+                            save_positions(self.positions)
+                        log.warning(f"[장중대조] {nm}({tk}) {internal_qty}→{real_qty}주 자동보정")
+                        _mismatch.append(f"  ✅ {nm}({tk}): {internal_qty}→{real_qty}주 자동보정")
+                    else:
+                        # 내부 > 실계좌 → 수동 확인 필요
+                        _mismatch.append(f"  ⚠️ {nm}({tk}): 내부 {internal_qty}주 > 실계좌 {real_qty}주")
+            for tk, qty in _real.items():
+                if tk not in self.positions and qty > 0:
+                    _mismatch.append(f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록)")
+            if _mismatch:
+                tg("🔍 <b>[장중 잔고 대조]</b> 불일치 감지\n" + "\n".join(_mismatch))
+                log.warning(f"[장중대조] 불일치 {len(_mismatch)}건")
+            else:
+                log.info("[장중대조] 내부 ↔ 실계좌 일치 ✅")
+        except Exception as e:
+            log.debug(f"[장중대조] 오류: {e}")
+
     def close_report(self):
         if not is_trading_day():
             return
@@ -6794,6 +6966,10 @@ if __name__ == "__main__":
 
     monitor = EdgeMonitor()
     monitor.update_regime()
+
+    # [35차-FIX] 재시작 시 미체결/pending 상태 복구
+    # positions에 pending=True 종목 → 실계좌 미체결 조회 → _pending_buy/_pending_sell 복원 + watcher 재기동
+    _recover_pending_on_startup(monitor)
     # ── 데이터 소스 진단 ─────────────────────────
     def _diagnose_data_sources():
         status, test_tk = [], "005930"
@@ -6897,6 +7073,7 @@ if __name__ == "__main__":
     schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.check_holdings)
     schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
     schedule.every(30).minutes.do(monitor.update_regime)
+    schedule.every(30).minutes.do(monitor.intraday_reconcile)   # [35차-FIX] 장중 주기적 잔고 대조
     schedule.every(30).minutes.do(monitor.offhours_check)
     schedule.every().day.at("08:30").do(monitor.do_refresh_universe)
     schedule.every().day.at("08:40").do(monitor.morning_report)
