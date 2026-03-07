@@ -836,6 +836,12 @@ _ohlcv_cache: dict = {}
 # check_holdings(메인 스케줄 스레드) + _do_buy/_do_sell(텔레그램 커맨더 스레드) 동시 호출 가능
 _trade_log_lock = threading.Lock()
 
+# [TOP7-⑦] positions 딕셔너리 직렬화 락
+# check_holdings(스케줄 스레드) + _do_buy/_do_sell(텔레그램 스레드)가 동시에
+# positions를 읽고 쓰면 이중 매도/포지션 꼬임 발생 가능
+# → 모든 positions 읽기/쓰기 경로를 단일 락으로 직렬화
+_positions_lock = threading.Lock()
+
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
 # ══════════════════════════════════════════════════
@@ -988,6 +994,7 @@ def get_ohlcv(ticker: str, days: int = 90):
                         df["foreign_net"] = 0
                     err_tracker.record_ok(f"kiwoom_ohlcv:{ticker}")
                     log.debug(f"[키움] 일봉 {ticker} {len(df)}행")
+                    _ohlcv_source = "kiwoom"
         except Exception as e:
             emsg = str(e)
             if "429" in emsg or "허용된 요청 개수를 초과" in emsg or "return_code" in emsg:
@@ -1025,6 +1032,9 @@ def get_ohlcv(ticker: str, days: int = 90):
                     except Exception:
                         df["foreign_net"] = 0
                     err_tracker.record_ok(f"fdr:{ticker}")
+                    # [TOP7-⑥] 소스 폴백 로그 — 신호 이상 발생 시 원인 추적용
+                    log.warning(f"[OHLCV폴백] {ticker}: 키움→FDR 전환 (days={days})")
+                    _ohlcv_source = "fdr"
         except Exception as e:
             log.debug(f"FDR [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"fdr:{ticker}")
@@ -1057,6 +1067,9 @@ def get_ohlcv(ticker: str, days: int = 90):
                     df["foreign_net"] = 0
                 df = df.tail(days)
                 err_tracker.record_ok(f"pykrx:{ticker}")
+                    # [TOP7-⑥] 소스 폴백 로그
+                log.warning(f"[OHLCV폴백] {ticker}: FDR→pykrx 전환 (days={days})")
+                _ohlcv_source = "pykrx"
         except Exception as e:
             log.debug(f"pykrx [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"pykrx:{ticker}")
@@ -1076,9 +1089,39 @@ def get_ohlcv(ticker: str, days: int = 90):
                     "거래량":      raw["Volume"].values.flatten(),
                     "foreign_net": 0,
                 }, index=raw.index).tail(days)
+                # [TOP7-⑥] 소스 폴백 로그
+                log.warning(f"[OHLCV폴백] {ticker}: pykrx→yfinance 전환 (days={days}, 15분지연)")
+                _ohlcv_source = "yfinance"
                 log.debug(f"[{ticker}] yfinance(15분지연) 사용")
         except Exception as e:
             log.debug(f"yfinance [{ticker}]: {e}")
+
+    # [TOP10-③] OHLCV 극단값 필터
+    # 0 가격, 전일 대비 ±30% 초과 이상값이 edge·ATR·손절가 계산에 흘러들어가는 것 방지
+    if df is not None:
+        try:
+            _before = len(df)
+            # ① 종가 0 이하 행 제거
+            df = df[df["종가"] > 0].copy()
+            # ② 종가 급등락 필터 — 전일 대비 ±30% 초과 행을 직전값으로 대체
+            _close = df["종가"].copy()
+            _pct   = _close.pct_change().abs()
+            _mask  = _pct > 0.30
+            if _mask.any():
+                # 제거 대신 직전값으로 대체 (행 제거 시 봉 수 부족 위험)
+                df.loc[_mask, "종가"] = df["종가"].shift(1)[_mask]
+                df.loc[_mask, "고가"] = df["고가"].shift(1)[_mask]
+                df.loc[_mask, "저가"] = df["저가"].shift(1)[_mask]
+                _cnt = int(_mask.sum())
+                log.warning(f"[OHLCV극단값] {ticker}: 전일대비 ±30% 초과 {_cnt}행 직전값 대체")
+            _after = len(df)
+            if _after < _before:
+                log.warning(f"[OHLCV극단값] {ticker}: 0가격 {_before-_after}행 제거")
+            if len(df) < 5:
+                log.warning(f"[OHLCV극단값] {ticker}: 필터 후 {len(df)}행 — None 반환")
+                df = None
+        except Exception as _fe:
+            log.debug(f"[OHLCV극단값] 필터 오류 {ticker}: {_fe}")
 
     if df is not None:
         _ohlcv_cache[_cache_key] = {"df": df, "ts": now}
@@ -2874,9 +2917,11 @@ class TelegramCommander:
             _order_sent = True
 
         # 주문 성공(또는 키움 미연결/긴급모드) 시에만 저장
+        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
         if _order_sent:
-            self.monitor.positions[ticker] = _new_position
-            save_positions(self.monitor.positions)
+            with _positions_lock:
+                self.monitor.positions[ticker] = _new_position
+                save_positions(self.monitor.positions)
 
             if ticker not in self.monitor.universe:
                 self.monitor.universe[ticker] = name
@@ -3129,12 +3174,14 @@ class TelegramCommander:
             "carry_over":   False,
         })
 
+        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
         if is_partial:
-            remain = total_shares - sell_shares
-            pos["shares"] = remain
-            pos["amount"] = buy_price * remain
-            pos["alerted_steps"] = []
-            save_positions(self.monitor.positions)
+            with _positions_lock:
+                remain = total_shares - sell_shares
+                pos["shares"] = remain
+                pos["amount"] = buy_price * remain
+                pos["alerted_steps"] = []
+                save_positions(self.monitor.positions)
             tg_btn(
                 f"📤 <b>일부 매도 완료!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -3150,8 +3197,9 @@ class TelegramCommander:
                   {"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
             )
         else:
-            del self.monitor.positions[ticker]
-            save_positions(self.monitor.positions)
+            with _positions_lock:
+                del self.monitor.positions[ticker]
+                save_positions(self.monitor.positions)
             tg_btn(
                 f"📤 <b>전체 매도 완료!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -4418,18 +4466,29 @@ class EdgeMonitor:
         })
         self.today_exited.add(ticker)   # ③ 당일 재진입 차단
         # ── 포지션 삭제 및 저장 ─────────────────────────
-        self.positions.pop(ticker, None)
-        save_positions(self.positions)
+        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
+        with _positions_lock:
+            self.positions.pop(ticker, None)
+            save_positions(self.positions)
 
     # ── 보유 종목 체크 (1분, 장중) ──────────────────────
     def check_holdings(self):
         """보유 종목 손절·트레일링·익절·타임스탑 1분 체크"""
         if not is_market_hour():
             return
+        # [TOP10-④] 장초 매매 버퍼 — 09:00~09:05 손절 트리거 차단
+        # 장 시작 직후 5분은 유동성 최저·스프레드 최대 구간
+        # 갭 하락이 일시적이면 억울한 손절, 체결 시 최악 가격 적용 위험
+        _now_t = datetime.now().strftime("%H:%M")
+        if "09:00" <= _now_t < "09:05":
+            log.debug(f"[장초버퍼] {_now_t} 손절 체크 스킵 (09:00~09:05 매매 차단)")
+            return
         if not self.positions:
             return
         alerts = []
-        for ticker, info in list(self.positions.items()):
+        # [TOP7-⑦] positions 락 — 텔레그램 수동매도와 동시 접근 시 이중 매도 방지
+        with _positions_lock:
+         for ticker, info in list(self.positions.items()):
             name   = info.get("name", resolve_name(ticker))
             df     = get_ohlcv(ticker, days=30)
             cp     = get_current_price(ticker)
@@ -4829,6 +4888,11 @@ class EdgeMonitor:
     # ── 유니버스 스캔 (5분, 장중) ──────────────────
     def scan_universe(self, force_notify: bool = False):
         if not is_market_hour() and not force_notify:
+            return
+        # [TOP10-④] 장초 매매 버퍼 — 09:00~09:05 매수 신호 차단
+        _now_t = datetime.now().strftime("%H:%M")
+        if "09:00" <= _now_t < "09:05" and not force_notify:
+            log.debug(f"[장초버퍼] {_now_t} 매수 스캔 스킵 (09:00~09:05 매매 차단)")
             return
         now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows         = []
@@ -5386,6 +5450,47 @@ class EdgeMonitor:
                     f"🏆 승률: {_summary['win_rate']:.1%}"
                 )
             tg(_trade_msg)
+        # [TOP7-④] 장 마감 후 실계좌 잔고 대조 리포트
+        # 자동 수정 없이 불일치만 텔레그램으로 알림 → 운영자가 수동 확인
+        try:
+            kw = kiwoom()
+            if kw and self.positions:
+                _bal = kw.get_balance()   # [{ticker, name, shares, ...}, ...]
+                if _bal:
+                    _real = {b["ticker"]: int(b.get("shares", 0)) for b in _bal
+                             if b.get("ticker")}
+                    _internal = {tk: int(info.get("shares", 0))
+                                 for tk, info in self.positions.items()}
+                    _mismatch = []
+                    # ① 내부 있음 → 실계좌 없거나 수량 다름
+                    for tk, qty in _internal.items():
+                        real_qty = _real.get(tk, 0)
+                        if real_qty != qty:
+                            nm = self.positions[tk].get("name", tk)
+                            _mismatch.append(
+                                f"  ⚠️ {nm}({tk}): 내부 {qty}주 ↔ 실계좌 {real_qty}주"
+                            )
+                    # ② 실계좌 있음 → 내부 없음
+                    for tk, qty in _real.items():
+                        if tk not in _internal and qty > 0:
+                            _mismatch.append(
+                                f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록)"
+                            )
+                    if _mismatch:
+                        _rec_msg = (
+                            "🔍 <b>잔고 대조 이상 감지</b>\n"
+                            "━━━━━━━━━━━━━━━━━━\n"
+                            + "\n".join(_mismatch) +
+                            "\n\n⚠️ 수동으로 확인 후 positions를 직접 수정해주세요.\n"
+                            "(자동 수정 없음 — 안전 우선)"
+                        )
+                        tg(_rec_msg)
+                        log.warning(f"[잔고대조] 불일치 {len(_mismatch)}건 감지")
+                    else:
+                        log.info("[잔고대조] 내부 포지션 ↔ 실계좌 잔고 일치 ✅")
+        except Exception as _re:
+            log.debug(f"[잔고대조] 조회 실패: {_re}")
+
         self.today_alerts = 0
     # ── ⑧ 주간 성과 집계 (금요일 15:35) ─────────
     def weekly_report(self):
