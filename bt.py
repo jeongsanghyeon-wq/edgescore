@@ -44,7 +44,7 @@ v26.0 유지:
   ①~㉙ 전 기능 유지
 
 필요 라이브러리:
-    pip install finance-datareader pandas numpy scipy matplotlib requests
+    pip install yfinance pandas numpy scipy matplotlib requests
                 beautifulsoup4 openpyxl schedule
 
 실행 (즉시):
@@ -100,14 +100,15 @@ except ImportError:
     SCHEDULE_AVAILABLE = False
 
 try:
-    import FinanceDataReader as fdr; FDR_AVAILABLE = True
+    import yfinance as yf; YF_AVAILABLE = True
 except ImportError:
-    FDR_AVAILABLE = False
-    print("⚠️  FinanceDataReader 미설치 → 시뮬레이션 데이터로 실행합니다.")
-    print("     pip install finance-datareader")
+    YF_AVAILABLE = False
+    print("⚠️  yfinance 미설치 → 시뮬레이션 데이터로 실행합니다.")
+    print("     python3 -m pip install yfinance")
 
-# pykrx 하위 호환 (일부 코드에서 PYKRX_AVAILABLE 참조 대비)
-PYKRX_AVAILABLE = FDR_AVAILABLE
+# 하위 호환
+FDR_AVAILABLE    = YF_AVAILABLE
+PYKRX_AVAILABLE  = YF_AVAILABLE
 
 
 # ══════════════════════════════════════════════════════
@@ -464,7 +465,7 @@ def build_yearly_kospi200():
     global YEARLY_UNIVERSE
     # StockListing 불안정 → 유니버스 필터 비활성화, 전 기간 동일 종목 사용
     YEARLY_UNIVERSE = {}
-    print("  ℹ️  연도별 유니버스: 하드코딩 코스피200 사용 (fdr StockListing 불안정)")
+    print("  ℹ️  연도별 유니버스: 하드코딩 코스피200 사용 (yfinance 기반)")
 
 def is_in_yearly_universe(ticker: str, date) -> bool:
     """YEARLY_UNIVERSE가 비어있으면 필터 비활성화 (전 종목 허용)."""
@@ -483,8 +484,8 @@ def build_kospi200_universe():
     for cp in CLUSTER_PARAMS.values():
         cp["tickers"] = []
 
-    if not FDR_AVAILABLE:
-        print("  ⚠️  fdr 미설치 → 기존 8종목 폴백")
+    if not YF_AVAILABLE:
+        print("  ⚠️  yfinance 미설치 → 기존 8종목 폴백")
         _fb = {
             "삼성전자":"005930","현대차":"005380","KB금융":"105560",
             "피에스케이홀딩스":"031980","SK하이닉스":"000660",
@@ -1153,14 +1154,19 @@ def calc_beta_eff(df, mkt):
     return b52.fillna(b20) * 0.3 + b20.fillna(b52) * 0.7
 
 def calc_med_vol(mkt, w=5):
-    if FDR_AVAILABLE:
+    if YF_AVAILABLE:
         vd = {}
-        for tk in TOP_TICKERS_MEDVOL[:10]:
+        sd = pd.Timestamp(START_DATE).strftime("%Y-%m-%d")
+        ed = pd.Timestamp(END_DATE).strftime("%Y-%m-%d")
+        for tk in TOP_TICKERS_MEDVOL[:5]:   # 5개로 축소 (속도)
             try:
-                tmp = fdr.DataReader(tk, START_DATE, END_DATE)
+                tmp = yf.download(f"{tk}.KS", start=sd, end=ed,
+                                  auto_adjust=True, progress=False)
+                if tmp is None or len(tmp) < 10: continue
+                tmp = _yf_parse(tmp)
                 tmp.index = pd.to_datetime(tmp.index)
-                close = tmp["Close"] if "Close" in tmp.columns else tmp.iloc[:,3]
-                vd[tk] = close.pct_change().abs()
+                if "종가" in tmp.columns:
+                    vd[tk] = tmp["종가"].pct_change().abs()
             except: continue
         if vd:
             return (pd.DataFrame(vd).rolling(w).median().median(axis=1)
@@ -1284,15 +1290,16 @@ def is_friday(idx) -> bool:
         ts = pd.Timestamp(idx)
         if ts.weekday() != 4:
             return False
-        # fdr로 실제 거래일 여부 확인 (삼성전자 데이터 존재 여부로 판단)
-        if FDR_AVAILABLE:
+        # yfinance로 실제 거래일 여부 확인
+        if YF_AVAILABLE:
             try:
                 d_str = ts.strftime("%Y-%m-%d")
-                chk = fdr.DataReader("005930", d_str, d_str)
+                chk = yf.download("005930.KS", start=d_str, end=d_str,
+                                   progress=False, auto_adjust=True)
                 return chk is not None and len(chk) > 0
             except:
                 pass
-        return True   # fdr 실패 시 금요일로 간주 (보수적)
+        return True   # yfinance 실패 시 금요일로 간주 (보수적)
     except:
         return False
 
@@ -2030,40 +2037,48 @@ def _log_trade(log_list, name, pos, idx, regime, reason,
 # 데이터 수집
 # ══════════════════════════════════════════════════════
 
-# fdr 코스피 지수 캐시 (매번 조회 방지)
-_FDR_MKT_CACHE: dict = {}
+# yfinance 캐시 (코스피 지수 중복 조회 방지)
+_YF_MKT_CACHE: dict = {}
 
-def _fdr_get_mkt():
-    """코스피 지수(KS11) 캐시 조회."""
-    if "mkt" not in _FDR_MKT_CACHE:
+def _yf_parse(raw: "pd.DataFrame") -> "pd.DataFrame":
+    """yfinance MultiIndex 컬럼 → 단순 컬럼으로 정규화."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    col_map = {"Close":"종가","Open":"시가","High":"고가","Low":"저가","Volume":"거래량"}
+    return raw.rename(columns=col_map)
+
+def _yf_get_mkt():
+    """코스피 지수(^KS11) 캐시 조회."""
+    if "mkt" not in _YF_MKT_CACHE:
         try:
-            df = fdr.DataReader("KS11", START_DATE, END_DATE)
-            df.index = pd.to_datetime(df.index)
-            mkt = pd.DataFrame({"종가": df["Close"]})
-            if "Open" in df.columns:
-                mkt["시가"] = df["Open"]
-            _FDR_MKT_CACHE["mkt"] = mkt
+            sd = pd.Timestamp(START_DATE).strftime("%Y-%m-%d")
+            ed = pd.Timestamp(END_DATE).strftime("%Y-%m-%d")
+            raw = yf.download("^KS11", start=sd, end=ed, auto_adjust=True, progress=False)
+            raw = _yf_parse(raw)
+            raw.index = pd.to_datetime(raw.index)
+            _YF_MKT_CACHE["mkt"] = raw[["종가"]].copy()
         except Exception as e:
             print(f"  ⚠️  코스피 지수 조회 실패: {e}")
-            _FDR_MKT_CACHE["mkt"] = None
-    return _FDR_MKT_CACHE["mkt"]
+            _YF_MKT_CACHE["mkt"] = None
+    return _YF_MKT_CACHE["mkt"]
 
 def get_data(ticker):
-    if FDR_AVAILABLE:
+    if YF_AVAILABLE:
         try:
-            raw = fdr.DataReader(ticker, START_DATE, END_DATE)
+            sd = pd.Timestamp(START_DATE).strftime("%Y-%m-%d")
+            ed = pd.Timestamp(END_DATE).strftime("%Y-%m-%d")
+            yt = f"{ticker}.KS"
+            raw = yf.download(yt, start=sd, end=ed, auto_adjust=True, progress=False)
+            if raw is None or len(raw) < 60:
+                raise ValueError(f"데이터 부족: {len(raw) if raw is not None else 0}행")
+            raw = _yf_parse(raw)
             raw.index = pd.to_datetime(raw.index)
-            # fdr 컬럼명 → EQS 내부 컬럼명 매핑
-            col_map = {"Close":"종가", "Open":"시가", "High":"고가",
-                       "Low":"저가", "Volume":"거래량", "Change":"등락률"}
-            raw = raw.rename(columns=col_map)
-            # 필수 컬럼 보장
-            if "거래량" not in raw.columns:
-                raw["거래량"] = 0
-            if "시가" not in raw.columns:
-                raw["시가"] = raw["종가"]
-            raw["foreign_net"] = 0   # fdr 외국인 순매수 미지원 → 0
-            mkt = _fdr_get_mkt()
+            if "거래량" not in raw.columns: raw["거래량"] = 0
+            if "시가"   not in raw.columns: raw["시가"]   = raw["종가"]
+            if "고가"   not in raw.columns: raw["고가"]   = raw["종가"]
+            if "저가"   not in raw.columns: raw["저가"]   = raw["종가"]
+            raw["foreign_net"] = 0
+            mkt = _yf_get_mkt()
             if mkt is None:
                 raise ValueError("코스피 지수 없음")
             return raw, mkt, True
@@ -2743,7 +2758,7 @@ def main():
     print("  ✅ EQS V1.2 백테스트 완료")
     print(f"{'='*62}")
     print("\n  [실전 전환 체크리스트]")
-    print("  □ pip install finance-datareader   → 실제 KRX 데이터")
+    print("  □ pip install yfinance             → 실제 KRX 데이터")
     print(f"  □ ALT_FILTER_BY_REGIME 조정        → BULL={ALT_FILTER_BY_REGIME['BULL']} / SIDE={ALT_FILTER_BY_REGIME['SIDE']} / BEAR={ALT_FILTER_BY_REGIME['BEAR']}")
     print(f"  □ HOLD_FRICTION_MULT 조정          → 현재 {HOLD_FRICTION_MULT} (높일수록 교체 억제)")
     print(f"  □ HOLD_FRICTION_EDGE_GAP_MULT 조정 → 현재 {HOLD_FRICTION_EDGE_GAP_MULT}")
