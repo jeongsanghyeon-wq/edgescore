@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# kiwoom_client.py  — 키움 REST API 클라이언트 v1.4
+# kiwoom_client.py  — EQS V1.0 키움 REST API 클라이언트 v1.4
 # v1.4 패치:
 #   [BUG-FIX] get_order_fill ord_dt: "" → 오늘 날짜 명시 (YYYYMMDD)
 #             빈 문자열 전달 시 키움 API가 오늘 주문 미조회 가능

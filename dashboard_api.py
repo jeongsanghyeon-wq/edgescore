@@ -1,5 +1,5 @@
 """
-Edge Score v40.0 — Dashboard API Server v1.9.2
+EQS V1.0 (Edge Quant Signal) — Dashboard API Server v1.9.2
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Edge Score v40.0 무중단 실행 스크립트
+# EQS V1.0 (Edge Quant Signal) 무중단 실행 스크립트
 
 BASE_DIR="/Users/jeongsanghyeon/Desktop/edgescore"
 LOG_DIR="$BASE_DIR/logs"
@@ -58,7 +58,7 @@ while true; do
     sleep 1
 
     echo "============================================================" | tee -a "$LOG_DIR/runner.log"
-    echo "🚀 [$(date '+%Y년 %m월 %d일 %A %H시 %M분 %S초 KST')] Edge Score 엔진 기동 시작..." | tee -a "$LOG_DIR/runner.log"
+    echo "🚀 [$(date '+%Y년 %m월 %d일 %A %H시 %M분 %S초 KST')] EQS V1.0 엔진 기동 시작..." | tee -a "$LOG_DIR/runner.log"
     echo "============================================================" | tee -a "$LOG_DIR/runner.log"
 
     # [R-4 FIX] rt.py 출력 → 터미널 + 로그 파일 동시 기록

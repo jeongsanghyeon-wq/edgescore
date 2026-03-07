@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Edge Score Auto Optimizer v1.5
+EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 실거래 결과(trade_log.json)를 분석해서
   1) 최적 파라미터를 그리드 서치로 도출
@@ -69,16 +69,10 @@ def _get_trade_slip(trade: dict) -> float:
     ticker = str(trade.get("ticker", ""))
     cluster = _TICKER_CLUSTER_OPT.get(ticker, "기타")
     return _SLIPPAGE_BY_CLUSTER_OPT.get(cluster, 0.005)
-# [BUG-FIX-1] 파일명 탐색 순서:
-#   1순위: 기존 네이밍 규칙 (edge_score_backtest_v*.py / edge_score_realtime_v*.py)
-#   2순위: 현재 소스 묶음 기준 단축명 (bt.py / rt.py)
-#   → 어느 환경에서도 자동 동기화 파이프라인이 작동하도록 폴백 추가
-_rt_candidates  = sorted(BASE.glob("edge_score_realtime_v*.py"), reverse=True)
-_bt_candidates  = sorted(BASE.glob("edge_score_backtest_v*.py"), reverse=True)
-REALTIME_FILE   = (_rt_candidates[0] if _rt_candidates
-                   else BASE / "rt.py" if (BASE / "rt.py").exists() else None)
-BACKTEST_FILE   = (_bt_candidates[0] if _bt_candidates
-                   else BASE / "bt.py" if (BASE / "bt.py").exists() else None)
+REALTIME_FILE  = sorted(BASE.glob("edge_score_realtime_v*.py"), reverse=True)
+BACKTEST_FILE  = sorted(BASE.glob("edge_score_backtest_v*.py"),  reverse=True)
+REALTIME_FILE  = REALTIME_FILE[0] if REALTIME_FILE else None
+BACKTEST_FILE  = BACKTEST_FILE[0] if BACKTEST_FILE else None
 
 # ════════════════════════════════════════════════
 # 텔레그램
@@ -107,34 +101,13 @@ def tg(msg: str):
 def load_trades() -> list:
     if not TRADE_LOG_FILE.exists():
         print("❌ trade_log.json 없음"); return []
-    # [BUG-FIX] rt.py가 os.replace()로 JSON을 원자적으로 교체하지만,
-    # 극히 드문 타이밍(교체 직전)에 읽으면 partial JSON 또는 JSONDecodeError 가능
-    # → 최대 3회 재시도 + .tmp 파일 존재 시 잠시 대기
-    import time as _time
-    for _attempt in range(3):
-        try:
-            raw = TRADE_LOG_FILE.read_text(encoding="utf-8").strip()
-            if not raw:
-                _time.sleep(0.1)
-                continue
-            trades = json.loads(raw)
-            # 청산된 거래만 — 이월 로그(carry_over=True) 제외
-            # [Minor-11 수정] BT 주간이월 로그는 미실현 수익률이 기록되어 통계 오염 가능
-            return [t for t in trades
-                    if t.get("exit_price", 0) > 0
-                    and t.get("buy_price", 0) > 0
-                    and not t.get("carry_over", False)]   # 이월 행 제외
-        except json.JSONDecodeError:
-            # rt가 temp→replace 교체 중 타이밍 충돌 → 잠시 대기 후 재시도
-            if _attempt < 2:
-                _time.sleep(0.15)
-            else:
-                print("❌ trade_log.json 파싱 실패 (3회 시도) — rt 실행 중 타이밍 충돌 가능")
-                return []
-        except Exception as e:
-            print(f"❌ trade_log.json 로드 실패: {e}")
-            return []
-    return []
+    trades = json.loads(TRADE_LOG_FILE.read_text(encoding="utf-8"))
+    # 청산된 거래만 — 이월 로그(carry_over=True) 제외
+    # [Minor-11 수정] BT 주간이월 로그는 미실현 수익률이 기록되어 통계 오염 가능
+    return [t for t in trades
+            if t.get("exit_price", 0) > 0
+            and t.get("buy_price", 0) > 0
+            and not t.get("carry_over", False)]   # 이월 행 제외
 
 def calc_stats(trades: list) -> dict:
     if not trades:
@@ -683,9 +656,8 @@ def update_config(updates: dict) -> dict:
         _rt   = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_rt)
         _base = getattr(_rt, "DEFAULT_CONFIG", {})
-    except Exception as _e:
-        # [BUG-FIX] 조용히 삼키지 않고 명시적 경고 — baseline 불일치 방지
-        print(f"⚠️  [optimizer] rt.py DEFAULT_CONFIG 로드 실패 ({_e}) — 빈 baseline으로 진행")
+    except Exception:
+        pass
     cfg  = dict(_base)
     cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
 
@@ -745,9 +717,6 @@ def update_backtest_source(updates: dict) -> list:
         "CORR_HIGH_THRESHOLD": (r"(CORR_HIGH_THRESHOLD\s*=\s*)[\d.]+",    "{:.3f}"),
         "FRIDAY_HOLD_EDGE_THR":(r"(FRIDAY_HOLD_EDGE_THR\s*=\s*)[\d.]+",   "{:.3f}"),
         "CAPITAL_FLOOR_RATIO": (r"(CAPITAL_FLOOR_RATIO\s*=\s*)[\d.]+",    "{:.3f}"),
-        # [BUG-FIX] RT에서 업데이트되는 파라미터가 BT에 미반영되는 괴리 수정
-        "TIME_STOP_DAYS":      (r"(TIME_STOP_DAYS\s*=\s*)\d+",             "{:d}"),
-        "VOL_TARGET_DAILY":    (r"(VOL_TARGET_DAILY\s*=\s*)[\d.]+",        "{:.4f}"),
     }
     for cfg_key, (pattern, fmt) in simple_map.items():
         if cfg_key not in updates:
@@ -947,7 +916,7 @@ def build_report(stats: dict, updates: dict, prev_cfg: dict,
 # ════════════════════════════════════════════════
 def main():
     print("\n" + "=" * 55)
-    print("  🤖 Edge Score Auto Optimizer v1.5")
+    print("  🤖 EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5")
     print("=" * 55)
     print(f"  모드: {'미리보기 (DRY RUN)' if DRY_RUN else '🔴 실제 적용'}")
     print(f"  텔레그램: {'ON' if SEND_TG else 'OFF'}")

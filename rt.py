@@ -1,5 +1,5 @@
 """
-Edge Score v40.0 — 완전 통합 엔진
+EQS V1.0 (Edge Quant Signal) — 완전 통합 엔진
 =====================================================
 v40.0 패치:
 
@@ -3278,7 +3278,7 @@ class TelegramCommander:
                 mode_str = "🔵 모의투자 중"
 
         tg_btn(
-            f"🤖 <b>Edge Score 메인 메뉴</b>\n"
+            f"🤖 <b>EQS V1.0 메인 메뉴</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🕐 {datetime.now().strftime('%H:%M')}  {market_str}\n"
             f"📈 시장: {_regime_plain(regime)}\n"
@@ -4249,7 +4249,7 @@ class TelegramCommander:
     def _help(self):
         self.state = ""
         tg_btn(
-            "❓ <b>Edge Score 사용 가이드</b>\n"
+            "❓ <b>EQS V1.0 사용 가이드</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🤖 AI가 주식을 분석해서\n"
             "   매수·손절 신호를 알려드려요.\n\n"
@@ -7081,7 +7081,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v40.0 통합 엔진 가동")
+    log.info("  🚀 EQS V1.0 (Edge Quant Signal) 가동")
     log.info("=" * 55)
 
     # [3순위-FIX] 실계좌 모드에서 EMERGENCY_STOP=True면 시작 차단
@@ -7182,7 +7182,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v40.0 가동</b>\n"
+        f"🚀 <b>EQS V1.0 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
