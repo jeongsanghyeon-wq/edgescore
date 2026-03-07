@@ -2150,19 +2150,18 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     buy_price: float = 0.0,
                     reason: str = "",
                     monitor=None,
-                    buy_log_data: dict = None):
+                    buy_log_data: dict = None,
+                    sell_log_data: dict = None):
     """
     백그라운드에서 체결 확인 후 텔레그램 알림 발송
     action: 'buy' or 'sell'
-    buy_price: 매도 시 손익 계산용 매수단가
-    monitor: positions 참조 — 클로저로 개별 캡처 (함수 속성 공유 금지)
-    buy_log_data: 매수 체결 후 append_trade_log 호출용 데이터
-                  (접수 시점이 아닌 체결 확인 후 기록하여 미체결 시 log 오염 방지)
+    monitor: positions 참조 — 클로저로 개별 캡처
+    buy_log_data:  매수 체결 확인 후 append_trade_log 호출용
+    sell_log_data: 매도 체결 확인 후 positions 업데이트 + append_trade_log 호출용
+                   (_is_partial, _total_shares 포함)
     최대 60초간 3초 간격으로 폴링
     """
-    # [BUG-FIX-①] monitor를 함수 속성(_monitor_ref)으로 공유하지 않고
-    # _wait_and_notify 클로저가 직접 캡처 → 호출마다 독립 보관
-    # 이전 방식: _notify_on_fill._monitor_ref = monitor (나중 호출이 덮어쓰는 버그)
+    # [BUG-FIX-①] monitor를 클로저로 직접 캡처
     def _wait_and_notify():
         kw = kiwoom()
         if not kw:
@@ -2204,10 +2203,39 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             f"⏰ 체결시간: {cntr_tm}"
                         )
                     else:
-                        # 실제 체결가 기준으로 손익 재계산
-                        _pnl = (cntr_uv - buy_price) * cntr_qty if buy_price > 0 else 0
-                        _ret = (cntr_uv - buy_price) / buy_price if buy_price > 0 else 0
+                        # [BUG-FIX] 매도 체결 확인 후 positions/trade_log 확정
+                        # 접수 시점 선확정 제거 → 실체결 수량/가격 기준으로 반영
+                        _bp  = buy_price
+                        _pnl = (cntr_uv - _bp) * cntr_qty if _bp > 0 else 0
+                        _ret = (cntr_uv - _bp) / _bp if _bp > 0 else 0
                         pnl_icon = "✅" if _pnl >= 0 else "🔴"
+
+                        if sell_log_data and monitor and hasattr(monitor, "positions"):
+                            # 실체결가/실체결수량으로 log 데이터 갱신
+                            sell_log_data["sell_price"]  = cntr_uv
+                            sell_log_data["exit_price"]  = cntr_uv
+                            sell_log_data["shares"]      = cntr_qty
+                            sell_log_data["amount"]      = _bp * cntr_qty
+                            sell_log_data["ret"]         = round(_ret, 4)
+                            sell_log_data["pnl"]         = round(_pnl, 0)
+                            append_trade_log(sell_log_data)
+                            # positions 업데이트 (실체결 수량 기준)
+                            _is_partial    = sell_log_data.get("_is_partial", False)
+                            _total_shares  = sell_log_data.get("_total_shares", cntr_qty)
+                            with _positions_lock:
+                                if ticker in monitor.positions:
+                                    if _is_partial or cntr_qty < _total_shares:
+                                        remain = _total_shares - cntr_qty
+                                        monitor.positions[ticker]["shares"] = remain
+                                        monitor.positions[ticker]["amount"] = _bp * remain
+                                        monitor.positions[ticker].pop("pending_sell", None)
+                                        monitor.positions[ticker]["alerted_steps"] = []
+                                        save_positions(monitor.positions)
+                                    else:
+                                        monitor.positions.pop(ticker, None)
+                                        save_positions(monitor.positions)
+                            _pending_sell.discard(ticker)
+
                         msg = (
                             f"{_icon} <b>[{_mode}] 매도 체결 완료!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -2215,7 +2243,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             f"{('🔔 사유: ' + reason + chr(10)) if reason else ''}"
                             f"💰 체결가: {cntr_uv:,}원\n"
                             f"📦 체결수량: {cntr_qty:,}주\n"
-                            f"💵 체결금액: {amount:,}원\n"
+                            f"💵 체결금액: {cntr_qty * cntr_uv:,}원\n"
                             f"{pnl_icon} 손익: {_pnl:+,.0f}원 ({_ret:+.2%})\n"
                             f"⏰ 체결시간: {cntr_tm}"
                         )
@@ -2249,10 +2277,17 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                 f"직접 확인이 필요해요."
             )
         else:
+            # [BUG-FIX] 매도 미체결 60초 타임아웃 → positions 유지, _pending_sell 해제
+            # positions를 삭제하지 않음 (실계좌 주문은 살아있을 수 있음)
+            _pending_sell.discard(ticker)
             tg(
-                f"⚠️ <b>[{_mode}] 매도 미체결</b>\n"
-                f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
-                f"직접 확인이 필요해요."
+                f"⚠️ <b>[{_mode}] 매도 미체결 (60초 초과)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📌 종목: {name} ({ticker})\n"
+                f"주문번호: {order_no}\n\n"
+                f"내부 포지션은 유지됩니다.\n"
+                f"실계좌 주문 상태를 직접 확인해주세요.\n"
+                f"(체결됐다면 다음 잔고 대조에서 자동 반영)"
             )
 
     threading.Thread(target=_wait_and_notify, daemon=True).start()
@@ -3207,6 +3242,7 @@ class TelegramCommander:
 
         # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
         _kw_order_ok = True
+        _sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
         if not EMERGENCY_STOP:
             kw = kiwoom()
             if kw:
@@ -3233,15 +3269,23 @@ class TelegramCommander:
                     )
 
         if not _kw_order_ok:
-            _pending_sell.discard(ticker)  # [BUG-FIX-③] 주문 실패 시 자동매도 재개
+            _pending_sell.discard(ticker)
             return   # 주문 실패 → 포지션·trade_log 모두 유지
 
-        # ── 주문 성공(또는 키움 미연결) → 기록·삭제 ─────────
+        # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
+        # _sell_deferred=True → 키움 연결 + 주문 접수 성공 → 여기서 즉시 확정 하지 않음
+        if _sell_deferred:
+            # positions 삭제/log 기록은 _notify_on_fill sell 체결 확인 후 수행
+            # 60초 미체결 시: tg 경고만 발송, positions 유지 (실계좌 수동 확인 필요)
+            log.info(f"[매도] {name} 접수 → 체결 대기 중 (order_no={_res.get('order_no','')})")
+            return
+
+        # ── 키움 미연결(모의/오프라인) fallback → 즉시 기록 ─────────
         append_trade_log({
             "action": "sell", "ticker": ticker, "name": name,
             "buy_price": buy_price, "sell_price": sell_price,
             "shares": sell_shares, "amount": buy_price * sell_shares,
-            "date": str(date.today()),       # api_performance equity_curve용
+            "date": str(date.today()),
             "entry_date": entry_date, "exit_date": str(date.today()),
             "exit_price": sell_price, "hold_days": hold_days,
             "ret": round(ret, 4), "pnl": round(pnl, 0),
@@ -3252,8 +3296,6 @@ class TelegramCommander:
             "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
             "carry_over":   False,
         })
-
-        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
         if is_partial:
             with _positions_lock:
                 remain = total_shares - sell_shares
@@ -3292,7 +3334,6 @@ class TelegramCommander:
                   {"text": "🏠 메인 메뉴",      "callback_data": "menu"}]]
             )
         log.info(f"[매도] {name} {sell_price:,.0f}원 {sell_shares}주 {ret:+.2%}")
-        # [BUG-FIX-③] 수동매도 완료 → 자동매도 재개 허용
         _pending_sell.discard(ticker)
 
     # ════════════════════════════════════════════
@@ -4492,6 +4533,7 @@ class EdgeMonitor:
         # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
         # 키움 미연결(kw=None)이면 True로 유지 → 모의/오프라인 모드 기존 동작 유지
         _kw_order_ok = True
+        _auto_sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
         if not EMERGENCY_STOP:
             kw = kiwoom()
             if kw:
@@ -4506,10 +4548,39 @@ class EdgeMonitor:
                             kind="sell", ticker=ticker
                         )
                         tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
+                        # [BUG-FIX] positions/log 확정을 체결 확인 후로 이동
+                        _auto_sell_log = {
+                            "action":      "sell",
+                            "ticker":      ticker,
+                            "name":        _name,
+                            "buy_price":   buy_price,
+                            "sell_price":  exit_price,
+                            "shares":      shares,
+                            "amount":      amount,
+                            "date":        str(date.today()),
+                            "entry_date":  entry_date,
+                            "exit_date":   str(date.today()),
+                            "exit_price":  exit_price,
+                            "hold_days":   hold_days,
+                            "ret":         round(ret, 4),
+                            "pnl":         round(pnl, 0),
+                            "reason":      reason,
+                            "regime":      getattr(self, "regime", "SIDE"),
+                            "edge_at_exit": info.get("last_edge", 0),
+                            "cluster":     _cluster_name,
+                            "atr_mult_orig": get_atr_mult_rt(_cluster_name),
+                            "carry_over":   False,
+                            "trail_active": bool(info.get("trail_active", False)),
+                            "_is_partial":  False,
+                            "_total_shares": shares,
+                        }
+                        _auto_sell_deferred = True
                         _notify_on_fill(
                             _res.get("order_no", ""), ticker, _name,
                             action="sell", qty=shares, price=exit_price,
-                            buy_price=_bp, reason=reason
+                            buy_price=_bp, reason=reason,
+                            monitor=self,
+                            sell_log_data=_auto_sell_log,
                         )
                     else:
                         _kw_order_ok = False
@@ -4526,19 +4597,25 @@ class EdgeMonitor:
         if not _kw_order_ok:
             return   # 주문 실패 → 포지션·trade_log 모두 유지, 다음 체크에서 재시도
 
-        # ── 주문 성공(또는 키움 미연결) → 기록·삭제 ─────────
+        # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
+        if _auto_sell_deferred:
+            self.today_exited.add(ticker)   # 당일 재진입 차단은 즉시 (접수 성공 기준)
+            log.info(f"[자동매도] {_name} 접수 → 체결 대기 중 (사유: {reason})")
+            return
+
+        # ── 키움 미연결(모의/오프라인) fallback → 즉시 기록 ─────────
         append_trade_log({
-            "action":     "sell",
-            "ticker":     ticker,
-            "name":       _name,
-            "buy_price":  buy_price,
-            "sell_price": exit_price,
-            "shares":     shares,
-            "amount":     amount,
-            "date":       str(date.today()),   # api_performance equity_curve용
-            "entry_date": entry_date,
-            "exit_date":  str(date.today()),
-            "exit_price": exit_price,
+            "action":      "sell",
+            "ticker":      ticker,
+            "name":        _name,
+            "buy_price":   buy_price,
+            "sell_price":  exit_price,
+            "shares":      shares,
+            "amount":      amount,
+            "date":        str(date.today()),
+            "entry_date":  entry_date,
+            "exit_date":   str(date.today()),
+            "exit_price":  exit_price,
             "hold_days":   hold_days,
             "ret":         round(ret, 4),
             "pnl":         round(pnl, 0),
@@ -4550,12 +4627,8 @@ class EdgeMonitor:
             "carry_over":   False,
             "trail_active": bool(info.get("trail_active", False)),
         })
-        self.today_exited.add(ticker)   # ③ 당일 재진입 차단
-        # ── 포지션 삭제 및 저장 ─────────────────────────
+        self.today_exited.add(ticker)
         # [BUG-FIX-①] _log_exit 내부 _positions_lock 제거 — 데드락 방지
-        # check_holdings()가 이미 with _positions_lock: 안에서 _log_exit()를 호출하므로
-        # _log_exit 내부에서 다시 같은 락을 잡으면 threading.Lock 재진입 불가 → 영구 블로킹
-        # _do_sell/_do_buy(텔레그램 스레드)는 _log_exit를 직접 호출하지 않으므로 락 불필요
         self.positions.pop(ticker, None)
         save_positions(self.positions)
 
