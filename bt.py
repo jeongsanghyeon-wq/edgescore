@@ -191,7 +191,7 @@ TRAIL_TIGHTEN_MULT   = 0.7    # +25% 이상 구간 추가 축소 배수
 TAKE_PROFIT_FIXED    = 0.15   # 트레일링 미발동 구간 고정 익절
 
 # ㉑ 슬리피지 진입 금지 필터
-SLIPPAGE_FILTER_RATIO = 3.0
+SLIPPAGE_FILTER_RATIO = 1.5   # 3.0 → 1.5 (매매빈도 개선)
 
 # ㉘ 기회비용 현실화 (한국 기준금리 3.5% ÷ 250 거래일)
 ALT_OPPORTUNITY_COST = 0.00014  # 기존 0.0001 → 0.00014 (연 3.5%)
@@ -212,9 +212,9 @@ ALT_FILTER_RATIO     = 3.5    # 기본값 (하위호환용, 실제 적용은 ㉚
 
 # ㉚ 국면 연동 동적 ALT_FILTER_RATIO
 ALT_FILTER_BY_REGIME = {
-    "BULL": 3.0,   # 추세장: 정규 진입과 동일 → 대안 배치 활성화
-    "SIDE": 3.5,   # 횡보장: 현재 기준 유지
-    "BEAR": 4.0,   # 하락장: 더 엄격 → 현금 보유 우선
+    "BULL": 1.5,   # 추세장: 완화
+    "SIDE": 2.0,   # 횡보장: 완화
+    "BEAR": 2.5,   # 하락장: 완화 (기존 4.0)
 }
 
 # ㉛ 교체 마찰 비용 (Hold Friction Cost)
@@ -2056,6 +2056,8 @@ def _yf_get_mkt():
             raw = yf.download("^KS11", start=sd, end=ed, auto_adjust=True, progress=False)
             raw = _yf_parse(raw)
             raw.index = pd.to_datetime(raw.index)
+            raw.index = pd.to_datetime(raw.index).tz_localize(None)
+            raw.index.name = None
             _YF_MKT_CACHE["mkt"] = raw[["종가"]].copy()
         except Exception as e:
             print(f"  ⚠️  코스피 지수 조회 실패: {e}")
@@ -2072,7 +2074,8 @@ def get_data(ticker):
             if raw is None or len(raw) < 60:
                 raise ValueError(f"데이터 부족: {len(raw) if raw is not None else 0}행")
             raw = _yf_parse(raw)
-            raw.index = pd.to_datetime(raw.index)
+            raw.index = pd.to_datetime(raw.index).tz_localize(None)
+            raw.index.name = None
             if "거래량" not in raw.columns: raw["거래량"] = 0
             if "시가"   not in raw.columns: raw["시가"]   = raw["종가"]
             if "고가"   not in raw.columns: raw["고가"]   = raw["종가"]
@@ -2081,6 +2084,10 @@ def get_data(ticker):
             mkt = _yf_get_mkt()
             if mkt is None:
                 raise ValueError("코스피 지수 없음")
+            # mkt 인덱스도 timezone 제거 + df와 정렬
+            mkt.index = pd.to_datetime(mkt.index).tz_localize(None)
+            mkt.index.name = None
+            mkt = mkt.reindex(raw.index).ffill().bfill()
             return raw, mkt, True
         except Exception as e:
             pass  # 폴백으로 진행
@@ -2135,7 +2142,7 @@ def prepare_stock(name, ticker, use_kind_api=False):
     is_anomaly, vol_zone_mult, avg_vol, vol_ratio = calc_vol_anomaly(df)
     tp, t_hi, t_lo, bias, sig_adj, d_mult = calc_targets(
         df, edge, sigma_sel, med_vol, beta, asym_k_ser, ci_t, vol_zone_mult)
-    in_zone    = (nc >= t_lo) & (nc <= t_hi)
+    in_zone    = pd.Series((nc.values >= t_lo.values) & (nc.values <= t_hi.values), index=df.index)
     dynamic_sl = calc_dynamic_stop_loss(df, cluster_name, regime_ser)
 
     res = pd.DataFrame({
