@@ -2812,7 +2812,9 @@ class TelegramCommander:
             entry_date   = str(date.today())
             is_add       = False
 
-        self.monitor.positions[ticker] = {
+        # ── [CRITICAL-BUY] 키움 실주문 먼저 → 성공 시에만 positions/로그 저장 ─
+        # _do_sell CRITICAL-1/2와 동일 패턴: 주문 실패 시 허위 포지션 기록 방지
+        _new_position = {
             "ticker": ticker, "name": name,
             "buy_price":    round(avg_price, 2),
             "shares":       total_shares,
@@ -2829,28 +2831,14 @@ class TelegramCommander:
             "sell_edge_alerted":   False,
             "max_hold_warned":     False,
         }
-        save_positions(self.monitor.positions)
-
-        if ticker not in self.monitor.universe:
-            self.monitor.universe[ticker] = name
-            save_universe(self.monitor.universe)
-
-        append_trade_log({
-            "action": "buy", "ticker": ticker, "name": name,
-            "buy_price": buy_price, "shares": shares, "amount": amount,
-            "date": str(date.today()),       # api_performance equity_curve용
-            "entry_date": str(date.today()),
-            "exit_price": 0, "hold_days": 0,
-            "reason": "추가매수" if is_add else "수동매수",
-        })
-
-        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
+        _order_sent = False
         if not EMERGENCY_STOP:
             kw = kiwoom()
             if kw:
                 _mode = "모의" if kw._mock else "실계좌"
                 _res  = kw.buy(ticker, shares, buy_price, order_type="0")
                 if _res.get("success"):
+                    _order_sent = True
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
                     _notify_on_fill(
@@ -2858,8 +2846,38 @@ class TelegramCommander:
                         action="buy", qty=shares, price=buy_price
                     )
                 else:
-                    tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n종목: {name}")
-        # ─────────────────────────────────────────────────────
+                    tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
+                       f"종목: {name}\n"
+                       f"❗ 포지션/로그 저장 스킵 (재시도 후 직접 확인 권장)")
+            else:
+                # 키움 미연결: 수동매수(모의/테스트)로 간주 → 저장 허용
+                _order_sent = True
+        else:
+            # EMERGENCY_STOP: 주문 없이 포지션만 저장 (수동 긴급모드)
+            _order_sent = True
+
+        # 주문 성공(또는 키움 미연결/긴급모드) 시에만 저장
+        if _order_sent:
+            self.monitor.positions[ticker] = _new_position
+            save_positions(self.monitor.positions)
+
+            if ticker not in self.monitor.universe:
+                self.monitor.universe[ticker] = name
+                save_universe(self.monitor.universe)
+
+            append_trade_log({
+                "action": "buy", "ticker": ticker, "name": name,
+                "buy_price": buy_price, "shares": shares, "amount": amount,
+                "date": str(date.today()),       # api_performance equity_curve용
+                "entry_date": str(date.today()),
+                "exit_price": 0, "hold_days": 0,
+                "reason": "추가매수" if is_add else "수동매수",
+            })
+        # ──────────────────────────────────────────────────────────────────
+
+        # 주문 실패 시 완료 메시지 전송 없이 종료
+        if not _order_sent:
+            return
 
         kelly_amt = calc_kelly_amount(C["TOTAL_CAPITAL"])
         add_line  = f"\n🔄 추가 매수!  평균단가 → {avg_price:,.0f}원" if is_add else ""

@@ -441,7 +441,7 @@ export default function Dashboard(){
               <th style={{padding:"6px 4px",textAlign:"right"}}>손익</th>
             </tr></thead>
             <tbody>{trades.slice(0,50).map((t,i)=>{
-              const isBuy=t.action==="BUY";
+              const isBuy=t.action==="buy"||t.action==="BUY";
               const pnl=t.pnl||0;
               return <tr key={i} style={{borderBottom:"1px solid #1e293b11",background:i%2?"#0f172a33":"transparent"}}>
                 <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.created_at||t.timestamp||"").slice(11,16)}</td>

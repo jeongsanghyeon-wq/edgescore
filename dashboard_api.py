@@ -1,10 +1,14 @@
 """
-Edge Score v40.0 — Dashboard API Server v1.9.1
+Edge Score v40.0 — Dashboard API Server v1.9.2
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
   [2] 스레드 안전성 — _monitor 접근 시 Lock + 스냅샷(deepcopy)
   [3] 텔레그램 알림 — 캐시 히트율 이상 시 알림
+
+v1.9.2 수정사항:
+  [BUG-FIX] api_portfolio summary에 available_cash 키 추가
+            (총자본 - 평가금) → Dashboard 가용현금 패널 항상 ₩0 버그 수정
 
 v1.9.1 수정사항:
   [BUG-FIX] _cached() 데코레이터 ttl 파라미터 미지원 → TypeError 크래시 수정
@@ -197,6 +201,7 @@ def _create_app():
                 "total_ret": round((total_eval - total_inv) / total_inv, 4) if total_inv > 0 else 0,
                 "capital": capital, "floor": floor,
                 "floor_remaining": round(max(0, total_eval - floor)),
+                "available_cash": round(max(0, capital - total_eval)),   # [BUG-FIX] Dashboard 가용현금 표시용
                 "count": len(holdings),
                 "trail_active_count": sum(1 for h in holdings if h["trail_active"]),
             }
