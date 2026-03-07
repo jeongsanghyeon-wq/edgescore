@@ -851,6 +851,11 @@ _pending_sell: set = set()
 # [BUG-FIX] check+add를 원자적으로 처리하는 전용 락 (스레드 경쟁 조건 방지)
 _pending_sell_lock = threading.Lock()
 
+# [2순위-FIX] 매수 중복 주문 차단 — 매도와 동일한 선점 구조
+# _do_buy 진입 시 check+add 원자화, 체결확정/롤백 시 discard
+_pending_buy: set = set()
+_pending_buy_lock = threading.Lock()
+
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
 # ══════════════════════════════════════════════════
@@ -2228,6 +2233,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                     pos["trail_price"] = cntr_uv
                                 pos.pop("_restore_pos", None)  # 내부 복원용 메타키 제거
                                 save_positions(monitor.positions)
+                        _pending_buy.discard(ticker)   # [2순위-FIX] positions 확정 후 매수 선점 해제
                         # 체결 확인 후 trade_log 기록 (실체결 기준 — 추가매수 이력용)
                         if buy_log_data:
                             buy_log_data["buy_price"] = cntr_uv       # 이번 체결가
@@ -2334,6 +2340,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                 buy_log_data["buy_price"] = _last_cntr_uv
                                 buy_log_data["amount"]    = _last_cntr_qty * _last_cntr_uv
                                 append_trade_log(buy_log_data)
+                            _pending_buy.discard(ticker)  # [2순위-FIX] 부분체결 확정 후 선점 해제
                             log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정")
                             tg(
                                 f"⚠️ <b>[{_mode}] 매수 부분체결 확정</b>\n"
@@ -2349,6 +2356,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             _restore.pop("_restore_pos", None)
                             monitor.positions[ticker] = _restore
                             save_positions(monitor.positions)
+                            _pending_buy.discard(ticker)  # [2순위-FIX] 롤백 완료 후 선점 해제
                             log.warning(f"[추가매수롤백] {name}({ticker}) {_fail_reason} → 기존 포지션 복원")
                             tg(
                                 f"⚠️ <b>[{_mode}] 추가매수 미체결 — 기존 포지션 복원</b>\n"
@@ -2363,6 +2371,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             # 0주 미체결 + 신규매수 → 포지션 제거
                             monitor.positions.pop(ticker, None)
                             save_positions(monitor.positions)
+                            _pending_buy.discard(ticker)  # [2순위-FIX] 롤백 완료 후 선점 해제
                             log.warning(f"[신규매수롤백] {name}({ticker}) {_fail_reason} → positions 제거")
                             tg(
                                 f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 취소</b>\n"
@@ -2381,8 +2390,8 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
             )
         else:
             # [BUG-FIX] 매도 timeout 시 _last_cntr_qty 기반 3단계 정산
+            # 순서: positions 확정/저장 → _pending_sell 해제 (역순 시 중복매도 경쟁 구간 발생)
             # 0주: 포지션 유지  |  부분체결 n주: 체결분 차감  |  전량: 이미 정상 처리됨
-            _pending_sell.discard(ticker)
             if _last_cntr_qty > 0 and sell_log_data and monitor and                hasattr(monitor, "positions") and ticker in monitor.positions:
                 # 부분체결 발생 — 체결된 수량만큼 포지션 차감 후 확정
                 _bp          = sell_log_data.get("buy_price", 0)
@@ -2413,6 +2422,8 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                 if _remain == 0 and hasattr(monitor, "today_exited"):
                     monitor.today_exited.add(ticker)
                 log.warning(f"[부분매도확정] {name}({ticker}) {_last_cntr_qty}주 체결 → 포지션 {_remain}주 남음")
+                # [1순위-FIX] positions 저장 완료 후 _pending_sell 해제 (역순 금지)
+                _pending_sell.discard(ticker)
                 tg(
                     f"⚠️ <b>[{_mode}] 매도 부분체결 확정</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -2423,8 +2434,9 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     f"체결분만 포지션에서 차감됐어요.\n잔량 주문 상태를 실계좌에서 확인해주세요."
                 )
             else:
-                # 0주 미체결 — 포지션 유지
+                # 0주 미체결 — 포지션 유지 후 _pending_sell 해제
                 log.warning(f"[매도미체결] {name}({ticker}) {_fail_reason} → _pending_sell 해제, positions 유지")
+                _pending_sell.discard(ticker)   # [1순위-FIX] 포지션 처리 없음이 확정된 뒤 해제
                 tg(
                     f"⚠️ <b>[{_mode}] 매도 미체결 ({_fail_reason})</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -3100,6 +3112,19 @@ class TelegramCommander:
             )
             return
 
+        # [2순위-FIX] _pending_buy check+add 원자화 — 동시 매수 요청 중복 차단
+        # 매도의 _pending_sell_lock과 동일 구조
+        with _pending_buy_lock:
+            if ticker in _pending_buy:
+                tg_btn(
+                    f"⚠️ <b>{name}({ticker}) 매수 처리 중</b>\n\n"
+                    f"동일 종목 매수가 이미 진행 중이에요.\n"
+                    f"잠시 후 다시 시도해주세요.",
+                    [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
+                )
+                return
+            _pending_buy.add(ticker)
+
         if existing:
             old_price    = float(existing.get("buy_price", buy_price))
             old_shares   = int(existing.get("shares", 0))
@@ -3170,12 +3195,14 @@ class TelegramCommander:
                         }
                     )
                 else:
+                    _pending_buy.discard(ticker)  # [2순위-FIX] 주문 실패 → 선점 즉시 해제
                     tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
                        f"종목: {name}\n"
                        f"❗ 포지션/로그 저장 스킵 (재시도 후 직접 확인 권장)")
             else:
                 # [BUG-FIX] kw=None은 클라이언트 오류일 수 있음 → 매도와 동일하게 주문 실패 처리
                 # 허위 포지션/거래로그 생성 방지 — positions/log 저장 금지
+                _pending_buy.discard(ticker)  # [2순위-FIX] kw=None 실패 → 선점 즉시 해제
                 tg(f"🚨 키움 클라이언트 연결 실패 — {name} 매수 취소\n직접 확인 후 재시도해주세요.")
                 log.error(f"[수동매수실패] {name}({ticker}) kiwoom() None — 포지션 저장 금지")
         else:
@@ -6548,6 +6575,16 @@ if __name__ == "__main__":
     log.info("=" * 55)
     log.info("  🚀 Edge Score v40.0 통합 엔진 가동")
     log.info("=" * 55)
+
+    # [3순위-FIX] 실계좌 모드에서 EMERGENCY_STOP=True면 시작 차단
+    # 실수로 비상정지 상태인 채로 실계좌를 가동하면 주문 없이 positions만 바뀌는 위험 상황 발생
+    _kw_start = kiwoom()
+    if _kw_start and not _kw_start._mock and EMERGENCY_STOP:
+        log.critical("[CRITICAL] 실계좌 모드에서 EMERGENCY_STOP=True 감지 — 시작 차단")
+        tg("🚨 <b>[시작 차단]</b> 실계좌 모드에서 EMERGENCY_STOP이 켜진 채로 시작됐습니다.\n"
+           "EMERGENCY_STOP=False로 변경 후 재시작해주세요.")
+        raise SystemExit("실계좌 EMERGENCY_STOP 차단")
+
     monitor = EdgeMonitor()
     monitor.update_regime()
     # ── 데이터 소스 진단 ─────────────────────────
