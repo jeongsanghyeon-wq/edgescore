@@ -2235,6 +2235,9 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                         monitor.positions.pop(ticker, None)
                                         save_positions(monitor.positions)
                             _pending_sell.discard(ticker)
+                            # 체결 확인 후 당일 재진입 차단 (미체결 시 재진입 허용)
+                            if hasattr(monitor, "today_exited"):
+                                monitor.today_exited.add(ticker)
 
                         msg = (
                             f"{_icon} <b>[{_mode}] 매도 체결 완료!</b>\n"
@@ -3251,10 +3254,31 @@ class TelegramCommander:
                 if _res.get("success"):
                     tg(f"📨 [{_mode}] 매도주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {sell_shares:,}주 | {sell_price:,}원")
+                    # [BUG-FIX] sell_log_data + monitor 전달 → 체결 확인 후 positions/log 확정
+                    _sell_log = {
+                        "action":      "sell", "ticker": ticker, "name": name,
+                        "buy_price":   buy_price, "sell_price": sell_price,
+                        "shares":      sell_shares, "amount": buy_price * sell_shares,
+                        "date":        str(date.today()),
+                        "entry_date":  entry_date, "exit_date": str(date.today()),
+                        "exit_price":  sell_price, "hold_days": hold_days,
+                        "ret":         round(ret, 4), "pnl": round(pnl, 0),
+                        "reason":      "일부청산" if is_partial else "수동청산",
+                        "regime":      self.monitor.regime,
+                        "edge_at_exit": pos.get("last_edge", 0),
+                        "cluster":     _cluster_manual,
+                        "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
+                        "carry_over":  False,
+                        "_is_partial": is_partial,
+                        "_total_shares": total_shares,
+                    }
+                    _sell_deferred = True
                     _notify_on_fill(
                         _res.get("order_no", ""), ticker, name,
                         action="sell", qty=sell_shares, price=sell_price,
-                        buy_price=buy_price
+                        buy_price=buy_price,
+                        monitor=self.monitor,
+                        sell_log_data=_sell_log,
                     )
                 else:
                     _kw_order_ok = False
@@ -4599,7 +4623,8 @@ class EdgeMonitor:
 
         # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
         if _auto_sell_deferred:
-            self.today_exited.add(ticker)   # 당일 재진입 차단은 즉시 (접수 성공 기준)
+            # [BUG-FIX] today_exited는 체결 확인 후 _notify_on_fill에서 추가
+            # 미체결/취소 시 당일 재진입이 불필요하게 막히는 문제 방지
             log.info(f"[자동매도] {_name} 접수 → 체결 대기 중 (사유: {reason})")
             return
 
