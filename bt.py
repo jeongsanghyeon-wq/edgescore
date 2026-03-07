@@ -351,226 +351,175 @@ def _auto_slippage(market_cap: int) -> float:
     return 0.008
 
 # fdr 코스피 종목 리스트 캐시
-_FDR_LISTING_CACHE: dict = {}
+# ══════════════════════════════════════════════════════
+# ㊷㊸ 코스피200 유니버스 (fdr 기반, StockListing 미사용)
+# ──────────────────────────────────────────────────────
+# fdr.StockListing("KOSPI")가 KRX JSON 파싱 오류로 불안정.
+# → 코스피200 대표 종목 리스트 하드코딩 + fdr.DataReader로 OHLCV 수집
+# 연도별 생존편향 제거: 상장일(IPO) 정보를 fdr.DataReader로 확인 불가하므로
+#   실용적 대안으로 시총 규모별 클러스터를 사전 정의하고
+#   YEARLY_UNIVERSE는 전 기간 동일 유니버스로 단순화
+#   (생존편향 완전 제거보다 데이터 안정성 우선)
+# ══════════════════════════════════════════════════════
 
-def _fdr_get_listing():
-    """fdr.StockListing('KOSPI') 캐시 조회 — 종목명/시총/업종 포함."""
-    if "listing" not in _FDR_LISTING_CACHE:
-        try:
-            df = fdr.StockListing("KOSPI")
-            # Code 컬럼 정규화
-            code_col = "Code" if "Code" in df.columns else df.columns[0]
-            df[code_col] = df[code_col].astype(str).str.zfill(6)
-            df = df.set_index(code_col)
-            _FDR_LISTING_CACHE["listing"] = df
-        except Exception as e:
-            print(f"  ⚠️  fdr StockListing 실패: {e}")
-            _FDR_LISTING_CACHE["listing"] = None
-    return _FDR_LISTING_CACHE["listing"]
+# 코스피200 대표 종목 (2015~2026 기간 내 주요 상장 종목)
+_KOSPI200_CODES = [
+    # 반도체/IT
+    "005930","000660","066570","009150","035420","251270","036570",
+    # 자동차
+    "005380","000270","012330","018880","010140",
+    # 금융
+    "105560","055550","086790","032830","316140","138930","024110",
+    # 소재/에너지
+    "005490","010130","011790","096770","010950","003670",
+    # 헬스케어
+    "068270","207940","128940","326030",
+    # 소비재/유통
+    "004370","097950","000810","051900","009830",
+    # 기술/성장
+    "035720","047050","259960","293490","373220","006400",
+    # 중소형
+    "031980","112610","051910","006260","042670","336260",
+    # 건설/기계
+    "000720","011200","009540","047810","034020",
+    # 통신
+    "017670","030200","032640",
+]
 
-def _fdr_get_mktcap(listing_df, code: str) -> int:
-    """fdr listing에서 시총 추출 — 컬럼명 차이 자동 처리."""
-    if listing_df is None or code not in listing_df.index:
-        return 0
-    for col in ["Marcap", "시가총액", "marcap", "MktCap"]:
-        if col in listing_df.columns:
-            try:
-                return int(listing_df.loc[code, col])
-            except Exception:
-                continue
-    return 0
+# 종목코드 → (종목명, 클러스터, EQS섹터, 시총규모) 매핑
+_TICKER_META = {
+    # 기술대형주
+    "005930": ("삼성전자",    "기술대형주", "IT전자",   "large"),
+    "000660": ("SK하이닉스",  "기술대형주", "IT전자",   "large"),
+    "066570": ("LG전자",      "기술대형주", "IT전자",   "large"),
+    "009150": ("삼성전기",    "기술대형주", "IT전자",   "mid"),
+    "035420": ("NAVER",       "기술대형주", "IT서비스", "large"),
+    "251270": ("넷마블",      "중소형성장주","IT서비스","mid"),
+    "036570": ("엔씨소프트",  "중소형성장주","IT서비스","mid"),
+    "035720": ("카카오",      "기술대형주", "IT서비스", "large"),
+    "047050": ("포스코인터내셔널","중소형성장주","소재", "mid"),
+    "259960": ("크래프톤",    "중소형성장주","IT서비스","mid"),
+    "293490": ("카카오뱅크",  "금융주",     "금융",     "mid"),
+    "373220": ("LG에너지솔루션","기술대형주","소재",    "large"),
+    "006400": ("삼성SDI",     "기술대형주", "소재",     "large"),
+    # 자동차
+    "005380": ("현대차",      "대형가치주", "자동차",   "large"),
+    "000270": ("기아",        "대형가치주", "자동차",   "large"),
+    "012330": ("현대모비스",  "대형가치주", "자동차",   "large"),
+    "018880": ("한온시스템",  "중소형성장주","자동차",  "mid"),
+    "010140": ("삼성중공업",  "중소형성장주","기타",    "mid"),
+    # 금융
+    "105560": ("KB금융",      "금융주",     "금융",     "large"),
+    "055550": ("신한지주",    "금융주",     "금융",     "large"),
+    "086790": ("하나금융지주","금융주",     "금융",     "large"),
+    "032830": ("삼성생명",    "금융주",     "금융",     "large"),
+    "316140": ("우리금융지주","금융주",     "금융",     "mid"),
+    "138930": ("BNK금융지주", "금융주",     "금융",     "mid"),
+    "024110": ("기업은행",    "금융주",     "금융",     "mid"),
+    # 소재/에너지
+    "005490": ("POSCO홀딩스", "기술대형주", "소재",     "large"),
+    "010130": ("고려아연",    "대형가치주", "소재",     "mid"),
+    "011790": ("SKC",         "중소형성장주","소재",    "mid"),
+    "096770": ("SK이노베이션","대형가치주", "소재",     "large"),
+    "010950": ("S-Oil",       "대형가치주", "소재",     "mid"),
+    "003670": ("포스코퓨처엠","중소형성장주","소재",    "mid"),
+    # 헬스케어
+    "068270": ("셀트리온",    "중소형성장주","헬스케어","large"),
+    "207940": ("삼성바이오로직스","중소형성장주","헬스케어","large"),
+    "128940": ("한미약품",    "중소형성장주","헬스케어","mid"),
+    "326030": ("SK바이오팜",  "중소형성장주","헬스케어","mid"),
+    # 소비재
+    "004370": ("농심",        "대형가치주", "기타",     "mid"),
+    "097950": ("CJ제일제당",  "대형가치주", "기타",     "mid"),
+    "000810": ("삼성화재",    "금융주",     "금융",     "large"),
+    "051900": ("LG생활건강",  "대형가치주", "기타",     "large"),
+    "009830": ("한화솔루션",  "중소형성장주","소재",    "mid"),
+    # 중소형성장주
+    "031980": ("피에스케이홀딩스","중소형성장주","IT전자","small"),
+    "112610": ("씨에스윈드",  "중소형성장주","기타",    "small"),
+    "051910": ("LG화학",      "대형가치주", "소재",     "large"),
+    "006260": ("LS",          "대형가치주", "소재",     "mid"),
+    "042670": ("HD현대인프라코어","중소형성장주","기타", "mid"),
+    "336260": ("두산퓨얼셀",  "중소형성장주","기타",    "small"),
+    # 건설/기계
+    "000720": ("현대건설",    "대형가치주", "기타",     "mid"),
+    "011200": ("HMM",         "대형가치주", "기타",     "mid"),
+    "009540": ("HD한국조선해양","대형가치주","기타",    "mid"),
+    "047810": ("한국항공우주","중소형성장주","기타",    "mid"),
+    "034020": ("두산에너빌리티","중소형성장주","기타",  "mid"),
+    # 통신
+    "017670": ("SK텔레콤",    "대형가치주", "IT서비스", "large"),
+    "030200": ("KT",          "대형가치주", "IT서비스", "large"),
+    "032640": ("LG유플러스",  "대형가치주", "IT서비스", "mid"),
+}
 
-def _fdr_get_sector(listing_df, code: str) -> str:
-    """fdr listing에서 업종 추출."""
-    if listing_df is None or code not in listing_df.index:
-        return "기타"
-    for col in ["Sector", "업종", "Industry"]:
-        if col in listing_df.columns:
-            val = str(listing_df.loc[code, col])
-            if val and val != "nan":
-                return val
-    return "기타"
-
-def _fdr_get_name(listing_df, code: str) -> str:
-    """fdr listing에서 종목명 추출."""
-    if listing_df is None or code not in listing_df.index:
-        return code
-    for col in ["Name", "종목명", "회사명"]:
-        if col in listing_df.columns:
-            val = str(listing_df.loc[code, col])
-            if val and val != "nan":
-                return val
-    return code
+_SIZE_TO_SLIPPAGE = {"large": 0.003, "mid": 0.005, "small": 0.008}
 
 def build_yearly_kospi200():
     """
-    ㊸ 연도별 코스피200 유니버스 캐시 빌드 (생존 편향 제거).
-
-    fdr.StockListing('KOSPI')로 현재 상장 종목을 가져오고
-    각 연도별 실제 상장 여부를 ListingDate로 필터링하여
-    YEARLY_UNIVERSE = {year: set(code)} 를 구성한다.
+    ㊸ 연도별 코스피200 유니버스.
+    fdr.StockListing 불안정으로 _TICKER_META 하드코딩 사용.
+    전 기간 동일 유니버스 적용 (YEARLY_UNIVERSE 필터 비활성화).
     """
     global YEARLY_UNIVERSE
-
-    start_year = int(START_DATE[:4])
-    end_year   = int(END_DATE[:4])
-
-    if not FDR_AVAILABLE:
-        fallback_codes = {"005930","005380","105560","031980","000660","035720","005490","373220"}
-        YEARLY_UNIVERSE = {yr: fallback_codes for yr in range(start_year, end_year + 1)}
-        print("  ⚠️  fdr 미설치 → 연도별 유니버스 폴백 (8종목)")
-        return
-
-    print(f"  ▶ 연도별 코스피200 유니버스 구성 중 ({start_year}~{end_year})...")
-
-    try:
-        listing = _fdr_get_listing()
-        if listing is None:
-            raise ValueError("StockListing 실패")
-
-        # 시총 컬럼 결정
-        cap_col = None
-        for c in ["Marcap", "시가총액", "marcap", "MktCap"]:
-            if c in listing.columns:
-                cap_col = c
-                break
-        if cap_col is None:
-            raise ValueError("시총 컬럼 없음")
-
-        # 상장일 컬럼
-        date_col = None
-        for c in ["ListingDate", "상장일", "IPOdate"]:
-            if c in listing.columns:
-                date_col = c
-                break
-
-        # 시총 기준 정렬 후 상위 300개 후보
-        listing[cap_col] = pd.to_numeric(listing[cap_col], errors="coerce").fillna(0)
-        top300 = listing.sort_values(cap_col, ascending=False).head(300)
-
-        all_codes_union = set()
-        for year in range(start_year, end_year + 1):
-            # 해당 연도 1월 1일 이전에 상장된 종목만 포함
-            if date_col:
-                cutoff = pd.Timestamp(f"{year}-01-01")
-                try:
-                    top300[date_col] = pd.to_datetime(top300[date_col], errors="coerce")
-                    year_df = top300[
-                        top300[date_col].isna() |  # 상장일 불명 → 포함
-                        (top300[date_col] <= cutoff)
-                    ]
-                except Exception:
-                    year_df = top300
-            else:
-                year_df = top300
-
-            codes = set(year_df.head(200).index.tolist())
-            YEARLY_UNIVERSE[year] = codes
-            all_codes_union |= codes
-            print(f"     {year}: {len(codes)}종목")
-
-        print(f"  ✅ 연도별 유니버스 완료 — 전체 유니언: {len(all_codes_union)}종목")
-
-    except Exception as e:
-        print(f"  ⚠️  연도별 유니버스 실패({e}) → 유니버스 필터 비활성화")
-        YEARLY_UNIVERSE = {}
+    # StockListing 불안정 → 유니버스 필터 비활성화, 전 기간 동일 종목 사용
+    YEARLY_UNIVERSE = {}
+    print("  ℹ️  연도별 유니버스: 하드코딩 코스피200 사용 (fdr StockListing 불안정)")
 
 def is_in_yearly_universe(ticker: str, date) -> bool:
-    """해당 날짜 기준으로 종목이 코스피200에 포함되는지 확인."""
+    """YEARLY_UNIVERSE가 비어있으면 필터 비활성화 (전 종목 허용)."""
+    if not YEARLY_UNIVERSE:
+        return True
     year = date.year if hasattr(date, "year") else int(str(date)[:4])
     universe = YEARLY_UNIVERSE.get(year)
-    if not universe:
-        return True   # 유니버스 없으면 차단하지 않음
-    return ticker in universe
+    return True if not universe else ticker in universe
 
 
 def build_kospi200_universe():
     """
-    fdr 기반 코스피200 유니버스 동적 구성.
-    TICKERS, CLUSTER_PARAMS["tickers"], SECTOR_MAP, SLIPPAGE_BY_CLUSTER 를 채운다.
+    fdr 기반 코스피200 유니버스 구성.
+    _TICKER_META 하드코딩으로 TICKERS/CLUSTER_PARAMS/SECTOR_MAP 구성.
     """
     for cp in CLUSTER_PARAMS.values():
         cp["tickers"] = []
 
-    _fallback_tickers = {
-        "삼성전자": "005930", "현대차": "005380", "KB금융": "105560",
-        "피에스케이홀딩스": "031980", "SK하이닉스": "000660",
-        "카카오": "035720", "POSCO홀딩스": "005490", "LG에너지솔루션": "373220",
-    }
-    _fallback_cluster = {
-        "005930":"기술대형주","000660":"기술대형주","005490":"기술대형주","373220":"기술대형주",
-        "005380":"대형가치주","105560":"금융주","031980":"중소형성장주","035720":"중소형성장주",
-    }
-    _fallback_sector = {
-        "반도체": ["005930","000660","031980"], "자동차": ["005380"],
-        "금융":   ["105560"], "소재": ["005490","373220"], "IT서비스": ["035720"],
-    }
-
-    def _apply_fallback():
-        for code, cluster in _fallback_cluster.items():
-            CLUSTER_PARAMS[cluster]["tickers"].append(code)
-        return _fallback_tickers, _fallback_sector
-
     if not FDR_AVAILABLE:
         print("  ⚠️  fdr 미설치 → 기존 8종목 폴백")
-        return _apply_fallback()
-
-    try:
-        print(f"  ▶ 코스피200 유니버스 조회 중 (fdr 기반)...")
-        listing = _fdr_get_listing()
-        if listing is None:
-            raise ValueError("StockListing 실패")
-
-        # YEARLY_UNIVERSE 합집합 우선 사용 (전 기간 등장 종목 전부 포함)
-        if YEARLY_UNIVERSE:
-            kospi200_codes = list({c for codes in YEARLY_UNIVERSE.values() for c in codes})
-            print(f"     유니버스 합집합: {len(kospi200_codes)}종목 (연도별 전 기간)")
-        else:
-            cap_col = next((c for c in ["Marcap","시가총액","marcap","MktCap"]
-                            if c in listing.columns), None)
-            if cap_col:
-                listing[cap_col] = pd.to_numeric(listing[cap_col], errors="coerce").fillna(0)
-                kospi200_codes = listing.sort_values(cap_col, ascending=False).head(200).index.tolist()
-            else:
-                kospi200_codes = listing.head(200).index.tolist()
-
-        tickers_dict = {}
-        sector_map   = {}
-        slip_totals  = {k: [] for k in CLUSTER_PARAMS}
-
-        for code in kospi200_codes:
-            code = str(code).zfill(6)
-            name    = _fdr_get_name(listing, code)
-            mktcap  = _fdr_get_mktcap(listing, code)
-            krx_sec = _fdr_get_sector(listing, code)
-
-            cluster = _classify_cluster(mktcap, krx_sec)
-            eqs_sec = _KRX_SECTOR_TO_EQS.get(krx_sec, "기타")
-            slip    = _auto_slippage(mktcap)
-
-            tickers_dict[name] = code
+        _fb = {
+            "삼성전자":"005930","현대차":"005380","KB금융":"105560",
+            "피에스케이홀딩스":"031980","SK하이닉스":"000660",
+            "카카오":"035720","POSCO홀딩스":"005490","LG에너지솔루션":"373220",
+        }
+        for code, cluster in {
+            "005930":"기술대형주","000660":"기술대형주","005490":"기술대형주","373220":"기술대형주",
+            "005380":"대형가치주","105560":"금융주","031980":"중소형성장주","035720":"중소형성장주",
+        }.items():
             CLUSTER_PARAMS[cluster]["tickers"].append(code)
-            sector_map.setdefault(eqs_sec, []).append(code)
-            slip_totals[cluster].append(slip)
+        return _fb, {"반도체":["005930","000660"],"금융":["105560"],"자동차":["005380"]}
 
-        for cname, slips in slip_totals.items():
-            if slips:
-                SLIPPAGE_BY_CLUSTER[cname] = float(np.median(slips))
+    print("  ▶ 코스피200 유니버스 구성 중 (하드코딩 메타 기반)...")
 
-        print(f"  ✅ 코스피200 유니버스 구성 완료: {len(tickers_dict)}종목")
-        for cname, cp in CLUSTER_PARAMS.items():
-            print(f"     {cname}: {len(cp['tickers'])}종목")
+    tickers_dict = {}
+    sector_map   = {}
+    slip_totals  = {k: [] for k in CLUSTER_PARAMS}
 
-        return tickers_dict, sector_map
+    for code, (name, cluster, eqs_sec, size) in _TICKER_META.items():
+        slip = _SIZE_TO_SLIPPAGE.get(size, 0.005)
+        tickers_dict[name] = code
+        CLUSTER_PARAMS[cluster]["tickers"].append(code)
+        sector_map.setdefault(eqs_sec, []).append(code)
+        slip_totals[cluster].append(slip)
 
-    except Exception as e:
-        print(f"  ⚠️  코스피200 조회 실패 ({e}) → 기존 8종목 폴백")
-        for cp in CLUSTER_PARAMS.values():
-            cp["tickers"] = []
-        return _apply_fallback()
+    for cname, slips in slip_totals.items():
+        if slips:
+            SLIPPAGE_BY_CLUSTER[cname] = float(np.median(slips))
 
+    print(f"  ✅ 코스피200 유니버스 구성 완료: {len(tickers_dict)}종목")
+    for cname, cp in CLUSTER_PARAMS.items():
+        print(f"     {cname}: {len(cp['tickers'])}종목")
 
-# ── 유니버스 빌드 (모듈 임포트 시 자동 실행) ──────────────
+    return tickers_dict, sector_map
+
 build_yearly_kospi200()                          # ㊸ 연도별 유니버스 먼저 빌드
 TICKERS, _built_sector_map = build_kospi200_universe()
 SECTOR_MAP.update(_built_sector_map)  # ㊷ 동적 섹터맵 반영
