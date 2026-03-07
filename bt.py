@@ -346,14 +346,36 @@ def _auto_slippage(market_cap: int) -> float:
         return 0.005
     return 0.008
 
+def _get_cap_df(ref_date: str):
+    """pykrx get_market_cap_by_ticker 래퍼 — 컬럼명 차이 자동 처리."""
+    # 후보 날짜들 (1월 초 휴장 대비)
+    from datetime import datetime, timedelta
+    base = datetime.strptime(ref_date, "%Y%m%d")
+    for delta in range(0, 10):
+        d = (base + timedelta(days=delta)).strftime("%Y%m%d")
+        try:
+            df = stock.get_market_cap_by_ticker(d, market="KOSPI")
+            if df is None or len(df) == 0:
+                continue
+            # 시가총액 컬럼 찾기 (버전별 차이 대응)
+            cap_col = None
+            for c in ["시가총액", "Mktcap", "시총", "marcap"]:
+                if c in df.columns:
+                    cap_col = c
+                    break
+            if cap_col is None:
+                cap_col = df.columns[0]   # 첫 번째 컬럼 사용
+            return df, cap_col
+        except Exception:
+            continue
+    return None, None
+
 def build_yearly_kospi200():
     """
-    ㊸ 연도별 코스피200 구성 종목 캐시 빌드 (생존 편향 제거).
+    ㊸ 연도별 코스피200 유니버스 캐시 빌드 (생존 편향 제거).
 
-    START_DATE ~ END_DATE 구간의 각 연도 1월 첫 거래일 기준으로
-    코스피200 구성 종목을 조회하여 YEARLY_UNIVERSE에 저장한다.
-
-    pykrx 미설치 또는 조회 실패 시 전 기간 동일 유니버스(폴백) 적용.
+    각 연도 1월 기준 시총 상위 200개를 조회하여 YEARLY_UNIVERSE에 저장.
+    pykrx 미설치 또는 전체 실패 시 단일 기준일(KOSPI200_REFERENCE_DATE) 폴백.
     """
     global YEARLY_UNIVERSE
 
@@ -361,7 +383,6 @@ def build_yearly_kospi200():
     end_year   = int(END_DATE[:4])
 
     if not PYKRX_AVAILABLE:
-        # 폴백: 전 기간 동일하게 기존 8종목
         fallback_codes = {"005930","005380","105560","031980","000660","035720","005490","373220"}
         YEARLY_UNIVERSE = {yr: fallback_codes for yr in range(start_year, end_year + 1)}
         print("  ⚠️  pykrx 미설치 → 연도별 유니버스 폴백 (8종목)")
@@ -369,31 +390,37 @@ def build_yearly_kospi200():
 
     print(f"  ▶ 연도별 코스피200 유니버스 조회 중 ({start_year}~{end_year})...")
     all_codes_union = set()
+    success_count   = 0
 
     for year in range(start_year, end_year + 1):
         ref_date = f"{year}0102"
         try:
-            # 코스피200 구성 종목 조회 (기준일 기준)
-            try:
-                codes = set(str(c).zfill(6)
-                            for c in stock.get_index_portfolio_deposit_file("1028"))
-                if len(codes) < 10:
-                    raise ValueError("구성 종목 부족")
-            except Exception:
-                # 폴백: 해당 연도 시총 상위 200개
-                cap_tmp = stock.get_market_cap_by_ticker(ref_date, market="KOSPI")
-                codes = set(cap_tmp.sort_values("시가총액", ascending=False)
-                            .head(200).index.astype(str).str.zfill(6).tolist())
+            df, cap_col = _get_cap_df(ref_date)
+            if df is None:
+                raise ValueError("시총 데이터 없음")
 
+            # 인덱스를 6자리 문자열로 정규화
+            df.index = df.index.astype(str).str.zfill(6)
+            codes = set(
+                df.sort_values(cap_col, ascending=False)
+                .head(200).index.tolist()
+            )
             YEARLY_UNIVERSE[year] = codes
             all_codes_union |= codes
+            success_count += 1
             print(f"     {year}: {len(codes)}종목")
 
         except Exception as e:
-            # 해당 연도 조회 실패 → 직전 연도 유니버스 재사용
             prev = YEARLY_UNIVERSE.get(year - 1)
             YEARLY_UNIVERSE[year] = prev if prev else set()
-            print(f"     {year}: 조회 실패({e}) → 직전 연도 재사용 ({len(YEARLY_UNIVERSE[year])}종목)")
+            print(f"     {year}: 조회 실패({e.__class__.__name__}) → "
+                  f"직전 연도 재사용 ({len(YEARLY_UNIVERSE[year])}종목)")
+
+    if success_count == 0:
+        # 전체 실패 → YEARLY_UNIVERSE 비워서 필터 비활성화
+        print("  ⚠️  연도별 유니버스 전체 실패 → 유니버스 필터 비활성화")
+        YEARLY_UNIVERSE = {}
+        return
 
     print(f"  ✅ 연도별 유니버스 완료 — 전체 유니언: {len(all_codes_union)}종목")
 
