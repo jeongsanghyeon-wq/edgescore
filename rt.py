@@ -2340,8 +2340,10 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                 buy_log_data["buy_price"] = _last_cntr_uv
                                 buy_log_data["amount"]    = _last_cntr_qty * _last_cntr_uv
                                 append_trade_log(buy_log_data)
-                            _pending_buy.discard(ticker)  # [2순위-FIX] 부분체결 확정 후 선점 해제
-                            log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정")
+                            # [치명-FIX] _pending_buy는 여기서 해제 금지
+                            # 잔량 주문이 브로커에 살아 있는 동안 추가매수 차단을 유지해야 함
+                            # orphan watcher가 is_final=True / 5분 타임아웃 시 해제
+                            log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정, _pending_buy 유지")
                             tg(
                                 f"⚠️ <b>[{_mode}] 매수 부분체결 — 잔량 자동 추적 시작</b>\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -2570,22 +2572,40 @@ def _start_orphan_watcher(
 
                 if fill.get("is_final", False):
                     log.info(f"[{_mode_str}] {name}({ticker}) {action} — 최종체결 확인, 추적 종료")
-                    # 매도 최종 확정 시 _pending_sell도 보장 해제
-                    if action == "sell":
+                    # [치명-FIX] watcher 종료 시 선점 플래그 해제 (순서: positions 확정 완료 후)
+                    if action == "buy":
+                        _pending_buy.discard(ticker)
+                        log.info(f"[연장추적] {name}({ticker}) 매수 _pending_buy 해제")
+                    else:  # sell
+                        # positions의 pending_sell 플래그도 정리
+                        if monitor and hasattr(monitor, "positions") and                                 ticker in monitor.positions:
+                            with _positions_lock:
+                                monitor.positions[ticker].pop("pending_sell", None)
+                                save_positions(monitor.positions)
                         _pending_sell.discard(ticker)
+                        log.info(f"[연장추적] {name}({ticker}) 매도 _pending_sell 해제")
                     return
 
             except Exception as e:
                 log.warning(f"[{_mode_str}] {name}({ticker}) 오류: {e}")
 
-        # 5분 경과 후에도 미완료
+        # 5분 경과 후에도 미완료 — 선점 플래그 반드시 해제 후 경고
+        # [치명-FIX] 타임아웃 시에도 _pending_buy/_pending_sell 고착 방지
+        if action == "buy":
+            _pending_buy.discard(ticker)
+            log.warning(f"[연장추적-타임아웃] {name}({ticker}) 매수 _pending_buy 해제")
+        else:
+            if monitor and hasattr(monitor, "positions") and                     ticker in monitor.positions:
+                with _positions_lock:
+                    monitor.positions[ticker].pop("pending_sell", None)
+                    save_positions(monitor.positions)
+            _pending_sell.discard(ticker)
+            log.warning(f"[연장추적-타임아웃] {name}({ticker}) 매도 _pending_sell 해제")
         log.warning(f"[{_mode_str}] {name}({ticker}) {action} — 5분 추적 후에도 미완료. 수동 확인 필요")
         tg(f"⚠️ <b>[잔량 미확인]</b> {name}({ticker}) {action}\n"
            f"5분 추적 후에도 잔량 체결 미확인.\n"
            f"실계좌 주문 상태를 직접 확인해주세요.\n"
            f"(내부 포지션: 확인된 {_prev_qty:,}주 기준)")
-        if action == "sell":
-            _pending_sell.discard(ticker)
 
     threading.Thread(target=_watcher, daemon=True, name=f"orphan-{ticker}").start()
 
