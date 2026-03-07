@@ -2190,16 +2190,25 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     amount   = cntr_qty * cntr_uv
 
                     if action == "buy":
-                        # [BUG-FIX-①] 클로저로 캡처한 monitor 직접 사용
-                        # [BUG-FIX-②] 체결 확인 후 pending 해제 + trade_log 기록
+                        # [BUG-FIX] 실체결 기준으로 positions 최종 확정 (부분체결 대응)
+                        # 주문수량(_new_position)이 아닌 실체결수량(cntr_qty)으로 덮어씀
                         if monitor and hasattr(monitor, "positions") and                            ticker in monitor.positions:
                             with _positions_lock:
-                                monitor.positions[ticker].pop("pending", None)
+                                pos = monitor.positions[ticker]
+                                pos.pop("pending", None)
+                                pos["shares"]      = cntr_qty          # 실체결수량
+                                pos["buy_price"]   = cntr_uv           # 실체결가
+                                pos["amount"]      = cntr_qty * cntr_uv
+                                # trail/peak 가격도 실체결가 기준으로 정렬
+                                if pos.get("peak_price", 0) < cntr_uv:
+                                    pos["peak_price"] = cntr_uv
+                                if pos.get("trail_price", 0) < cntr_uv:
+                                    pos["trail_price"] = cntr_uv
                                 save_positions(monitor.positions)
-                        # 체결 확인 후 trade_log 기록 (접수 시점 아님)
+                        # 체결 확인 후 trade_log 기록 (실체결 기준)
                         if buy_log_data:
-                            buy_log_data["buy_price"] = cntr_uv   # 실체결가 반영
-                            buy_log_data["shares"]    = cntr_qty  # 실체결수량 반영
+                            buy_log_data["buy_price"] = cntr_uv
+                            buy_log_data["shares"]    = cntr_qty
                             buy_log_data["amount"]    = cntr_qty * cntr_uv
                             append_trade_log(buy_log_data)
                         msg = (
