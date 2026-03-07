@@ -1,5 +1,5 @@
 """
-Edge Score v39.7 — Dashboard API Server v1.8
+Edge Score v39.8 — Dashboard API Server v1.8
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -123,7 +123,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "v39.7", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.8", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -641,13 +641,19 @@ def _create_app():
 
         C = rt.C
         params = {
-            "EDGE_BUY_THRESHOLD": C.get("EDGE_BUY_THRESHOLD"),
-            "ATR_SL_MULTIPLIER": C.get("ATR_SL_MULTIPLIER"),
-            "TRAIL_ACTIVATE": C.get("TRAIL_ACTIVATE"),
-            "TRAIL_STEP": C.get("TRAIL_STEP"),
-            "DAILY_DRAWDOWN_LIMIT": C.get("DAILY_DRAWDOWN_LIMIT"),
-            "MAX_SECTOR_PCT": C.get("MAX_SECTOR_PCT"),
-            "TIMESTOP_DAYS": C.get("TIMESTOP_DAYS"),
+            # ── 진입/매도 기준 ────────────────────────────────
+            "SELL_EDGE_THRESHOLD":    C.get("SELL_EDGE_THRESHOLD"),     # 0.30
+            # ── ATR 손절 배수 ─────────────────────────────────
+            "ATR_MULT_LARGE":         C.get("ATR_MULT_LARGE"),          # 1.2
+            "ATR_MULT_SMALL":         C.get("ATR_MULT_SMALL"),          # 2.0
+            "ATR_MULT_TECH":          C.get("ATR_MULT_TECH"),           # 1.5
+            # ── 트레일링 스탑 ─────────────────────────────────
+            "TRAIL_ACTIVATE":         C.get("TRAIL_ACTIVATE"),          # 0.07
+            "TRAIL_ATR_MULT_DEFAULT": C.get("TRAIL_ATR_MULT_DEFAULT"),  # 2.0
+            # ── 리스크/시간 관리 ──────────────────────────────
+            "DAILY_DRAWDOWN_LIMIT":   C.get("DAILY_DRAWDOWN_LIMIT"),    # -0.05
+            "SECTOR_MAX_POSITIONS":   C.get("SECTOR_MAX_POSITIONS"),    # 2
+            "TIME_STOP_DAYS":         C.get("TIME_STOP_DAYS"),          # 15
         }
 
         cache_info = {
@@ -679,7 +685,7 @@ def _create_app():
                 conn = _sq.connect(str(db_path))
                 conn.row_factory = _sq.Row
                 cur = conn.execute(
-                    "SELECT * FROM trade_log ORDER BY timestamp DESC LIMIT 100"
+                    "SELECT * FROM trades ORDER BY created_at DESC LIMIT 100"
                 )
                 for row in cur.fetchall():
                     trades.append(dict(row))
@@ -689,6 +695,7 @@ def _create_app():
         return {"trades": trades, "today": today}
 
     @app.route("/api/today_trades")
+    @_cached("today_trades")
     def api_today_trades():
         """오늘 체결 내역 요약 — Dashboard todayTrades 패널용"""
         today = date.today().isoformat()
@@ -703,7 +710,7 @@ def _create_app():
                 conn = _sq.connect(str(db_path))
                 conn.row_factory = _sq.Row
                 cur = conn.execute(
-                    "SELECT * FROM trade_log WHERE date = ? ORDER BY timestamp DESC",
+                    "SELECT * FROM trades WHERE date = ? ORDER BY created_at DESC",
                     (today,)
                 )
                 for row in cur.fetchall():
