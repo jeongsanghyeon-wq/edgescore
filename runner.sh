@@ -1,5 +1,5 @@
 #!/bin/bash
-# Edge Score v39.7 무중단 실행 스크립트
+# Edge Score v39.9 무중단 실행 스크립트
 
 # 부팅 직후 시스템 준비 대기 (30초)
 sleep 30

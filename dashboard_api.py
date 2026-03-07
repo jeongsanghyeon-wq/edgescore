@@ -1,5 +1,5 @@
 """
-Edge Score v39.8 — Dashboard API Server v1.8
+Edge Score v39.9 — Dashboard API Server v1.8
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -123,7 +123,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "v39.8", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.9", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),

@@ -1,6 +1,22 @@
 """
-Edge Score v39.8 — 완전 통합 엔진
+Edge Score v39.9 — 완전 통합 엔진
 =====================================================
+v39.9 패치:
+
+  [버그수정] ① sl_warn 리셋 조건 항상 True 수정 (접근 경보 매분 스팸)
+    - 기존: _sl_price_check = cp*(1+dyn_sl)*1.02 → 항상 cp 미만 → 조건 항상 True
+    - 결과: sl_warn 플래그 매 분 리셋 → 손절가 접근 경보 매분 재발송 스팸
+    - 수정: ret vs dyn_sl 직접 비교 (ret > dyn_sl + 0.03 시에만 리셋)
+    - 효과: 경보 1회 발송 후 ret이 dyn_sl보다 3% 회복됐을 때만 리셋
+
+  [버그수정] ② 접근 경보 조건 수식 오류 수정 (ATR 손절폭 5% 초과 시 미발동)
+    - 기존: sl_price_now = cp*(1+dyn_sl) → |dyn_sl|>5% 시 sl_price_now/0.95 < cp
+            → cp <= sl_price_now*(1/0.95) 조건 절대 True 불가
+    - 결과: ATR 손절폭 5~12% 구간에서 접근 경보 전혀 발동 안 됨
+    - 수정: sl_price_now = buy_p*(1+dyn_sl) (매수가 기준 절대 손절가)
+            조건: cp <= sl_price_now*1.05 and cp > sl_price_now
+    - 효과: 실제 손절가의 5% 이내 접근 시 정상 경보
+
 v39.8 패치:
 
   [버그수정] ① _dash_alert 필드명 불일치 수정
@@ -4347,8 +4363,10 @@ class EdgeMonitor:
             # 미리셋 시 다음 접근에서 경보가 영구적으로 발송되지 않는 문제 방지
             _sl_warn_key = f"sl_warn_{ticker}"
             if info.get(_sl_warn_key):
-                _sl_price_check = cp * (1 + dyn_sl)
-                if cp > _sl_price_check * 1.02:   # 손절가 대비 2% 이상 회복
+                # [BUG-FIX] cp*(1+dyn_sl)*1.02 는 항상 cp 미만 → 조건 항상 True → 매분 리셋 스팸
+                # 수정: ret(매수가 기준 수익률) vs dyn_sl 직접 비교
+                # ret가 손절 임계치보다 3% 이상 회복됐을 때만 리셋
+                if ret > dyn_sl + 0.03:
                     info.pop(_sl_warn_key, None)
             # ── 미매도 후속 분석 ─────────────────────────
             # 손절/트레일링 알림 후 아직 보유 중이면, N분 뒤 추세 재분석
@@ -4514,9 +4532,11 @@ class EdgeMonitor:
                     )
                 continue
             # ATR 손절
-            sl_price_now = cp * (1 + dyn_sl)
+            # [BUG-FIX] sl_price_now = cp*(1+dyn_sl) → |dyn_sl|>5% 시 접근 경보 영구 미발동
+            # 수정: buy_p 기준 절대 손절가로 계산 (동적 dyn_sl을 매수가에 적용)
+            sl_price_now = buy_p * (1 + dyn_sl)
             if np.isnan(sl_price_now) or sl_price_now <= 0:
-                sl_price_now = cp * 0.93
+                sl_price_now = buy_p * 0.93
             # ㊳ 타임스탑 체크 (ATR/트레일링 미발동 상태에서 장기 무변동 시)
             if not info.get("trail_active") and not info.get("atr_alerted"):
                 _entry_ts = info.get("entry_date", "")
@@ -4638,7 +4658,7 @@ class EdgeMonitor:
                 elif edge_now >= sell_thr:
                     info.pop("sell_edge_alerted", None)  # 점수 회복 시 초기화
             # ── 손절가 95% 접근 사전 경보 ── (독립 if로 분리)
-            if cp <= sl_price_now * (1 / 0.95) and cp > sl_price_now:
+            if cp <= sl_price_now * 1.05 and cp > sl_price_now:
                 approach_pct = (cp - sl_price_now) / sl_price_now
                 warned_key   = f"sl_warn_{ticker}"
                 if not info.get(warned_key):
@@ -5924,7 +5944,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.8 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.9 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -6006,7 +6026,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.8 가동</b>\n"
+        f"🚀 <b>Edge Score v39.9 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
