@@ -3029,13 +3029,15 @@ class TelegramCommander:
                        f"종목: {name}\n"
                        f"❗ 포지션/로그 저장 스킵 (재시도 후 직접 확인 권장)")
             else:
-                # 키움 미연결: 수동매수(모의/테스트)로 간주 → 저장 허용
-                _order_sent = True
+                # [BUG-FIX] kw=None은 클라이언트 오류일 수 있음 → 매도와 동일하게 주문 실패 처리
+                # 허위 포지션/거래로그 생성 방지 — positions/log 저장 금지
+                tg(f"🚨 키움 클라이언트 연결 실패 — {name} 매수 취소\n직접 확인 후 재시도해주세요.")
+                log.error(f"[수동매수실패] {name}({ticker}) kiwoom() None — 포지션 저장 금지")
         else:
             # EMERGENCY_STOP: 주문 없이 포지션만 저장 (수동 긴급모드)
             _order_sent = True
 
-        # 주문 성공(또는 키움 미연결/긴급모드) 시에만 저장
+        # 주문 성공(또는 EMERGENCY_STOP 긴급모드) 시에만 저장
         # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
         if _order_sent:
             with _positions_lock:
