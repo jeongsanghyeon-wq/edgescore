@@ -444,7 +444,7 @@ export default function Dashboard(){
               const isBuy=t.action==="BUY";
               const pnl=t.pnl||0;
               return <tr key={i} style={{borderBottom:"1px solid #1e293b11",background:i%2?"#0f172a33":"transparent"}}>
-                <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.timestamp||"").slice(11,16)}</td>
+                <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.created_at||t.timestamp||"").slice(11,16)}</td>
                 <td style={{padding:"5px 4px",fontWeight:600}}>{t.name||t.ticker}</td>
                 <td style={{padding:"5px 4px",textAlign:"center"}}><span style={{background:isBuy?"#22c55e22":"#ef444422",color:isBuy?"#22c55e":"#ef4444",padding:"2px 6px",borderRadius:4,fontWeight:700,fontSize:10}}>{isBuy?"매수":"매도"}</span></td>
                 <td style={{padding:"5px 4px",textAlign:"right"}}>{fmt(t.shares)}주</td>

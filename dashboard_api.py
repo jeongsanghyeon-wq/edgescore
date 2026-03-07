@@ -1,10 +1,14 @@
 """
-Edge Score v40.0 — Dashboard API Server v1.9
+Edge Score v40.0 — Dashboard API Server v1.9.1
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
   [2] 스레드 안전성 — _monitor 접근 시 Lock + 스냅샷(deepcopy)
   [3] 텔레그램 알림 — 캐시 히트율 이상 시 알림
+
+v1.9.1 수정사항:
+  [BUG-FIX] _cached() 데코레이터 ttl 파라미터 미지원 → TypeError 크래시 수정
+            api_account(@_cached("account", ttl=_CACHE_TTL_ACCOUNT)) 정상 동작
 
 사용법: rt.py main에서
   from dashboard_api import start_dashboard
@@ -42,13 +46,15 @@ _CACHE_TTL = 3
 _CACHE_TTL_ACCOUNT = 30   # [v1.9] api_account 전용 30초 캐시 (키움 API 과호출 방지)
 
 
-def _cached(endpoint_key):
+def _cached(endpoint_key, ttl=None):
+    # [v1.9 BUG-FIX] ttl 파라미터 지원 추가 — api_account의 @_cached("account", ttl=_CACHE_TTL_ACCOUNT) TypeError 수정
+    _ttl = ttl if ttl is not None else _CACHE_TTL
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             now = _time.time()
             cached = _cache.get(endpoint_key)
-            if cached and (now - cached["ts"]) < _CACHE_TTL:
+            if cached and (now - cached["ts"]) < _ttl:
                 return jsonify(cached["data"])
             result = fn(*args, **kwargs)
             if isinstance(result, dict):
@@ -116,7 +122,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.9",
+        return jsonify({"status": "ok", "version": "v1.9.1",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
