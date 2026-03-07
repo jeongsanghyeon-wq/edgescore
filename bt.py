@@ -44,7 +44,7 @@ v26.0 유지:
   ①~㉙ 전 기능 유지
 
 필요 라이브러리:
-    pip install pykrx pandas numpy scipy matplotlib requests
+    pip install finance-datareader pandas numpy scipy matplotlib requests
                 beautifulsoup4 openpyxl schedule
 
 실행 (즉시):
@@ -100,10 +100,14 @@ except ImportError:
     SCHEDULE_AVAILABLE = False
 
 try:
-    from pykrx import stock; PYKRX_AVAILABLE = True
+    import FinanceDataReader as fdr; FDR_AVAILABLE = True
 except ImportError:
-    PYKRX_AVAILABLE = False
-    print("⚠️  pykrx 미설치 → 시뮬레이션 데이터로 실행합니다.")
+    FDR_AVAILABLE = False
+    print("⚠️  FinanceDataReader 미설치 → 시뮬레이션 데이터로 실행합니다.")
+    print("     pip install finance-datareader")
+
+# pykrx 하위 호환 (일부 코드에서 PYKRX_AVAILABLE 참조 대비)
+PYKRX_AVAILABLE = FDR_AVAILABLE
 
 
 # ══════════════════════════════════════════════════════
@@ -346,100 +350,145 @@ def _auto_slippage(market_cap: int) -> float:
         return 0.005
     return 0.008
 
-def _get_cap_df(ref_date: str):
-    """pykrx get_market_cap_by_ticker 래퍼 — 컬럼명 차이 자동 처리."""
-    # 후보 날짜들 (1월 초 휴장 대비)
-    from datetime import datetime, timedelta
-    base = datetime.strptime(ref_date, "%Y%m%d")
-    for delta in range(0, 10):
-        d = (base + timedelta(days=delta)).strftime("%Y%m%d")
+# fdr 코스피 종목 리스트 캐시
+_FDR_LISTING_CACHE: dict = {}
+
+def _fdr_get_listing():
+    """fdr.StockListing('KOSPI') 캐시 조회 — 종목명/시총/업종 포함."""
+    if "listing" not in _FDR_LISTING_CACHE:
         try:
-            df = stock.get_market_cap_by_ticker(d, market="KOSPI")
-            if df is None or len(df) == 0:
+            df = fdr.StockListing("KOSPI")
+            # Code 컬럼 정규화
+            code_col = "Code" if "Code" in df.columns else df.columns[0]
+            df[code_col] = df[code_col].astype(str).str.zfill(6)
+            df = df.set_index(code_col)
+            _FDR_LISTING_CACHE["listing"] = df
+        except Exception as e:
+            print(f"  ⚠️  fdr StockListing 실패: {e}")
+            _FDR_LISTING_CACHE["listing"] = None
+    return _FDR_LISTING_CACHE["listing"]
+
+def _fdr_get_mktcap(listing_df, code: str) -> int:
+    """fdr listing에서 시총 추출 — 컬럼명 차이 자동 처리."""
+    if listing_df is None or code not in listing_df.index:
+        return 0
+    for col in ["Marcap", "시가총액", "marcap", "MktCap"]:
+        if col in listing_df.columns:
+            try:
+                return int(listing_df.loc[code, col])
+            except Exception:
                 continue
-            # 시가총액 컬럼 찾기 (버전별 차이 대응)
-            cap_col = None
-            for c in ["시가총액", "Mktcap", "시총", "marcap"]:
-                if c in df.columns:
-                    cap_col = c
-                    break
-            if cap_col is None:
-                cap_col = df.columns[0]   # 첫 번째 컬럼 사용
-            return df, cap_col
-        except Exception:
-            continue
-    return None, None
+    return 0
+
+def _fdr_get_sector(listing_df, code: str) -> str:
+    """fdr listing에서 업종 추출."""
+    if listing_df is None or code not in listing_df.index:
+        return "기타"
+    for col in ["Sector", "업종", "Industry"]:
+        if col in listing_df.columns:
+            val = str(listing_df.loc[code, col])
+            if val and val != "nan":
+                return val
+    return "기타"
+
+def _fdr_get_name(listing_df, code: str) -> str:
+    """fdr listing에서 종목명 추출."""
+    if listing_df is None or code not in listing_df.index:
+        return code
+    for col in ["Name", "종목명", "회사명"]:
+        if col in listing_df.columns:
+            val = str(listing_df.loc[code, col])
+            if val and val != "nan":
+                return val
+    return code
 
 def build_yearly_kospi200():
     """
     ㊸ 연도별 코스피200 유니버스 캐시 빌드 (생존 편향 제거).
 
-    각 연도 1월 기준 시총 상위 200개를 조회하여 YEARLY_UNIVERSE에 저장.
-    pykrx 미설치 또는 전체 실패 시 단일 기준일(KOSPI200_REFERENCE_DATE) 폴백.
+    fdr.StockListing('KOSPI')로 현재 상장 종목을 가져오고
+    각 연도별 실제 상장 여부를 ListingDate로 필터링하여
+    YEARLY_UNIVERSE = {year: set(code)} 를 구성한다.
     """
     global YEARLY_UNIVERSE
 
     start_year = int(START_DATE[:4])
     end_year   = int(END_DATE[:4])
 
-    if not PYKRX_AVAILABLE:
+    if not FDR_AVAILABLE:
         fallback_codes = {"005930","005380","105560","031980","000660","035720","005490","373220"}
         YEARLY_UNIVERSE = {yr: fallback_codes for yr in range(start_year, end_year + 1)}
-        print("  ⚠️  pykrx 미설치 → 연도별 유니버스 폴백 (8종목)")
+        print("  ⚠️  fdr 미설치 → 연도별 유니버스 폴백 (8종목)")
         return
 
-    print(f"  ▶ 연도별 코스피200 유니버스 조회 중 ({start_year}~{end_year})...")
-    all_codes_union = set()
-    success_count   = 0
+    print(f"  ▶ 연도별 코스피200 유니버스 구성 중 ({start_year}~{end_year})...")
 
-    for year in range(start_year, end_year + 1):
-        ref_date = f"{year}0102"
-        try:
-            df, cap_col = _get_cap_df(ref_date)
-            if df is None:
-                raise ValueError("시총 데이터 없음")
+    try:
+        listing = _fdr_get_listing()
+        if listing is None:
+            raise ValueError("StockListing 실패")
 
-            # 인덱스를 6자리 문자열로 정규화
-            df.index = df.index.astype(str).str.zfill(6)
-            codes = set(
-                df.sort_values(cap_col, ascending=False)
-                .head(200).index.tolist()
-            )
+        # 시총 컬럼 결정
+        cap_col = None
+        for c in ["Marcap", "시가총액", "marcap", "MktCap"]:
+            if c in listing.columns:
+                cap_col = c
+                break
+        if cap_col is None:
+            raise ValueError("시총 컬럼 없음")
+
+        # 상장일 컬럼
+        date_col = None
+        for c in ["ListingDate", "상장일", "IPOdate"]:
+            if c in listing.columns:
+                date_col = c
+                break
+
+        # 시총 기준 정렬 후 상위 300개 후보
+        listing[cap_col] = pd.to_numeric(listing[cap_col], errors="coerce").fillna(0)
+        top300 = listing.sort_values(cap_col, ascending=False).head(300)
+
+        all_codes_union = set()
+        for year in range(start_year, end_year + 1):
+            # 해당 연도 1월 1일 이전에 상장된 종목만 포함
+            if date_col:
+                cutoff = pd.Timestamp(f"{year}-01-01")
+                try:
+                    top300[date_col] = pd.to_datetime(top300[date_col], errors="coerce")
+                    year_df = top300[
+                        top300[date_col].isna() |  # 상장일 불명 → 포함
+                        (top300[date_col] <= cutoff)
+                    ]
+                except Exception:
+                    year_df = top300
+            else:
+                year_df = top300
+
+            codes = set(year_df.head(200).index.tolist())
             YEARLY_UNIVERSE[year] = codes
             all_codes_union |= codes
-            success_count += 1
             print(f"     {year}: {len(codes)}종목")
 
-        except Exception as e:
-            prev = YEARLY_UNIVERSE.get(year - 1)
-            YEARLY_UNIVERSE[year] = prev if prev else set()
-            print(f"     {year}: 조회 실패({e.__class__.__name__}) → "
-                  f"직전 연도 재사용 ({len(YEARLY_UNIVERSE[year])}종목)")
+        print(f"  ✅ 연도별 유니버스 완료 — 전체 유니언: {len(all_codes_union)}종목")
 
-    if success_count == 0:
-        # 전체 실패 → YEARLY_UNIVERSE 비워서 필터 비활성화
-        print("  ⚠️  연도별 유니버스 전체 실패 → 유니버스 필터 비활성화")
+    except Exception as e:
+        print(f"  ⚠️  연도별 유니버스 실패({e}) → 유니버스 필터 비활성화")
         YEARLY_UNIVERSE = {}
-        return
-
-    print(f"  ✅ 연도별 유니버스 완료 — 전체 유니언: {len(all_codes_union)}종목")
 
 def is_in_yearly_universe(ticker: str, date) -> bool:
     """해당 날짜 기준으로 종목이 코스피200에 포함되는지 확인."""
-    year = date.year if hasattr(date, 'year') else int(str(date)[:4])
+    year = date.year if hasattr(date, "year") else int(str(date)[:4])
     universe = YEARLY_UNIVERSE.get(year)
     if not universe:
-        return True   # 유니버스 없으면 차단하지 않음 (보수적)
+        return True   # 유니버스 없으면 차단하지 않음
     return ticker in universe
 
 
 def build_kospi200_universe():
     """
-    코스피200 유니버스를 동적 구성.
+    fdr 기반 코스피200 유니버스 동적 구성.
     TICKERS, CLUSTER_PARAMS["tickers"], SECTOR_MAP, SLIPPAGE_BY_CLUSTER 를 채운다.
-    pykrx 미설치 또는 조회 실패 시 기존 8종목으로 폴백.
     """
-    # 각 클러스터 tickers 초기화
     for cp in CLUSTER_PARAMS.values():
         cp["tickers"] = []
 
@@ -453,11 +502,8 @@ def build_kospi200_universe():
         "005380":"대형가치주","105560":"금융주","031980":"중소형성장주","035720":"중소형성장주",
     }
     _fallback_sector = {
-        "반도체": ["005930","000660","031980"],
-        "자동차": ["005380"],
-        "금융":   ["105560"],
-        "소재":   ["005490","373220"],
-        "IT서비스":["035720"],
+        "반도체": ["005930","000660","031980"], "자동차": ["005380"],
+        "금융":   ["105560"], "소재": ["005490","373220"], "IT서비스": ["035720"],
     }
 
     def _apply_fallback():
@@ -465,34 +511,28 @@ def build_kospi200_universe():
             CLUSTER_PARAMS[cluster]["tickers"].append(code)
         return _fallback_tickers, _fallback_sector
 
-    if not PYKRX_AVAILABLE:
-        print("  ⚠️  pykrx 미설치 → 기존 8종목 폴백")
+    if not FDR_AVAILABLE:
+        print("  ⚠️  fdr 미설치 → 기존 8종목 폴백")
         return _apply_fallback()
 
     try:
-        print(f"  ▶ 코스피200 유니버스 조회 중 (기준일: {KOSPI200_REFERENCE_DATE})...")
+        print(f"  ▶ 코스피200 유니버스 조회 중 (fdr 기반)...")
+        listing = _fdr_get_listing()
+        if listing is None:
+            raise ValueError("StockListing 실패")
 
-        # ① 코스피200 구성 종목 — YEARLY_UNIVERSE 합집합 우선 사용 (전 기간 등장 종목 포함)
+        # YEARLY_UNIVERSE 합집합 우선 사용 (전 기간 등장 종목 전부 포함)
         if YEARLY_UNIVERSE:
             kospi200_codes = list({c for codes in YEARLY_UNIVERSE.values() for c in codes})
             print(f"     유니버스 합집합: {len(kospi200_codes)}종목 (연도별 전 기간)")
         else:
-            try:
-                kospi200_codes = stock.get_index_portfolio_deposit_file("1028")
-            except Exception:
-                kospi200_codes = []
-            if not kospi200_codes or len(kospi200_codes) < 10:
-                cap_df_tmp = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
-                kospi200_codes = cap_df_tmp.sort_values("시가총액", ascending=False).head(200).index.tolist()
-
-        # ② 시가총액
-        cap_df = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
-
-        # ③ 업종 정보
-        try:
-            sector_df = stock.get_market_sector_classifications(KOSPI200_REFERENCE_DATE, market="KOSPI")
-        except Exception:
-            sector_df = None
+            cap_col = next((c for c in ["Marcap","시가총액","marcap","MktCap"]
+                            if c in listing.columns), None)
+            if cap_col:
+                listing[cap_col] = pd.to_numeric(listing[cap_col], errors="coerce").fillna(0)
+                kospi200_codes = listing.sort_values(cap_col, ascending=False).head(200).index.tolist()
+            else:
+                kospi200_codes = listing.head(200).index.tolist()
 
         tickers_dict = {}
         sector_map   = {}
@@ -500,26 +540,19 @@ def build_kospi200_universe():
 
         for code in kospi200_codes:
             code = str(code).zfill(6)
-            try:
-                name = stock.get_market_ticker_name(code)
-            except Exception:
-                name = code
+            name    = _fdr_get_name(listing, code)
+            mktcap  = _fdr_get_mktcap(listing, code)
+            krx_sec = _fdr_get_sector(listing, code)
 
-            mktcap  = int(cap_df.loc[code, "시가총액"]) if code in cap_df.index else 0
-            krx_sec = "기타"
-            if sector_df is not None and code in sector_df.index:
-                krx_sec = str(sector_df.loc[code].get("업종명", "기타"))
-
-            cluster  = _classify_cluster(mktcap, krx_sec)
-            eqs_sec  = _KRX_SECTOR_TO_EQS.get(krx_sec, "기타")
-            slip     = _auto_slippage(mktcap)
+            cluster = _classify_cluster(mktcap, krx_sec)
+            eqs_sec = _KRX_SECTOR_TO_EQS.get(krx_sec, "기타")
+            slip    = _auto_slippage(mktcap)
 
             tickers_dict[name] = code
             CLUSTER_PARAMS[cluster]["tickers"].append(code)
             sector_map.setdefault(eqs_sec, []).append(code)
             slip_totals[cluster].append(slip)
 
-        # SLIPPAGE_BY_CLUSTER 클러스터별 중앙값으로 갱신
         for cname, slips in slip_totals.items():
             if slips:
                 SLIPPAGE_BY_CLUSTER[cname] = float(np.median(slips))
@@ -535,6 +568,7 @@ def build_kospi200_universe():
         for cp in CLUSTER_PARAMS.values():
             cp["tickers"] = []
         return _apply_fallback()
+
 
 # ── 유니버스 빌드 (모듈 임포트 시 자동 실행) ──────────────
 build_yearly_kospi200()                          # ㊸ 연도별 유니버스 먼저 빌드
@@ -1170,14 +1204,14 @@ def calc_beta_eff(df, mkt):
     return b52.fillna(b20) * 0.3 + b20.fillna(b52) * 0.7
 
 def calc_med_vol(mkt, w=5):
-    if PYKRX_AVAILABLE:
+    if FDR_AVAILABLE:
         vd = {}
         for tk in TOP_TICKERS_MEDVOL[:10]:
             try:
-                tmp = stock.get_market_ohlcv_by_date(START_DATE, END_DATE, tk)
+                tmp = fdr.DataReader(tk, START_DATE, END_DATE)
                 tmp.index = pd.to_datetime(tmp.index)
-                col = [c for c in tmp.columns if "종가" in c]
-                if col: vd[tk] = tmp[col[0]].pct_change().abs()
+                close = tmp["Close"] if "Close" in tmp.columns else tmp.iloc[:,3]
+                vd[tk] = close.pct_change().abs()
             except: continue
         if vd:
             return (pd.DataFrame(vd).rolling(w).median().median(axis=1)
@@ -1293,7 +1327,7 @@ def check_exit_trigger(curr_price, buy_price, regime, dynamic_sl=None,
 
 def is_friday(idx) -> bool:
     """㉜ 금요일 여부 (주간 강제 청산 판단용)
-    [Issue-5 수정] pykrx 이용 가능 시 실제 휴장일(공휴일) 제외
+    [Issue-5 수정] fdr 이용 가능 시 실제 휴장일(공휴일) 제외
     이전: weekday()==4 단순 체크 → 한국 공휴일 금요일에도 강제청산 트리거
     수정: 공휴일 금요일은 실제로 거래 없음 → 청산 스킵
     """
@@ -1301,15 +1335,15 @@ def is_friday(idx) -> bool:
         ts = pd.Timestamp(idx)
         if ts.weekday() != 4:
             return False
-        # pykrx로 실제 거래일 여부 확인
-        if PYKRX_AVAILABLE:
+        # fdr로 실제 거래일 여부 확인 (삼성전자 데이터 존재 여부로 판단)
+        if FDR_AVAILABLE:
             try:
-                d_str = ts.strftime("%Y%m%d")
-                chk = stock.get_market_ohlcv_by_date(d_str, d_str, "005930")
+                d_str = ts.strftime("%Y-%m-%d")
+                chk = fdr.DataReader("005930", d_str, d_str)
                 return chk is not None and len(chk) > 0
             except:
                 pass
-        return True   # pykrx 실패 시 금요일로 간주 (보수적)
+        return True   # fdr 실패 시 금요일로 간주 (보수적)
     except:
         return False
 
@@ -2047,23 +2081,45 @@ def _log_trade(log_list, name, pos, idx, regime, reason,
 # 데이터 수집
 # ══════════════════════════════════════════════════════
 
-def get_data(ticker):
-    if PYKRX_AVAILABLE:
+# fdr 코스피 지수 캐시 (매번 조회 방지)
+_FDR_MKT_CACHE: dict = {}
+
+def _fdr_get_mkt():
+    """코스피 지수(KS11) 캐시 조회."""
+    if "mkt" not in _FDR_MKT_CACHE:
         try:
-            ohlcv = stock.get_market_ohlcv_by_date(START_DATE, END_DATE, ticker)
-            ohlcv.index = pd.to_datetime(ohlcv.index)
-            ohlcv.columns = [c.strip() for c in ohlcv.columns]
-            try:
-                fv = stock.get_market_trading_value_by_date(START_DATE, END_DATE, ticker)
-                fv.index = pd.to_datetime(fv.index)
-                col = [c for c in fv.columns if "외국인" in c]
-                ohlcv["foreign_net"] = fv[col[0]] if col else 0
-            except: ohlcv["foreign_net"] = 0
-            mkt = stock.get_index_ohlcv_by_date(START_DATE, END_DATE, "1001")
-            mkt.index = pd.to_datetime(mkt.index)
-            mkt.columns = [c.strip() for c in mkt.columns]
-            return ohlcv, mkt, True
-        except: pass
+            df = fdr.DataReader("KS11", START_DATE, END_DATE)
+            df.index = pd.to_datetime(df.index)
+            mkt = pd.DataFrame({"종가": df["Close"]})
+            if "Open" in df.columns:
+                mkt["시가"] = df["Open"]
+            _FDR_MKT_CACHE["mkt"] = mkt
+        except Exception as e:
+            print(f"  ⚠️  코스피 지수 조회 실패: {e}")
+            _FDR_MKT_CACHE["mkt"] = None
+    return _FDR_MKT_CACHE["mkt"]
+
+def get_data(ticker):
+    if FDR_AVAILABLE:
+        try:
+            raw = fdr.DataReader(ticker, START_DATE, END_DATE)
+            raw.index = pd.to_datetime(raw.index)
+            # fdr 컬럼명 → EQS 내부 컬럼명 매핑
+            col_map = {"Close":"종가", "Open":"시가", "High":"고가",
+                       "Low":"저가", "Volume":"거래량", "Change":"등락률"}
+            raw = raw.rename(columns=col_map)
+            # 필수 컬럼 보장
+            if "거래량" not in raw.columns:
+                raw["거래량"] = 0
+            if "시가" not in raw.columns:
+                raw["시가"] = raw["종가"]
+            raw["foreign_net"] = 0   # fdr 외국인 순매수 미지원 → 0
+            mkt = _fdr_get_mkt()
+            if mkt is None:
+                raise ValueError("코스피 지수 없음")
+            return raw, mkt, True
+        except Exception as e:
+            pass  # 폴백으로 진행
     np.random.seed(hash(ticker) % 2**32)
     dates = pd.bdate_range(START_DATE, END_DATE); n = len(dates)
     params = {"005930": (80000, 0.0003, 0.018), "005380": (200000, 0.0002, 0.020),
@@ -2738,7 +2794,7 @@ def main():
     print("  ✅ EQS V1.2 백테스트 완료")
     print(f"{'='*62}")
     print("\n  [실전 전환 체크리스트]")
-    print("  □ pip install pykrx                → 실제 KRX 고저가 포함")
+    print("  □ pip install finance-datareader   → 실제 KRX 데이터")
     print(f"  □ ALT_FILTER_BY_REGIME 조정        → BULL={ALT_FILTER_BY_REGIME['BULL']} / SIDE={ALT_FILTER_BY_REGIME['SIDE']} / BEAR={ALT_FILTER_BY_REGIME['BEAR']}")
     print(f"  □ HOLD_FRICTION_MULT 조정          → 현재 {HOLD_FRICTION_MULT} (높일수록 교체 억제)")
     print(f"  □ HOLD_FRICTION_EDGE_GAP_MULT 조정 → 현재 {HOLD_FRICTION_EDGE_GAP_MULT}")
