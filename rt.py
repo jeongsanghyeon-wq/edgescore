@@ -1,18 +1,7 @@
 """
-EQS V1.0 (Edge Quant Signal) — 완전 통합 엔진
+Edge Score v39.9 — 완전 통합 엔진
 =====================================================
-v40.0 패치:
-
-  [버그수정-CRITICAL] ① prev_edge 단위 불일치 (check_holdings=정수↔scan_universe=float 교차오염)
-    - 증상: Edge 급등/급락 알림 비정상 발동, 섹터 모멘텀 항상 보너스 적용
-    - 수정: 정수(100배) 통일 + float 오염 자동 보정
-  [버그수정] ② sl_price 표시 불일치 전체 수정
-    - _status, _sell_opinion, close_report, friday_force_exit, morning_report
-    - cp*(1+dyn_sl) → buy_p*(1+dyn_sl) (실제 트리거와 동일 기준)
-  [버그수정] ③ _optimizer_preview 최소 건수 3→5 (apply와 통일)
-  [버그수정] ④ get_order_fill ord_dt "" → 오늘 날짜 명시 (kiwoom_client.py)
-
-v39.9 패치 (이전):
+v39.9 패치:
 
   [버그수정] ① sl_warn 리셋 조건 항상 True 수정 (접근 경보 매분 스팸)
     - 기존: _sl_price_check = cp*(1+dyn_sl)*1.02 → 항상 cp 미만 → 조건 항상 True
@@ -182,33 +171,11 @@ try:
 except ImportError:
     BS4_OK = False
 
-# ══════════════════════════════════════════════════
-# 로깅 — load_config()보다 먼저 초기화 (BUG-FIX: log 미정의 NameError 방지)
-# ══════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(str(Path(__file__).parent / "realtime.log"), encoding="utf-8"),
-        logging.StreamHandler(),
-    ]
-)
-log = logging.getLogger("EdgeRT")
-for _noisy_logger in ["pykrx", "pykrx.stock", "pykrx.website",
-                       "pykrx.website.krx", "pykrx.website.krx.market",
-                       "urllib3", "requests",
-                       "FinanceDataReader", "finance_datareader"]:
-    logging.getLogger(_noisy_logger).setLevel(logging.CRITICAL)
-
 # ═══════════════════════════════════════════════════
 # ④ config.json 통합 관리
 # ═══════════════════════════════════════════════════
 
-# [BUG-FIX] 상대경로 → __file__ 기준 절대경로 통일
-# cwd가 달라도 항상 스크립트 위치 기준으로 파일 접근
-_BASE_DIR = Path(__file__).parent
-CONFIG_FILE = _BASE_DIR / "config.json"
+CONFIG_FILE = Path("config.json")
 
 DEFAULT_CONFIG = {
     # ── 유니버스 ──────────────────────────────
@@ -234,7 +201,7 @@ DEFAULT_CONFIG = {
     # ── 슬리피지 필터 ─────────────────────────
     "SLIPPAGE_LARGE":        0.003,
     "SLIPPAGE_SMALL":        0.008,
-    "SLIPPAGE_FILTER_RATIO": 3.0,
+    "SLIPPAGE_FILTER_RATIO": 2.0,   # bt.py 최적값 반영 (3.0 → 2.0)
 
     # ── ATR 손절 ──────────────────────────────
     "ATR_MULT_LARGE": 1.2,
@@ -269,7 +236,7 @@ DEFAULT_CONFIG = {
     "CORR_HIGH_THRESHOLD": 0.70,   # 백테스트 v27 검증값으로 통일
     "ATR_STOP_MIN":        0.03,   # ATR 손절 최솟값 3%  (백테스트 동일)
     "ATR_STOP_MAX":        0.12,   # ATR 손절 최댓값 12% (백테스트 동일)
-    "MAX_POSITION_RATIO":  0.30,   # 단일 종목 최대 비중 (백테스트 동일)
+    "MAX_POSITION_RATIO":  0.20,   # bt.py 최적값 반영 (0.30 → 0.20)
     "SELL_EDGE_THRESHOLD": 0.30,   # 보유 중 AI점수 이 이하 → 매도 경보 (백테스트 동일)
     # ── 투자원칙 ────────────────────────────────
     "MAX_HOLD_DAYS":         5,    # 원칙2: 최대 보유 거래일 (월~금)
@@ -387,11 +354,11 @@ TELEGRAM = {
     "chat_id": _os_tg.getenv("TELEGRAM_CHAT_ID", ""),
 }
 
-POSITIONS_FILE   = _BASE_DIR / "positions.json"
-UNIVERSE_FILE    = _BASE_DIR / "universe_cache.json"
-TRADE_LOG_FILE   = _BASE_DIR / "trade_log.json"
-TRADE_DB_FILE    = _BASE_DIR / "trade_history.db"
-ALERTS_FILE      = _BASE_DIR / "alerts_today.json"   # 대시보드 /api/alerts 연동
+POSITIONS_FILE   = Path("positions.json")
+UNIVERSE_FILE    = Path("universe_cache.json")
+TRADE_LOG_FILE   = Path("trade_log.json")
+TRADE_DB_FILE    = Path("trade_history.db")
+ALERTS_FILE      = Path("alerts_today.json")   # 대시보드 /api/alerts 연동
 
 # ── 수수료/세금 상수 ─────────────────────────────────
 COMMISSION_RATE  = 0.00015   # 키움 매매수수료 (매수+매도 각 0.015%)
@@ -490,6 +457,26 @@ REGIME_EDGE_THRESHOLD = {
 def get_regime_threshold(regime: str) -> float:
     return REGIME_EDGE_THRESHOLD.get(regime, 0.60)
 
+# ══════════════════════════════════════════════════
+# 로깅
+# ══════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("realtime.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ]
+)
+log = logging.getLogger("EdgeRT")
+# [BUG-FIX] pykrx 내부 logger가 JSONDecodeError 로깅 시 Formatter 크래시 유발
+# → CRITICAL로 완전 차단하여 연쇄 크래시 방지
+for _noisy_logger in ["pykrx", "pykrx.stock", "pykrx.website",
+                       "pykrx.website.krx", "pykrx.website.krx.market",
+                       "urllib3", "requests",
+                       "FinanceDataReader", "finance_datareader"]:
+    logging.getLogger(_noisy_logger).setLevel(logging.CRITICAL)
 
 # [BUG-FIX] pykrx가 root logger로 직접 logging.info(args, kwargs)를 호출하여
 # Python logging Formatter가 % 포매팅 크래시. root logger에 필터를 추가하여 차단.
@@ -834,27 +821,6 @@ class NetworkMonitor:
 # ══════════════════════════════════════════════════
 
 _ohlcv_cache: dict = {}
-# [BUG-FIX-C] trade_log.json read-modify-write 경쟁 조건 방지
-# check_holdings(메인 스케줄 스레드) + _do_buy/_do_sell(텔레그램 커맨더 스레드) 동시 호출 가능
-_trade_log_lock = threading.Lock()
-
-# [TOP7-⑦] positions 딕셔너리 직렬화 락
-# check_holdings(스케줄 스레드) + _do_buy/_do_sell(텔레그램 스레드)가 동시에
-# positions를 읽고 쓰면 이중 매도/포지션 꼬임 발생 가능
-# → 모든 positions 읽기/쓰기 경로를 단일 락으로 직렬화
-_positions_lock = threading.Lock()
-
-# [BUG-FIX-③] 수동매도/자동매도 중복 주문 차단용 set
-# _do_sell(텔레그램) 진입 시 추가, 완료 시 제거
-# check_holdings/_log_exit에서 해당 종목 있으면 자동매도 스킵
-_pending_sell: set = set()
-# [BUG-FIX] check+add를 원자적으로 처리하는 전용 락 (스레드 경쟁 조건 방지)
-_pending_sell_lock = threading.Lock()
-
-# [2순위-FIX] 매수 중복 주문 차단 — 매도와 동일한 선점 구조
-# _do_buy 진입 시 check+add 원자화, 체결확정/롤백 시 discard
-_pending_buy: set = set()
-_pending_buy_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
@@ -970,10 +936,7 @@ def fetch_kospi_top_by_volume_naver(pool_size: int = 60) -> dict:
 
 def get_ohlcv(ticker: str, days: int = 90):
     now    = time.time()
-    # [BUG-FIX-A] 캐시 키에 days 포함 — ticker만 사용 시 days=30/60/90이 서로 덮어쓰는 버그 수정
-    # check_holdings에서 동일 ticker에 days=30(ATR)과 days=60(Edge) 순차 호출 시 오염 방지
-    _cache_key = (ticker, int(days))
-    cached = _ohlcv_cache.get(_cache_key)
+    cached = _ohlcv_cache.get(ticker)
     # 장중 60초 / 장외 3600초(1시간) — 일봉은 하루에 한 번만 바뀜
     eff_ttl = 60 if is_market_hour() else 3600
     if cached and (now - cached["ts"]) < eff_ttl:
@@ -1008,7 +971,6 @@ def get_ohlcv(ticker: str, days: int = 90):
                         df["foreign_net"] = 0
                     err_tracker.record_ok(f"kiwoom_ohlcv:{ticker}")
                     log.debug(f"[키움] 일봉 {ticker} {len(df)}행")
-                    _ohlcv_source = "kiwoom"
         except Exception as e:
             emsg = str(e)
             if "429" in emsg or "허용된 요청 개수를 초과" in emsg or "return_code" in emsg:
@@ -1046,9 +1008,6 @@ def get_ohlcv(ticker: str, days: int = 90):
                     except Exception:
                         df["foreign_net"] = 0
                     err_tracker.record_ok(f"fdr:{ticker}")
-                    # [TOP7-⑥] 소스 폴백 로그 — 신호 이상 발생 시 원인 추적용
-                    log.warning(f"[OHLCV폴백] {ticker}: 키움→FDR 전환 (days={days})")
-                    _ohlcv_source = "fdr"
         except Exception as e:
             log.debug(f"FDR [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"fdr:{ticker}")
@@ -1081,9 +1040,6 @@ def get_ohlcv(ticker: str, days: int = 90):
                     df["foreign_net"] = 0
                 df = df.tail(days)
                 err_tracker.record_ok(f"pykrx:{ticker}")
-                    # [TOP7-⑥] 소스 폴백 로그
-                log.warning(f"[OHLCV폴백] {ticker}: FDR→pykrx 전환 (days={days})")
-                _ohlcv_source = "pykrx"
         except Exception as e:
             log.debug(f"pykrx [{ticker}]: {type(e).__name__}")
             err_tracker.record_fail(f"pykrx:{ticker}")
@@ -1103,42 +1059,12 @@ def get_ohlcv(ticker: str, days: int = 90):
                     "거래량":      raw["Volume"].values.flatten(),
                     "foreign_net": 0,
                 }, index=raw.index).tail(days)
-                # [TOP7-⑥] 소스 폴백 로그
-                log.warning(f"[OHLCV폴백] {ticker}: pykrx→yfinance 전환 (days={days}, 15분지연)")
-                _ohlcv_source = "yfinance"
                 log.debug(f"[{ticker}] yfinance(15분지연) 사용")
         except Exception as e:
             log.debug(f"yfinance [{ticker}]: {e}")
 
-    # [TOP10-③] OHLCV 극단값 필터
-    # 0 가격, 전일 대비 ±30% 초과 이상값이 edge·ATR·손절가 계산에 흘러들어가는 것 방지
     if df is not None:
-        try:
-            _before = len(df)
-            # ① 종가 0 이하 행 제거
-            df = df[df["종가"] > 0].copy()
-            # ② 종가 급등락 필터 — 전일 대비 ±30% 초과 행을 직전값으로 대체
-            _close = df["종가"].copy()
-            _pct   = _close.pct_change().abs()
-            _mask  = _pct > 0.30
-            if _mask.any():
-                # 제거 대신 직전값으로 대체 (행 제거 시 봉 수 부족 위험)
-                df.loc[_mask, "종가"] = df["종가"].shift(1)[_mask]
-                df.loc[_mask, "고가"] = df["고가"].shift(1)[_mask]
-                df.loc[_mask, "저가"] = df["저가"].shift(1)[_mask]
-                _cnt = int(_mask.sum())
-                log.warning(f"[OHLCV극단값] {ticker}: 전일대비 ±30% 초과 {_cnt}행 직전값 대체")
-            _after = len(df)
-            if _after < _before:
-                log.warning(f"[OHLCV극단값] {ticker}: 0가격 {_before-_after}행 제거")
-            if len(df) < 5:
-                log.warning(f"[OHLCV극단값] {ticker}: 필터 후 {len(df)}행 — None 반환")
-                df = None
-        except Exception as _fe:
-            log.debug(f"[OHLCV극단값] 필터 오류 {ticker}: {_fe}")
-
-    if df is not None:
-        _ohlcv_cache[_cache_key] = {"df": df, "ts": now}
+        _ohlcv_cache[ticker] = {"df": df, "ts": now}
     return df
 
 # Edge 계산 결과 캐시
@@ -1159,9 +1085,7 @@ def _purge_edge_cache() -> int:
 def invalidate_cache(ticker: str = None):
     """ohlcv_cache 무효화. ticker 미지정 시 전체 삭제."""
     if ticker:
-        # [BUG-FIX-A] days별 복수 캐시 키 전체 삭제
-        for _k in [k for k in _ohlcv_cache if isinstance(k, tuple) and k[0] == ticker]:
-            _ohlcv_cache.pop(_k, None)
+        _ohlcv_cache.pop(ticker, None)
         _foreign_net_cache.pop(ticker, None)
         # 해당 ticker df의 edge_cache는 id 기반이라 자동 미스 처리됨
     else:
@@ -2059,26 +1983,17 @@ def db_daily_summary(target_date: str = None) -> dict:
         return {"buy_count": 0, "sell_count": 0, "total_pnl": 0, "win_rate": 0}
 
 def append_trade_log(entry: dict):
-    # [BUG-FIX-C] threading.Lock + os.replace() 원자적 저장
-    # ① Lock: write-write 경쟁 조건 방지 (텔레그램 스레드 vs 스케줄 스레드)
-    # ② temp + os.replace(): write-read 경쟁 조건 방지
-    #    - 기존: "w"로 열면 즉시 truncate → 다른 스레드가 빈 파일 또는 partial JSON 읽을 수 있음
-    #    - 수정: .tmp에 완성 후 os.replace()로 원자적 교체 → 읽는 쪽은 항상 완전한 JSON을 봄
-    with _trade_log_lock:
-        logs = load_trade_log()
-        logs.append(entry)
-        try:
-            _tmp = TRADE_LOG_FILE.with_suffix(".json.tmp")
-            with open(_tmp, "w", encoding="utf-8") as f:
-                json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
-            os.replace(_tmp, TRADE_LOG_FILE)   # POSIX 원자적 교체 (Windows도 지원)
-        except Exception as e:
-            log.error(f"거래로그 저장 실패: {e}")
-            try:
-                _tmp.unlink(missing_ok=True)   # 실패 시 tmp 정리
-            except Exception:
-                pass
-    # SQLite는 자체 락 보유 — Lock 밖에서 호출 (교착방지)
+    # [설계 의도] positions 저장 직후 기록 → 앱 재시작 시 포지션-로그 일관성 보장
+    # 키움 주문 실패 시 로그는 남지만 positions도 이미 업데이트된 상태이므로 허용
+    # JSON 백업
+    logs = load_trade_log()
+    logs.append(entry)
+    try:
+        with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        log.error(f"거래로그 저장 실패: {e}")
+    # SQLite 동시 기록
     _db_insert(entry)
 
 def calc_performance(logs: list = None) -> dict:
@@ -2155,91 +2070,32 @@ def save_universe(univ: dict):
 def _notify_on_fill(order_no: str, ticker: str, name: str,
                     action: str, qty: int, price: int,
                     buy_price: float = 0.0,
-                    reason: str = "",
-                    monitor=None,
-                    buy_log_data: dict = None,
-                    sell_log_data: dict = None):
+                    reason: str = ""):
     """
     백그라운드에서 체결 확인 후 텔레그램 알림 발송
     action: 'buy' or 'sell'
-    monitor: positions 참조 — 클로저로 개별 캡처
-    buy_log_data:  매수 체결 확인 후 append_trade_log 호출용
-    sell_log_data: 매도 체결 확인 후 positions 업데이트 + append_trade_log 호출용
-                   (_is_partial, _total_shares 포함)
+    buy_price: 매도 시 손익 계산용 매수단가
     최대 60초간 3초 간격으로 폴링
     """
-    # [BUG-FIX-①] monitor를 클로저로 직접 캡처
     def _wait_and_notify():
-        # [BUG-FIX] kw 시작부 즉시 return 제거 → 폴링 루프 안에서 매번 재시도
-        # kiwoom()이 일시적으로 None이어도 체결확인/상태정리를 포기하지 않음
-        _mode   = "모의"   # 첫 kw 획득 전 기본값
-        _icon   = "🔵"
+        kw = kiwoom()
+        if not kw:
+            return
+        _mode   = "모의" if kw._mock else "실계좌"
+        _icon   = "🔵" if kw._mock else "🟢"
         _action = "매수" if action == "buy" else "매도"
 
-        _kw_ever_ok    = False  # 20회 중 kw 획득 성공 여부 추적
-        _last_cntr_qty = 0      # [BUG-FIX] 폴링 중 확인된 최신 누적 체결수량
-        _last_cntr_uv  = 0      # 폴링 중 확인된 최신 체결단가
-        for _attempt in range(20):  # 3초 × 20 = 최대 60초
+        for _ in range(20):  # 3초 × 20 = 최대 60초
             time.sleep(3)
             try:
-                kw = kiwoom()   # 매 루프마다 재시도 (세션 재연결 대응)
-                if kw is None:
-                    log.warning(f"[체결확인] {ticker} {_action} kiwoom() None — {_attempt+1}/20 재시도 중")
-                    continue
-                _kw_ever_ok = True
-                _mode = "모의" if kw._mock else "실계좌"
-                _icon = "🔵"   if kw._mock else "🟢"
                 fill = kw.get_order_fill(order_no, ticker)
                 if fill and fill.get("filled"):
                     cntr_qty = fill["cntr_qty"]
                     cntr_uv  = fill["cntr_uv"]
                     cntr_tm  = fill.get("cntr_tm", "")
                     amount   = cntr_qty * cntr_uv
-                    # [BUG-FIX] 부분체결 vs 전량체결 구분
-                    # is_final=False → 부분체결 진행 중 → 누적수량 갱신 후 계속 폴링
-                    if not fill.get("is_final", True):
-                        _rem = fill.get("remaining_qty", 0)
-                        _last_cntr_qty = cntr_qty   # timeout 시 부분체결 정산용
-                        _last_cntr_uv  = cntr_uv
-                        log.info(f"[부분체결] {ticker} {_action} {cntr_qty}주 체결, 잔량 {_rem}주 — 계속 대기")
-                        continue
 
                     if action == "buy":
-                        # [BUG-FIX] 실체결 기준 positions 최종 확정 — 추가매수 평균단가 재계산 포함
-                        if monitor and hasattr(monitor, "positions") and                            ticker in monitor.positions:
-                            with _positions_lock:
-                                pos = monitor.positions[ticker]
-                                pos.pop("pending", None)
-                                # 추가매수인 경우 기존 보유분을 포함해 평균단가 재계산
-                                _old_sh = int(buy_log_data.get("_old_shares", 0)) if buy_log_data else 0
-                                _old_px = float(buy_log_data.get("_old_price", 0)) if buy_log_data else 0
-                                if _old_sh > 0 and _old_px > 0:
-                                    # 추가매수: 기존보유 + 실체결 합산
-                                    _final_shares = _old_sh + cntr_qty
-                                    _final_amount = _old_sh * _old_px + cntr_qty * cntr_uv
-                                    _final_price  = round(_final_amount / _final_shares, 2)
-                                else:
-                                    # 신규매수: 실체결수량만
-                                    _final_shares = cntr_qty
-                                    _final_amount = cntr_qty * cntr_uv
-                                    _final_price  = cntr_uv
-                                pos["shares"]    = _final_shares
-                                pos["buy_price"] = _final_price
-                                pos["amount"]    = _final_amount
-                                # trail/peak 가격도 실체결가 기준 정렬
-                                if pos.get("peak_price", 0) < cntr_uv:
-                                    pos["peak_price"] = cntr_uv
-                                if pos.get("trail_price", 0) < cntr_uv:
-                                    pos["trail_price"] = cntr_uv
-                                pos.pop("_restore_pos", None)  # 내부 복원용 메타키 제거
-                                save_positions(monitor.positions)
-                        _pending_buy.discard(ticker)   # [2순위-FIX] positions 확정 후 매수 선점 해제
-                        # 체결 확인 후 trade_log 기록 (실체결 기준 — 추가매수 이력용)
-                        if buy_log_data:
-                            buy_log_data["buy_price"] = cntr_uv       # 이번 체결가
-                            buy_log_data["shares"]    = cntr_qty       # 이번 체결수량
-                            buy_log_data["amount"]    = cntr_qty * cntr_uv
-                            append_trade_log(buy_log_data)
                         msg = (
                             f"{_icon} <b>[{_mode}] 매수 체결 완료!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -2250,42 +2106,10 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             f"⏰ 체결시간: {cntr_tm}"
                         )
                     else:
-                        # [BUG-FIX] 매도 체결 확인 후 positions/trade_log 확정
-                        # 접수 시점 선확정 제거 → 실체결 수량/가격 기준으로 반영
-                        _bp  = buy_price
-                        _pnl = (cntr_uv - _bp) * cntr_qty if _bp > 0 else 0
-                        _ret = (cntr_uv - _bp) / _bp if _bp > 0 else 0
+                        # 실제 체결가 기준으로 손익 재계산
+                        _pnl = (cntr_uv - buy_price) * cntr_qty if buy_price > 0 else 0
+                        _ret = (cntr_uv - buy_price) / buy_price if buy_price > 0 else 0
                         pnl_icon = "✅" if _pnl >= 0 else "🔴"
-
-                        if sell_log_data and monitor and hasattr(monitor, "positions"):
-                            # 실체결가/실체결수량으로 log 데이터 갱신
-                            sell_log_data["sell_price"]  = cntr_uv
-                            sell_log_data["exit_price"]  = cntr_uv
-                            sell_log_data["shares"]      = cntr_qty
-                            sell_log_data["amount"]      = _bp * cntr_qty
-                            sell_log_data["ret"]         = round(_ret, 4)
-                            sell_log_data["pnl"]         = round(_pnl, 0)
-                            append_trade_log(sell_log_data)
-                            # positions 업데이트 (실체결 수량 기준)
-                            _is_partial    = sell_log_data.get("_is_partial", False)
-                            _total_shares  = sell_log_data.get("_total_shares", cntr_qty)
-                            with _positions_lock:
-                                if ticker in monitor.positions:
-                                    if _is_partial or cntr_qty < _total_shares:
-                                        remain = _total_shares - cntr_qty
-                                        monitor.positions[ticker]["shares"] = remain
-                                        monitor.positions[ticker]["amount"] = _bp * remain
-                                        monitor.positions[ticker].pop("pending_sell", None)
-                                        monitor.positions[ticker]["alerted_steps"] = []
-                                        save_positions(monitor.positions)
-                                    else:
-                                        monitor.positions.pop(ticker, None)
-                                        save_positions(monitor.positions)
-                            _pending_sell.discard(ticker)
-                            # 체결 확인 후 당일 재진입 차단 (미체결 시 재진입 허용)
-                            if hasattr(monitor, "today_exited"):
-                                monitor.today_exited.add(ticker)
-
                         msg = (
                             f"{_icon} <b>[{_mode}] 매도 체결 완료!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -2293,7 +2117,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             f"{('🔔 사유: ' + reason + chr(10)) if reason else ''}"
                             f"💰 체결가: {cntr_uv:,}원\n"
                             f"📦 체결수량: {cntr_qty:,}주\n"
-                            f"💵 체결금액: {cntr_qty * cntr_uv:,}원\n"
+                            f"💵 체결금액: {amount:,}원\n"
                             f"{pnl_icon} 손익: {_pnl:+,.0f}원 ({_ret:+.2%})\n"
                             f"⏰ 체결시간: {cntr_tm}"
                         )
@@ -2302,544 +2126,14 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
             except Exception as e:
                 log.warning(f"[키움] 체결 확인 오류: {e}")
 
-        # ── 60초 경과 후 상태 정리 ────────────────────────────────────────────
-        # _kw_ever_ok=False: 20회 전부 kiwoom() None → 키움 연결 실패 (조용한 종료 방지)
-        # _kw_ever_ok=True : 키움 연결됐지만 60초 내 체결 미확인
-        if not _kw_ever_ok:
-            log.error(f"[체결확인실패] {ticker} {_action} — 60초 동안 kiwoom() 재획득 실패, 상태 정리 강제 수행")
-            _fail_reason = "키움 클라이언트 연결 실패 (60초 동안 재시도)"
-        else:
-            _fail_reason = "60초 내 체결 미확인"
-
-        if action == "buy":
-            # [BUG-FIX] timeout 시 누적 체결수량(_last_cntr_qty) 기반 3단계 정산
-            # 0주: 미체결 → 롤백  |  n주 부분체결 → 부분 확정  |  전량: 이미 정상 처리됨
-            if monitor and hasattr(monitor, "positions"):
-                with _positions_lock:
-                    if ticker in monitor.positions and                        monitor.positions[ticker].get("pending"):
-                        _restore = monitor.positions[ticker].get("_restore_pos")
-                        if _last_cntr_qty > 0:
-                            # 부분체결 발생 — 체결된 수량 기준으로 포지션 확정
-                            pos = monitor.positions[ticker]
-                            pos.pop("pending", None)
-                            pos.pop("_restore_pos", None)
-                            _old_sh = int(buy_log_data.get("_old_shares", 0)) if buy_log_data else 0
-                            _old_px = float(buy_log_data.get("_old_price", 0)) if buy_log_data else 0
-                            if _old_sh > 0 and _old_px > 0:
-                                _f_shares = _old_sh + _last_cntr_qty
-                                _f_amount = _old_sh * _old_px + _last_cntr_qty * _last_cntr_uv
-                            else:
-                                _f_shares = _last_cntr_qty
-                                _f_amount = _last_cntr_qty * _last_cntr_uv
-                            pos["shares"]    = _f_shares
-                            pos["buy_price"] = round(_f_amount / _f_shares, 2)
-                            pos["amount"]    = _f_amount
-                            save_positions(monitor.positions)
-                            if buy_log_data:
-                                buy_log_data["shares"]    = _last_cntr_qty
-                                buy_log_data["buy_price"] = _last_cntr_uv
-                                buy_log_data["amount"]    = _last_cntr_qty * _last_cntr_uv
-                                append_trade_log(buy_log_data)
-                            # [치명-FIX] _pending_buy는 여기서 해제 금지
-                            # 잔량 주문이 브로커에 살아 있는 동안 추가매수 차단을 유지해야 함
-                            # orphan watcher가 is_final=True / 장마감(15:35) 시 해제
-                            log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정, _pending_buy 유지")
-                            tg(
-                                f"⚠️ <b>[{_mode}] 매수 부분체결 — 잔량 자동 추적 시작</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 종목: {name} ({ticker})\n"
-                                f"주문번호: {order_no} | 원인: {_fail_reason}\n"
-                                f"📦 부분체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원\n\n"
-                                f"체결된 수량은 포지션에 반영됐어요.\n"
-                                f"잔량은 백그라운드에서 장마감(15:35)까지 자동 추적합니다."
-                            )
-                            # [38차-FIX] 문구 수정: "최대 5분" → "장마감까지 자동 추적"
-                            _start_orphan_watcher(
-                                order_no, ticker, name, "buy",
-                                confirmed_qty=_last_cntr_qty,
-                                confirmed_uv=_last_cntr_uv,
-                                monitor=monitor,
-                                buy_log_data=buy_log_data,
-                            )
-                        elif _restore:
-                            # 0주 미체결 + 추가매수 → 기존 포지션 복원
-                            _restore.pop("_restore_pos", None)
-                            monitor.positions[ticker] = _restore
-                            save_positions(monitor.positions)
-                            _pending_buy.discard(ticker)  # [2순위-FIX] 롤백 완료 후 선점 해제
-                            log.warning(f"[추가매수롤백] {name}({ticker}) {_fail_reason} → 기존 포지션 복원")
-                            tg(
-                                f"⚠️ <b>[{_mode}] 추가매수 미체결 — 기존 포지션 복원</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 종목: {name} ({ticker})\n"
-                                f"주문번호: {order_no}\n"
-                                f"원인: {_fail_reason}\n\n"
-                                f"기존 보유 포지션으로 복원됐어요.\n"
-                                f"실계좌 주문 상태를 직접 확인해주세요."
-                            )
-                        else:
-                            # 0주 미체결 + 신규매수 → 포지션 제거
-                            monitor.positions.pop(ticker, None)
-                            save_positions(monitor.positions)
-                            _pending_buy.discard(ticker)  # [2순위-FIX] 롤백 완료 후 선점 해제
-                            log.warning(f"[신규매수롤백] {name}({ticker}) {_fail_reason} → positions 제거")
-                            tg(
-                                f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 취소</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 종목: {name} ({ticker})\n"
-                                f"주문번호: {order_no}\n"
-                                f"원인: {_fail_reason}\n\n"
-                                f"내부 포지션을 취소했어요.\n"
-                                f"실계좌 주문 상태를 직접 확인해주세요."
-                            )
-                        return
-            tg(
-                f"⚠️ <b>[{_mode}] 매수 미체결</b>\n"
-                f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
-                f"원인: {_fail_reason}\n직접 확인이 필요해요."
-            )
-        else:
-            # [BUG-FIX] 매도 timeout 시 _last_cntr_qty 기반 3단계 정산
-            # 순서: positions 확정/저장 → _pending_sell 해제 (역순 시 중복매도 경쟁 구간 발생)
-            # 0주: 포지션 유지  |  부분체결 n주: 체결분 차감  |  전량: 이미 정상 처리됨
-            if _last_cntr_qty > 0 and sell_log_data and monitor and                hasattr(monitor, "positions") and ticker in monitor.positions:
-                # 부분체결 발생 — 체결된 수량만큼 포지션 차감 후 확정
-                _bp          = sell_log_data.get("buy_price", 0)
-                _total_sh    = sell_log_data.get("_total_shares", qty)
-                _remain      = max(0, _total_sh - _last_cntr_qty)
-                _pnl_partial = (_last_cntr_uv - _bp) * _last_cntr_qty if _bp > 0 else 0
-                _ret_partial = (_last_cntr_uv - _bp) / _bp if _bp > 0 else 0
-                with _positions_lock:
-                    if ticker in monitor.positions:
-                        if _remain > 0:
-                            monitor.positions[ticker]["shares"] = _remain
-                            monitor.positions[ticker]["amount"] = _bp * _remain
-                            monitor.positions[ticker].pop("pending_sell", None)
-                            monitor.positions[ticker]["alerted_steps"] = []
-                        else:
-                            monitor.positions.pop(ticker, None)
-                        save_positions(monitor.positions)
-                # 부분체결분 trade_log 기록
-                _partial_log = dict(sell_log_data)
-                _partial_log["sell_price"]  = _last_cntr_uv
-                _partial_log["exit_price"]  = _last_cntr_uv
-                _partial_log["shares"]      = _last_cntr_qty
-                _partial_log["amount"]      = _bp * _last_cntr_qty
-                _partial_log["ret"]         = round(_ret_partial, 4)
-                _partial_log["pnl"]         = round(_pnl_partial, 0)
-                _partial_log["reason"]      = _partial_log.get("reason", "") + "(부분체결확정)"
-                append_trade_log(_partial_log)
-                if _remain == 0 and hasattr(monitor, "today_exited"):
-                    monitor.today_exited.add(ticker)
-                log.warning(f"[부분매도확정] {name}({ticker}) {_last_cntr_qty}주 체결 → 포지션 {_remain}주 남음")
-                # [1순위-FIX] positions 저장 완료 후 _pending_sell 해제 (역순 금지)
-                # [치명-FIX] 잔량 추가 체결을 orphan watcher가 추적하므로
-                #           _pending_sell은 watcher 종료 시 해제 (여기서 해제 금지)
-                tg(
-                    f"⚠️ <b>[{_mode}] 매도 부분체결 — 잔량 자동 추적 시작</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 종목: {name} ({ticker})\n"
-                    f"주문번호: {order_no} | 원인: {_fail_reason}\n"
-                    f"📦 체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원 | 잔여: {_remain:,}주\n"
-                    f"{'✅' if _pnl_partial >= 0 else '🔴'} 손익: {_pnl_partial:+,.0f}원 ({_ret_partial:+.2%})\n\n"
-                    f"체결분은 포지션에서 차감됐어요.\n잔량은 백그라운드에서 장마감(15:35)까지 자동 추적합니다."
-                )
-                # [38차-FIX] 문구 수정: "최대 5분" → "장마감까지 자동 추적"
-                # watcher가 is_final 확인 후 _pending_sell.discard 처리
-                _start_orphan_watcher(
-                    order_no, ticker, name, "sell",
-                    confirmed_qty=_last_cntr_qty,
-                    confirmed_uv=_last_cntr_uv,
-                    monitor=monitor,
-                    sell_log_data=sell_log_data,
-                )
-            else:
-                # 0주 미체결 — 포지션 유지 후 _pending_sell 해제
-                log.warning(f"[매도미체결] {name}({ticker}) {_fail_reason} → _pending_sell 해제, positions 유지")
-                _pending_sell.discard(ticker)   # [1순위-FIX] 포지션 처리 없음이 확정된 뒤 해제
-                tg(
-                    f"⚠️ <b>[{_mode}] 매도 미체결 ({_fail_reason})</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 종목: {name} ({ticker})\n"
-                    f"주문번호: {order_no}\n\n"
-                    f"내부 포지션은 유지됩니다.\n"
-                    f"실계좌 주문 상태를 직접 확인해주세요.\n"
-                    f"(체결됐다면 다음 잔고 대조에서 자동 반영)"
-                )
+        # 60초 후에도 미체결 → 미체결 알림
+        tg(
+            f"⚠️ <b>[{_mode}] {_action} 미체결</b>\n"
+            f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
+            f"직접 확인이 필요해요."
+        )
 
     threading.Thread(target=_wait_and_notify, daemon=True).start()
-
-
-def _recover_pending_on_startup(monitor) -> None:
-    """재시작 시 미체결/pending 주문 상태를 실계좌 기준으로 복구.
-
-    복구 대상:
-    ① positions에 pending=True / pending_sell=True 종목
-       → 실계좌 미체결 주문 조회 후 order_no 매핑
-       → _pending_buy/_pending_sell 복원 + orphan watcher 재기동
-    ② [37차-FIX] ticker는 positions에 있으나 pending 마커 누락 + live order 존재
-       (케이스 A: 추가매수 pending 저장 전 다운 / 케이스 B: kw.sell 후 pending_sell 저장 전 다운)
-       → 마커 뒤늦게 영속 저장 + _pending_buy/_pending_sell 복원 + orphan watcher 재기동
-    ③ 실계좌에 미체결 주문이 있지만 내부 positions 자체가 없는 경우
-       → 경고만 발송 (자동 처리 불가 — 운영자 확인 필요)
-    """
-    try:
-        kw = kiwoom()
-        if kw is None:
-            log.warning("[재시작복구] kiwoom() None — pending 복구 건너뜀")
-            return
-
-        # ① 실계좌 미체결 주문 목록 조회
-        live_orders = kw.get_pending_orders()  # [{order_no, ticker, action, ...}]
-        live_by_ticker = {}
-        for o in live_orders:
-            live_by_ticker.setdefault(o["ticker"], []).append(o)
-
-        _recovered_buy  = []
-        _recovered_sell = []
-        _orphan_warn    = []
-
-        # ② positions에 pending=True 종목 처리
-        pending_tickers = [
-            tk for tk, info in monitor.positions.items()
-            if info.get("pending") or info.get("pending_sell")
-        ]
-        for ticker in pending_tickers:
-            info = monitor.positions.get(ticker, {})
-            name = info.get("name", ticker)
-            is_buy_pending  = bool(info.get("pending"))
-            is_sell_pending = bool(info.get("pending_sell"))
-
-            matched = live_by_ticker.get(ticker, [])
-            if not matched:
-                # 실계좌에 미체결 주문 없음 → 재시작 전에 이미 체결/취소됨
-                # pending 플래그만 정리 (체결은 다음 잔고 대조에서 자동 보정)
-                with _positions_lock:
-                    monitor.positions[ticker].pop("pending", None)
-                    monitor.positions[ticker].pop("pending_sell", None)
-                    monitor.positions[ticker].pop("_restore_pos", None)
-                    save_positions(monitor.positions)
-                log.info(f"[재시작복구] {name}({ticker}) 미체결 주문 없음 → pending 플래그 정리")
-                continue
-
-            # 미체결 주문 있음 → pending 복원 + orphan watcher 재기동
-            # [38차-FIX] 복수 live order 시 watcher 중복 방지:
-            #   action별로 remaining_qty 최대 1개만 선택 → watcher 1개만 기동
-            #   나머지 주문은 orphan 경고로 분류
-            _buy_orders  = sorted([o for o in matched if o["action"] == "buy"],
-                                   key=lambda x: x["remaining_qty"], reverse=True)
-            _sell_orders = sorted([o for o in matched if o["action"] == "sell"],
-                                   key=lambda x: x["remaining_qty"], reverse=True)
-
-            def _warn_extra(extras, action_label):
-                for ex in extras:
-                    _orphan_warn.append(
-                        f"  ⚠️ {name}({ticker}) {action_label} 주문:{ex['order_no']} "
-                        f"잔량:{ex['remaining_qty']}주 [복수주문 — 수동확인 필요]"
-                    )
-
-            if is_buy_pending and _buy_orders:
-                o = _buy_orders[0]   # remaining_qty 최대 주문 1개만 추적
-                _warn_extra(_buy_orders[1:], "매수")
-                order_no, cntr_qty, ord_qty, remaining = (
-                    o["order_no"], o["cntr_qty"], o["ord_qty"], o["remaining_qty"])
-                with _pending_buy_lock:
-                    _pending_buy.add(ticker)
-                _recovered_buy.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
-                log.info(f"[재시작복구] {name}({ticker}) 매수 _pending_buy 복원 + watcher 재기동")
-                _start_orphan_watcher(
-                    order_no, ticker, name, "buy",
-                    confirmed_qty=cntr_qty,
-                    confirmed_uv=int(monitor.positions.get(ticker, {}).get("buy_price", 0)),
-                    monitor=monitor,
-                    buy_log_data={
-                        "action": "buy", "ticker": ticker, "name": name,
-                        "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
-                        "shares": cntr_qty, "amount": 0,
-                        "reason": "재시작복구(잔량추적)",
-                    },
-                )
-
-            if is_sell_pending and _sell_orders:
-                o = _sell_orders[0]   # remaining_qty 최대 주문 1개만 추적
-                _warn_extra(_sell_orders[1:], "매도")
-                order_no, cntr_qty, ord_qty, remaining = (
-                    o["order_no"], o["cntr_qty"], o["ord_qty"], o["remaining_qty"])
-                with _pending_sell_lock:
-                    _pending_sell.add(ticker)
-                _recovered_sell.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
-                log.info(f"[재시작복구] {name}({ticker}) 매도 _pending_sell 복원 + watcher 재기동")
-                _start_orphan_watcher(
-                    order_no, ticker, name, "sell",
-                    confirmed_qty=cntr_qty,
-                    confirmed_uv=0,
-                    monitor=monitor,
-                    sell_log_data={
-                        "action": "sell", "ticker": ticker, "name": name,
-                        "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
-                        "shares": cntr_qty, "amount": 0,
-                        "_total_shares": ord_qty,
-                        "reason": "재시작복구(잔량추적)",
-                    },
-                )
-
-        # ③ 실계좌 live order가 있는데 내부 pending 마커가 없는 모든 케이스 처리
-        # [37차-FIX] 기존: ticker not in positions일 때만 경고
-        #            수정: ticker는 있는데 pending 마커 없이 live order 있는 케이스도 자동 복구
-        #   - 케이스 A: 추가매수 직후 pending 저장 전 다운 → ticker는 positions에 있음
-        #   - 케이스 B: kw.sell() 직후 pending_sell 저장 전 다운 → 동일
-        for ticker, orders in live_by_ticker.items():
-            info = monitor.positions.get(ticker)
-
-            if info is None:
-                # 케이스 C: 내부 포지션 자체가 없음 → 수동 확인 필요
-                for o in orders:
-                    _orphan_warn.append(
-                        f"  ❓ {ticker} {o['action']} 주문:{o['order_no']} "
-                        f"(내부 포지션 없음 — 수동 확인 필요)"
-                    )
-                continue
-
-            # ticker는 positions에 있음 — pending 마커 누락 여부 확인
-            has_pending      = bool(info.get("pending"))
-            has_pending_sell = bool(info.get("pending_sell"))
-            name = info.get("name", ticker)
-
-            # [38차-FIX] action별로 remaining_qty 최대 주문 1개만 선택 → watcher 중복 방지
-            _ab_buy_orders  = sorted([o for o in orders if o["action"] == "buy"],
-                                      key=lambda x: x["remaining_qty"], reverse=True)
-            _ab_sell_orders = sorted([o for o in orders if o["action"] == "sell"],
-                                      key=lambda x: x["remaining_qty"], reverse=True)
-
-            def _warn_extra_ab(extras, action_label):
-                for ex in extras:
-                    _orphan_warn.append(
-                        f"  ⚠️ {name}({ticker}) {action_label} 주문:{ex['order_no']} "
-                        f"잔량:{ex['remaining_qty']}주 [복수주문 — 수동확인 필요]"
-                    )
-
-            if _ab_buy_orders and not has_pending:
-                # 케이스 A: 매수 live order 있는데 pending 마커 없음 → 자동 복구 (1개만)
-                o = _ab_buy_orders[0]
-                _warn_extra_ab(_ab_buy_orders[1:], "매수")
-                order_no = o["order_no"]; cntr_qty = o["cntr_qty"]
-                ord_qty  = o["ord_qty"];  remaining = o["remaining_qty"]
-                with _pending_buy_lock:
-                    _pending_buy.add(ticker)
-                with _positions_lock:
-                    monitor.positions[ticker]["pending"] = True
-                    save_positions(monitor.positions)
-                _recovered_buy.append(
-                    f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주 [마커누락복구]"
-                )
-                log.warning(
-                    f"[재시작복구] {name}({ticker}) 매수 pending 마커 누락 감지 → "
-                    f"_pending_buy 복원 + watcher 재기동"
-                )
-                _start_orphan_watcher(
-                    order_no, ticker, name, "buy",
-                    confirmed_qty=cntr_qty,
-                    confirmed_uv=int(info.get("buy_price", 0)),
-                    monitor=monitor,
-                    buy_log_data={
-                        "action": "buy", "ticker": ticker, "name": name,
-                        "buy_price": info.get("buy_price", 0),
-                        "shares": cntr_qty, "amount": 0,
-                        "reason": "재시작복구(마커누락)",
-                    },
-                )
-
-            if _ab_sell_orders and not has_pending_sell:
-                # 케이스 B: 매도 live order 있는데 pending_sell 마커 없음 → 자동 복구 (1개만)
-                o = _ab_sell_orders[0]
-                _warn_extra_ab(_ab_sell_orders[1:], "매도")
-                order_no = o["order_no"]; cntr_qty = o["cntr_qty"]
-                ord_qty  = o["ord_qty"];  remaining = o["remaining_qty"]
-                with _pending_sell_lock:
-                    _pending_sell.add(ticker)
-                with _positions_lock:
-                    monitor.positions[ticker]["pending_sell"] = True
-                    save_positions(monitor.positions)
-                _recovered_sell.append(
-                    f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주 [마커누락복구]"
-                )
-                log.warning(
-                    f"[재시작복구] {name}({ticker}) 매도 pending_sell 마커 누락 감지 → "
-                    f"_pending_sell 복원 + watcher 재기동"
-                )
-                _start_orphan_watcher(
-                    order_no, ticker, name, "sell",
-                    confirmed_qty=cntr_qty,
-                    confirmed_uv=0,
-                    monitor=monitor,
-                    sell_log_data={
-                        "action": "sell", "ticker": ticker, "name": name,
-                        "buy_price": info.get("buy_price", 0),
-                        "shares": cntr_qty, "amount": 0,
-                        "_total_shares": ord_qty,
-                        "reason": "재시작복구(마커누락)",
-                    },
-                )
-
-        # ④ 복구 결과 텔레그램 발송
-        if _recovered_buy or _recovered_sell or _orphan_warn:
-            _parts = ["🔄 <b>[재시작 복구] pending 주문 상태 복원</b>", "━━━━━━━━━━━━━━━━━━"]
-            if _recovered_buy:
-                _parts.append(f"✅ 매수 재추적 ({len(_recovered_buy)}건)")
-                _parts += _recovered_buy
-            if _recovered_sell:
-                _parts.append(f"✅ 매도 재추적 ({len(_recovered_sell)}건)")
-                _parts += _recovered_sell
-            if _orphan_warn:
-                _parts.append("⚠️ 실계좌 주문 / 내부 불일치 (수동확인)")
-                _parts += _orphan_warn
-            tg("\n".join(_parts))
-        else:
-            log.info("[재시작복구] 복구 대상 없음 — 정상 시작")
-
-    except Exception as e:
-        log.error(f"[재시작복구] 오류: {e}")
-
-
-def _release_pending(
-    action: str, ticker: str, name: str, monitor,
-    is_final: bool, prev_qty: int,
-):
-    """orphan watcher 종료 시 공통 선점 플래그 해제 헬퍼.
-    is_final=True: 정상 전량 체결 완료
-    is_final=False: 장 마감 도달 등 추적 강제 종료 (경고 발송)
-    """
-    if action == "buy":
-        _pending_buy.discard(ticker)
-        log.info(f"[연장추적] {name}({ticker}) 매수 _pending_buy 해제 (is_final={is_final})")
-    else:  # sell
-        if monitor and hasattr(monitor, "positions") and ticker in monitor.positions:
-            with _positions_lock:
-                monitor.positions[ticker].pop("pending_sell", None)
-                save_positions(monitor.positions)
-        _pending_sell.discard(ticker)
-        log.info(f"[연장추적] {name}({ticker}) 매도 _pending_sell 해제 (is_final={is_final})")
-
-    if not is_final:
-        # 장 마감 / 강제 종료 경고
-        log.warning(f"[연장추적-마감종료] {name}({ticker}) {action} — 추적 강제 종료, 수동 확인 필요")
-        tg(f"⚠️ <b>[잔량 미확인]</b> {name}({ticker}) {action}\n"
-           f"장 마감으로 잔량 추적이 종료됐어요.\n"
-           f"실계좌 주문 상태를 직접 확인해주세요.\n"
-           f"(내부 포지션: 확인된 {prev_qty:,}주 기준)")
-
-
-def _start_orphan_watcher(
-    order_no: str, ticker: str, name: str, action: str,
-    confirmed_qty: int, confirmed_uv: int,
-    monitor, buy_log_data: dict = None, sell_log_data: dict = None,
-):
-    """[치명-FIX] 60초 timeout 이후 부분체결 잔량 연장 추적 스레드
-    timeout 시점에 confirmed_qty가 이미 positions에 반영됐다는 전제.
-    이후 추가 체결(cntr_qty > confirmed_qty)을 감지해 delta만큼 추가 반영.
-    [34차-FIX] 5분 제한 제거 → is_final=True 또는 당일 장 마감(15:35)까지 무제한 추적.
-    장 마감 도달 시 _release_pending으로 선점 해제 + 경고 발송.
-    """
-    _mode_str = "연장추적"
-
-    def _watcher():
-        nonlocal confirmed_qty, confirmed_uv
-        _prev_qty = confirmed_qty
-
-        log.info(f"[{_mode_str}] {name}({ticker}) {action} — 잔량 연장추적 시작 "
-                 f"(확정 {confirmed_qty}주, is_final 또는 장마감까지 무제한 추적)")
-
-        # [34차-FIX] 방법 B: is_final=True 또는 장 마감(15:35)까지 무제한 추적
-        # 5분 제한 제거 — 실계좌 잔량 체결이 얼마나 늦어도 내부와 동기화
-        _MARKET_CLOSE = datetime.now().replace(hour=15, minute=35, second=0, microsecond=0)
-
-        while True:
-            # 장 마감 후에도 추적이 계속되면 강제 종료
-            if datetime.now() >= _MARKET_CLOSE:
-                log.warning(f"[{_mode_str}] {name}({ticker}) {action} — 장 마감 도달, 추적 종료")
-                _release_pending(action, ticker, name, monitor, is_final=False, prev_qty=_prev_qty)
-                return
-            time.sleep(10)
-            try:
-                kw = kiwoom()
-                if kw is None:
-                    continue
-                fill = kw.get_order_fill(order_no, ticker)
-                if not fill:
-                    continue
-
-                new_qty = fill.get("cntr_qty", 0)
-                new_uv  = fill.get("cntr_uv", 0)
-                delta   = new_qty - _prev_qty  # 이번 루프에서 새로 체결된 수량
-
-                if delta > 0:
-                    log.info(f"[{_mode_str}] {name}({ticker}) {action} 추가체결 +{delta}주 "
-                             f"(누적 {new_qty}주)")
-                    if action == "buy":
-                        if monitor and hasattr(monitor, "positions") and                                 ticker in monitor.positions:
-                            with _positions_lock:
-                                pos = monitor.positions[ticker]
-                                _cur_sh  = int(pos.get("shares", 0))
-                                _cur_px  = float(pos.get("buy_price", 0))
-                                _cur_amt = float(pos.get("amount", 0))
-                                _add_amt = delta * new_uv
-                                _new_sh  = _cur_sh + delta
-                                _new_amt = _cur_amt + _add_amt
-                                pos["shares"]    = _new_sh
-                                pos["buy_price"] = round(_new_amt / _new_sh, 2)
-                                pos["amount"]    = _new_amt
-                                save_positions(monitor.positions)
-                            # 추가 체결분 trade_log
-                            if buy_log_data:
-                                _extra = dict(buy_log_data)
-                                _extra["shares"]    = delta
-                                _extra["buy_price"] = new_uv
-                                _extra["amount"]    = delta * new_uv
-                                _extra["reason"]    = _extra.get("reason","") + "(잔량추가체결)"
-                                append_trade_log(_extra)
-                            tg(f"✅ <b>[잔량체결]</b> {name}({ticker}) 매수 +{delta:,}주 추가 확인\n"
-                               f"누적 {new_qty:,}주 | 단가 {new_uv:,}원")
-                    else:  # sell
-                        if monitor and hasattr(monitor, "positions"):
-                            _bp = sell_log_data.get("buy_price", 0) if sell_log_data else 0
-                            with _positions_lock:
-                                if ticker in monitor.positions:
-                                    _cur_sh = int(monitor.positions[ticker].get("shares", 0))
-                                    _remain = max(0, _cur_sh - delta)
-                                    if _remain > 0:
-                                        monitor.positions[ticker]["shares"] = _remain
-                                        monitor.positions[ticker]["amount"] = _bp * _remain
-                                    else:
-                                        monitor.positions.pop(ticker, None)
-                                        if hasattr(monitor, "today_exited"):
-                                            monitor.today_exited.add(ticker)
-                                    save_positions(monitor.positions)
-                            if sell_log_data:
-                                _pnl = (new_uv - _bp) * delta if _bp else 0
-                                _ret = (new_uv - _bp) / _bp if _bp else 0
-                                _extra = dict(sell_log_data)
-                                _extra["shares"]     = delta
-                                _extra["sell_price"] = new_uv
-                                _extra["exit_price"] = new_uv
-                                _extra["amount"]     = _bp * delta
-                                _extra["pnl"]        = round(_pnl, 0)
-                                _extra["ret"]        = round(_ret, 4)
-                                _extra["reason"]     = _extra.get("reason","") + "(잔량추가체결)"
-                                append_trade_log(_extra)
-                            tg(f"✅ <b>[잔량체결]</b> {name}({ticker}) 매도 +{delta:,}주 추가 확인\n"
-                               f"누적 {new_qty:,}주 | 단가 {new_uv:,}원")
-                    _prev_qty = new_qty
-
-                if fill.get("is_final", False):
-                    log.info(f"[{_mode_str}] {name}({ticker}) {action} — 최종체결 확인, 추적 종료")
-                    _release_pending(action, ticker, name, monitor, is_final=True, prev_qty=_prev_qty)
-                    return
-
-            except Exception as e:
-                log.warning(f"[{_mode_str}] {name}({ticker}) 오류: {e}")
-
-    threading.Thread(target=_watcher, daemon=True, name=f"orphan-{ticker}").start()
-
 
 def _get_env_path() -> str:
     """스크립트 위치 기준 .env 경로 반환"""
@@ -3278,7 +2572,7 @@ class TelegramCommander:
                 mode_str = "🔵 모의투자 중"
 
         tg_btn(
-            f"🤖 <b>EQS V1.0 메인 메뉴</b>\n"
+            f"🤖 <b>Edge Score 메인 메뉴</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🕐 {datetime.now().strftime('%H:%M')}  {market_str}\n"
             f"📈 시장: {_regime_plain(regime)}\n"
@@ -3331,11 +2625,9 @@ class TelegramCommander:
             df     = get_ohlcv(ticker, days=30)
             atr    = calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = calc_dynamic_sl(atr, cp, ticker, regime)
-            # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
-            _sl_base = buy_price if buy_price > 0 else cp
-            sl_price = _sl_base * (1 + dyn_sl)
+            sl_price = cp * (1 + dyn_sl)
             if np.isnan(sl_price) or sl_price <= 0:
-                sl_price = _sl_base * 0.93
+                sl_price = cp * 0.93   # nan 방지: 현재가의 93%
 
             entry_date = info.get("entry_date", "")
             hold_days  = (date.today() - date.fromisoformat(entry_date)).days \
@@ -3492,31 +2784,6 @@ class TelegramCommander:
                                 self.monitor.positions)
         existing = self.monitor.positions.get(ticker)
 
-        # [BUG-FIX] pending 중인 종목은 체결 확인 완료 전까지 추가매수 금지
-        # 미확정 주문을 실제 보유처럼 누적 계산하는 버그 방지 (매도의 _pending_sell과 동일 구조)
-        if existing and existing.get("pending"):
-            tg_btn(
-                f"⚠️ <b>{name}({ticker}) 매수 대기 중</b>\n\n"
-                f"아직 이전 매수 주문의 체결이 확인되지 않았어요.\n"
-                f"체결 확인 후 추가매수 가능해요.\n\n"
-                f"(최대 60초 후 자동 처리됩니다)",
-                [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
-            )
-            return
-
-        # [2순위-FIX] _pending_buy check+add 원자화 — 동시 매수 요청 중복 차단
-        # 매도의 _pending_sell_lock과 동일 구조
-        with _pending_buy_lock:
-            if ticker in _pending_buy:
-                tg_btn(
-                    f"⚠️ <b>{name}({ticker}) 매수 처리 중</b>\n\n"
-                    f"동일 종목 매수가 이미 진행 중이에요.\n"
-                    f"잠시 후 다시 시도해주세요.",
-                    [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
-                )
-                return
-            _pending_buy.add(ticker)
-
         if existing:
             old_price    = float(existing.get("buy_price", buy_price))
             old_shares   = int(existing.get("shares", 0))
@@ -3532,9 +2799,7 @@ class TelegramCommander:
             entry_date   = str(date.today())
             is_add       = False
 
-        # ── [CRITICAL-BUY] 키움 실주문 먼저 → 성공 시에만 positions/로그 저장 ─
-        # _do_sell CRITICAL-1/2와 동일 패턴: 주문 실패 시 허위 포지션 기록 방지
-        _new_position = {
+        self.monitor.positions[ticker] = {
             "ticker": ticker, "name": name,
             "buy_price":    round(avg_price, 2),
             "shares":       total_shares,
@@ -3551,90 +2816,37 @@ class TelegramCommander:
             "sell_edge_alerted":   False,
             "max_hold_warned":     False,
         }
-        _order_sent = False
+        save_positions(self.monitor.positions)
+
+        if ticker not in self.monitor.universe:
+            self.monitor.universe[ticker] = name
+            save_universe(self.monitor.universe)
+
+        append_trade_log({
+            "action": "buy", "ticker": ticker, "name": name,
+            "buy_price": buy_price, "shares": shares, "amount": amount,
+            "date": str(date.today()),       # api_performance equity_curve용
+            "entry_date": str(date.today()),
+            "exit_price": 0, "hold_days": 0,
+            "reason": "추가매수" if is_add else "수동매수",
+        })
+
+        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
         if not EMERGENCY_STOP:
             kw = kiwoom()
             if kw:
                 _mode = "모의" if kw._mock else "실계좌"
                 _res  = kw.buy(ticker, shares, buy_price, order_type="0")
                 if _res.get("success"):
-                    _order_sent = True
-                    # [BUG-FIX-②] pending=True: 체결 확인 전 임시 상태 표시
-                    # _notify_on_fill이 체결 확인 후 제거 or 롤백
-                    _new_position["pending"] = True
-                    # [BUG-FIX] 추가매수 미체결 시 기존 포지션 복원을 위해 스냅샷 보존
-                    # 신규매수면 None → rollback 시 pop, 추가매수면 기존 pos → rollback 시 복원
-                    _new_position["_restore_pos"] = (
-                        {k: v for k, v in existing.items()} if is_add and existing else None
-                    )
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
                     _notify_on_fill(
                         _res.get("order_no", ""), ticker, name,
-                        action="buy", qty=shares, price=buy_price,
-                        monitor=self.monitor,
-                        buy_log_data={
-                            "action": "buy", "ticker": ticker, "name": name,
-                            "buy_price": buy_price, "shares": shares,
-                            "amount": amount,
-                            "date": str(date.today()),
-                            "entry_date": str(date.today()),
-                            "exit_price": 0, "hold_days": 0,
-                            "reason": "추가매수" if is_add else "수동매수",
-                            # [BUG-FIX] 추가매수 평균단가 재계산용 기존 보유 정보
-                            "_old_shares": old_shares if is_add else 0,
-                            "_old_price":  old_price  if is_add else 0,
-                        }
+                        action="buy", qty=shares, price=buy_price
                     )
                 else:
-                    _pending_buy.discard(ticker)  # [2순위-FIX] 주문 실패 → 선점 즉시 해제
-                    tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
-                       f"종목: {name}\n"
-                       f"❗ 포지션/로그 저장 스킵 (재시도 후 직접 확인 권장)")
-            else:
-                # [BUG-FIX] kw=None은 클라이언트 오류일 수 있음 → 매도와 동일하게 주문 실패 처리
-                # 허위 포지션/거래로그 생성 방지 — positions/log 저장 금지
-                _pending_buy.discard(ticker)  # [2순위-FIX] kw=None 실패 → 선점 즉시 해제
-                tg(f"🚨 키움 클라이언트 연결 실패 — {name} 매수 취소\n직접 확인 후 재시도해주세요.")
-                log.error(f"[수동매수실패] {name}({ticker}) kiwoom() None — 포지션 저장 금지")
-        else:
-            # EMERGENCY_STOP: 주문 없이 포지션만 저장 (수동 긴급모드)
-            _order_sent = True
-
-        # 주문 성공(또는 EMERGENCY_STOP 긴급모드) 시에만 저장
-        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
-        if _order_sent:
-            with _positions_lock:
-                self.monitor.positions[ticker] = _new_position
-                save_positions(self.monitor.positions)
-
-            if ticker not in self.monitor.universe:
-                self.monitor.universe[ticker] = name
-                save_universe(self.monitor.universe)
-
-            # [BUG-FIX-②] trade_log는 체결 확인 후 기록 (접수 시점 기록 제거)
-            # 미체결 롤백 시 log가 남는 버그 방지 — buy_log_data를 _notify_on_fill에 전달
-            # 키움 미연결/긴급모드(pending 없음)는 즉시 기록
-            if _new_position.get("pending"):
-                pass  # _notify_on_fill에서 체결 확인 후 기록
-            else:
-                # EMERGENCY_STOP 긴급모드: 주문 없이 즉시 저장 → pending 없음 → 즉시 log
-                append_trade_log({
-                    "action": "buy", "ticker": ticker, "name": name,
-                    "buy_price": buy_price, "shares": shares, "amount": amount,
-                    "date": str(date.today()),
-                    "entry_date": str(date.today()),
-                    "exit_price": 0, "hold_days": 0,
-                    "reason": "추가매수" if is_add else "수동매수",
-                })
-                # [중간2-FIX] EMERGENCY_STOP 경로는 _notify_on_fill을 거치지 않으므로
-                # 여기서 _pending_buy 해제 (누락 시 해당 종목 stuck 상태 유지)
-                _pending_buy.discard(ticker)
-        # ──────────────────────────────────────────────────────────────────
-
-        # 주문 실패 시 완료 메시지 전송 없이 종료
-        if not _order_sent:
-            return
+                    tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n종목: {name}")
+        # ─────────────────────────────────────────────────────
 
         kelly_amt = calc_kelly_amount(C["TOTAL_CAPITAL"])
         add_line  = f"\n🔄 추가 매수!  평균단가 → {avg_price:,.0f}원" if is_add else ""
@@ -3775,17 +2987,8 @@ class TelegramCommander:
             )
             return
 
-        # [BUG-FIX] check+add를 _pending_sell_lock 안에서 원자적으로 처리
-        # 자동매도 스레드와 수동매도 스레드가 동시에 같은 종목을 팔 수 없도록 보장
-        with _pending_sell_lock:
-            if ticker in _pending_sell:
-                tg(f"⚠️ {ticker} 매도 처리 중이에요. 잠시 후 다시 시도해주세요.")
-                return
-            _pending_sell.add(ticker)
-
         pos = self.monitor.positions.get(ticker)
         if not pos:
-            _pending_sell.discard(ticker)
             tg("⚠️ 보유 종목에 없어요."); return
 
         name         = pos.get("name", resolve_name(ticker))
@@ -3799,10 +3002,8 @@ class TelegramCommander:
             try:
                 sell_shares = int(str(extra[0]).replace(",", ""))
             except:
-                _pending_sell.discard(ticker)  # [BUG-FIX] 검증 실패 → stuck 방지
                 tg("❌ 주식수 형식이 맞지 않아요."); return
             if sell_shares > total_shares:
-                _pending_sell.discard(ticker)  # [BUG-FIX] 검증 실패 → stuck 방지
                 tg(f"❌ 보유 주식수({total_shares:,}주)보다 많아요."); return
             is_partial = sell_shares < total_shares
         else:
@@ -3819,98 +3020,11 @@ class TelegramCommander:
         pnl_icon = "✅" if pnl >= 0 else "🔴"
 
         _cluster_manual = get_cluster_name(ticker)
-
-        # ── [MEDIUM-1 FIX] 지정가 미체결 리스크 경고 ────────────────
-        _cp_now = get_current_price(ticker)
-        if _cp_now > 0 and sell_price < _cp_now * 0.97:
-            tg(
-                f"⚠️ <b>지정가 미체결 주의</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"입력 매도가 <b>{sell_price:,.0f}원</b>이\n"
-                f"현재가({_cp_now:,.0f}원)보다 {(_cp_now - sell_price) / _cp_now:.1%} 낮아요.\n\n"
-                f"주가가 계속 하락 중이면 체결이 안 될 수 있어요.\n"
-                f"시장가 매도를 원하면 현재가로 다시 입력해주세요.\n"
-                f"현재가: <code>{ticker} {int(_cp_now)}</code>"
-            )
-
-        # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
-        _kw_order_ok = True
-        _sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
-        if not EMERGENCY_STOP:
-            kw = kiwoom()
-            if kw is None:
-                # [BUG-FIX] kw=None은 의도된 오프라인이 아닌 클라이언트 오류일 수 있음
-                # fallback 즉시청산 대신 주문 실패로 처리 → positions 보존
-                _kw_order_ok = False
-                tg(f"🚨 키움 클라이언트 연결 실패 — {name} 매도 취소\n직접 확인 후 재시도해주세요.")
-            elif kw:
-                _mode = "모의" if kw._mock else "실계좌"
-                _res  = kw.sell(ticker, sell_shares, sell_price, order_type="0")
-                if _res.get("success"):
-                    tg(f"📨 [{_mode}] 매도주문 접수 → 체결 대기 중...\n"
-                       f"종목: {name} | {sell_shares:,}주 | {sell_price:,}원")
-                    # [BUG-FIX] sell_log_data + monitor 전달 → 체결 확인 후 positions/log 확정
-                    _sell_log = {
-                        "action":      "sell", "ticker": ticker, "name": name,
-                        "buy_price":   buy_price, "sell_price": sell_price,
-                        "shares":      sell_shares, "amount": buy_price * sell_shares,
-                        "date":        str(date.today()),
-                        "entry_date":  entry_date, "exit_date": str(date.today()),
-                        "exit_price":  sell_price, "hold_days": hold_days,
-                        "ret":         round(ret, 4), "pnl": round(pnl, 0),
-                        "reason":      "일부청산" if is_partial else "수동청산",
-                        "regime":      self.monitor.regime,
-                        "edge_at_exit": pos.get("last_edge", 0),
-                        "cluster":     _cluster_manual,
-                        "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
-                        "carry_over":  False,
-                        "_is_partial": is_partial,
-                        "_total_shares": total_shares,
-                    }
-                    # [36차-FIX] 주문 접수 성공 → positions에 pending_sell=True 영속 저장
-                    # 재시작 시 _recover_pending_on_startup이 이 마커를 보고 매도 복구 수행
-                    with _positions_lock:
-                        if ticker in self.monitor.positions:
-                            self.monitor.positions[ticker]["pending_sell"] = True
-                            save_positions(self.monitor.positions)
-                    _sell_deferred = True
-                    _notify_on_fill(
-                        _res.get("order_no", ""), ticker, name,
-                        action="sell", qty=sell_shares, price=sell_price,
-                        buy_price=buy_price,
-                        monitor=self.monitor,
-                        sell_log_data=_sell_log,
-                    )
-                else:
-                    _kw_order_ok = False
-                    tg_btn(
-                        f"🚨 <b>[{_mode}] 매도주문 실패!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"종목: {name} | 오류: {_res.get('error','')}\n\n"
-                        f"⚠️ <b>포지션이 유지됩니다.</b>\n"
-                        f"다시 시도해주세요.",
-                        [[{"text": "💸 다시 매도", "callback_data": "sell_start"},
-                          {"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
-                    )
-
-        if not _kw_order_ok:
-            _pending_sell.discard(ticker)
-            return   # 주문 실패 → 포지션·trade_log 모두 유지
-
-        # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
-        # _sell_deferred=True → 키움 연결 + 주문 접수 성공 → 여기서 즉시 확정 하지 않음
-        if _sell_deferred:
-            # positions 삭제/log 기록은 _notify_on_fill sell 체결 확인 후 수행
-            # 60초 미체결 시: tg 경고만 발송, positions 유지 (실계좌 수동 확인 필요)
-            log.info(f"[매도] {name} 접수 → 체결 대기 중 (order_no={_res.get('order_no','')})")
-            return
-
-        # ── EMERGENCY_STOP 시 즉시 기록 (kw=None은 위에서 실패 처리됨) ─────────
         append_trade_log({
             "action": "sell", "ticker": ticker, "name": name,
             "buy_price": buy_price, "sell_price": sell_price,
             "shares": sell_shares, "amount": buy_price * sell_shares,
-            "date": str(date.today()),
+            "date": str(date.today()),       # api_performance equity_curve용
             "entry_date": entry_date, "exit_date": str(date.today()),
             "exit_price": sell_price, "hold_days": hold_days,
             "ret": round(ret, 4), "pnl": round(pnl, 0),
@@ -3918,16 +3032,35 @@ class TelegramCommander:
             "regime": self.monitor.regime,
             "edge_at_exit": pos.get("last_edge", 0),
             "cluster":       _cluster_manual,
+            # [Fix-BUG-1] atr_mult_orig 추가 (수동청산도 OPT 분석 대상)
             "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
             "carry_over":   False,
         })
+
+        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode = "모의" if kw._mock else "실계좌"
+                _res  = kw.sell(ticker, sell_shares, sell_price, order_type="0")
+                if _res.get("success"):
+                    tg(f"📨 [{_mode}] 매도주문 접수 → 체결 대기 중...\n"
+                       f"종목: {name} | {sell_shares:,}주 | {sell_price:,}원")
+                    _notify_on_fill(
+                        _res.get("order_no", ""), ticker, name,
+                        action="sell", qty=sell_shares, price=sell_price,
+                        buy_price=buy_price
+                    )
+                else:
+                    tg(f"⚠️ [{_mode}] 매도주문 실패: {_res.get('error','')}\n종목: {name}")
+        # ─────────────────────────────────────────────────────
+
         if is_partial:
-            with _positions_lock:
-                remain = total_shares - sell_shares
-                pos["shares"] = remain
-                pos["amount"] = buy_price * remain
-                pos["alerted_steps"] = []
-                save_positions(self.monitor.positions)
+            remain = total_shares - sell_shares
+            pos["shares"] = remain
+            pos["amount"] = buy_price * remain
+            pos["alerted_steps"] = []
+            save_positions(self.monitor.positions)
             tg_btn(
                 f"📤 <b>일부 매도 완료!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -3943,9 +3076,8 @@ class TelegramCommander:
                   {"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
             )
         else:
-            with _positions_lock:
-                del self.monitor.positions[ticker]
-                save_positions(self.monitor.positions)
+            del self.monitor.positions[ticker]
+            save_positions(self.monitor.positions)
             tg_btn(
                 f"📤 <b>전체 매도 완료!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -3959,7 +3091,6 @@ class TelegramCommander:
                   {"text": "🏠 메인 메뉴",      "callback_data": "menu"}]]
             )
         log.info(f"[매도] {name} {sell_price:,.0f}원 {sell_shares}주 {ret:+.2%}")
-        _pending_sell.discard(ticker)
 
     # ════════════════════════════════════════════
     # 종목 상세 분석
@@ -4054,9 +3185,7 @@ class TelegramCommander:
             pnl = (cp - buy_p) * shares
             atr = calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = calc_dynamic_sl(atr, cp, ticker, regime)
-            # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
-            _sl_base_so = buy_p if buy_p > 0 else cp
-            sl_price = round(_sl_base_so * (1 + dyn_sl), -1)
+            sl_price = round(cp * (1 + dyn_sl), -1)
 
             # Edge 점수
             df_signal = get_closed_df(df) if df is not None else None
@@ -4249,7 +3378,7 @@ class TelegramCommander:
     def _help(self):
         self.state = ""
         tg_btn(
-            "❓ <b>EQS V1.0 사용 가이드</b>\n"
+            "❓ <b>Edge Score 사용 가이드</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🤖 AI가 주식을 분석해서\n"
             "   매수·손절 신호를 알려드려요.\n\n"
@@ -4723,7 +3852,7 @@ class TelegramCommander:
     def _optimizer_preview(self):
         logs   = load_trade_log()
         closed = [t for t in logs if t.get("exit_price", 0) > 0]
-        if len(closed) < 5:  # [v40.0] apply와 동일하게 5건으로 통일
+        if len(closed) < 3:
             tg_btn(
                 f"❌ <b>거래 데이터 부족</b>\n"
                 f"현재 {len(closed)}건\n"
@@ -5116,9 +4245,8 @@ class EdgeMonitor:
         # invalidate_cache() 전체 삭제 대신 미사용 종목만 제거하여
         # 보유 종목 데이터는 유지 → 다음 check_holdings에서 API 재호출 불필요
         active_tickers = set(self.universe.keys()) | set(self.positions.keys())
-        # [BUG-FIX-A] 캐시 키가 (ticker, days) 튜플 형태 → ticker 추출 후 비교
         stale_ohlcv    = [tk for tk in list(_ohlcv_cache.keys())
-                          if (tk[0] if isinstance(tk, tuple) else tk) not in active_tickers]
+                          if tk not in active_tickers]
         for tk in stale_ohlcv:
             _ohlcv_cache.pop(tk, None)
             _foreign_net_cache.pop(tk, None)  # 외국인 순매수 캐시도 함께 정리
@@ -5134,12 +4262,6 @@ class EdgeMonitor:
 
     def _log_exit(self, ticker: str, info: dict,
                   exit_price: float, reason: str):
-        # [BUG-FIX] check+add를 _pending_sell_lock 안에서 원자적으로 처리
-        with _pending_sell_lock:
-            if ticker in _pending_sell:
-                log.warning(f"[중복매도차단] {ticker} 매도 진행 중 — 자동매도({reason}) 스킵")
-                return
-            _pending_sell.add(ticker)  # kw.sell() 직전 선점 → 경쟁 창구 완전 차단
         buy_price  = float(info.get("buy_price", 0))
         shares     = int(info.get("shares", 0))
         amount     = buy_price * shares
@@ -5154,106 +4276,18 @@ class EdgeMonitor:
         pnl        = (_sell_amt - _buy_amt) - _commission - _tax
         ret        = pnl / _buy_amt if _buy_amt > 0 else 0
         _cluster_name = get_cluster_name(ticker)
-        _name         = info.get("name", ticker)
-
-        # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
-        _kw_order_ok = True
-        _auto_sell_deferred = False   # [BUG-FIX] 체결 확인 위임 플래그
-        if not EMERGENCY_STOP:
-            kw = kiwoom()
-            if kw is None:
-                # [BUG-FIX] kw=None은 클라이언트 오류일 수 있음 → 주문 실패로 처리
-                # positions 보존, 다음 1분 체크에서 재시도
-                _kw_order_ok = False
-                log.error(f"[자동매도실패] {_name}({ticker}) 키움 클라이언트 None — 사유:{reason}, 다음 체크 재시도")
-                tg(f"🚨 키움 클라이언트 연결 실패 — {_name} 자동매도({reason}) 취소\n다음 체크에서 재시도합니다.")
-            elif kw:
-                _mode = "모의" if kw._mock else "실계좌"
-                _bp   = float(info.get("buy_price", 0))
-                _ret  = (exit_price - _bp) / _bp if _bp > 0 else 0
-                if shares > 0:
-                    _res = kw.sell(ticker, shares, exit_price, order_type="3")  # 시장가
-                    if _res.get("success"):
-                        _dash_alert(
-                            f"자동매도 접수: {_name} | {reason} | {_ret:+.2%}",
-                            kind="sell", ticker=ticker
-                        )
-                        tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
-                        # [BUG-FIX] positions/log 확정을 체결 확인 후로 이동
-                        _auto_sell_log = {
-                            "action":      "sell",
-                            "ticker":      ticker,
-                            "name":        _name,
-                            "buy_price":   buy_price,
-                            "sell_price":  exit_price,
-                            "shares":      shares,
-                            "amount":      amount,
-                            "date":        str(date.today()),
-                            "entry_date":  entry_date,
-                            "exit_date":   str(date.today()),
-                            "exit_price":  exit_price,
-                            "hold_days":   hold_days,
-                            "ret":         round(ret, 4),
-                            "pnl":         round(pnl, 0),
-                            "reason":      reason,
-                            "regime":      getattr(self, "regime", "SIDE"),
-                            "edge_at_exit": info.get("last_edge", 0),
-                            "cluster":     _cluster_name,
-                            "atr_mult_orig": get_atr_mult_rt(_cluster_name),
-                            "carry_over":   False,
-                            "trail_active": bool(info.get("trail_active", False)),
-                            "_is_partial":  False,
-                            "_total_shares": shares,
-                        }
-                        # [36차-FIX] 주문 접수 성공 → positions에 pending_sell=True 영속 저장
-                        # 재시작 시 _recover_pending_on_startup이 이 마커로 매도 복구 수행
-                        with _positions_lock:
-                            if ticker in self.positions:
-                                self.positions[ticker]["pending_sell"] = True
-                                save_positions(self.positions)
-                        _auto_sell_deferred = True
-                        _notify_on_fill(
-                            _res.get("order_no", ""), ticker, _name,
-                            action="sell", qty=shares, price=exit_price,
-                            buy_price=_bp, reason=reason,
-                            monitor=self,
-                            sell_log_data=_auto_sell_log,
-                        )
-                    else:
-                        _kw_order_ok = False
-                        tg(
-                            f"🚨 <b>[{_mode}] 자동매도 주문 실패!</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━\n"
-                            f"종목: {_name} | 사유: {reason}\n"
-                            f"오류: {_res.get('error','')}\n\n"
-                            f"⚠️ <b>포지션이 유지됩니다.</b>\n"
-                            f"다음 1분 체크에서 자동 재시도합니다.\n"
-                            f"지속 실패 시 수동으로 매도해주세요."
-                        )
-
-        if not _kw_order_ok:
-            _pending_sell.discard(ticker)  # 주문 실패 → 잠금 해제, 다음 체크 재시도 허용
-            return   # 포지션·trade_log 모두 유지
-
-        # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
-        # deferred=True → _notify_on_fill에서 체결/타임아웃/예외 모든 경로에 discard 보장
-        if _auto_sell_deferred:
-            log.info(f"[자동매도] {_name} 접수 → 체결 대기 중 (사유: {reason})")
-            return
-
-        # ── EMERGENCY_STOP 시 즉시 기록 (kw=None은 위에서 실패 처리됨) ─────────
         append_trade_log({
-            "action":      "sell",
-            "ticker":      ticker,
-            "name":        _name,
-            "buy_price":   buy_price,
-            "sell_price":  exit_price,
-            "shares":      shares,
-            "amount":      amount,
-            "date":        str(date.today()),
-            "entry_date":  entry_date,
-            "exit_date":   str(date.today()),
-            "exit_price":  exit_price,
+            "action":     "sell",
+            "ticker":     ticker,
+            "name":       info.get("name", ticker),
+            "buy_price":  buy_price,
+            "sell_price": exit_price,
+            "shares":     shares,
+            "amount":     amount,
+            "date":       str(date.today()),   # api_performance equity_curve용
+            "entry_date": entry_date,
+            "exit_date":  str(date.today()),
+            "exit_price": exit_price,
             "hold_days":   hold_days,
             "ret":         round(ret, 4),
             "pnl":         round(pnl, 0),
@@ -5265,34 +4299,46 @@ class EdgeMonitor:
             "carry_over":   False,
             "trail_active": bool(info.get("trail_active", False)),
         })
-        self.today_exited.add(ticker)
-        # [BUG-FIX-①] _log_exit 내부 _positions_lock 제거 — 데드락 방지
+        self.today_exited.add(ticker)   # ③ 당일 재진입 차단
+
+        # ── 키움 자동 실주문 + 체결 대기 알림 ───────────────
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode   = "모의" if kw._mock else "실계좌"
+                _shares = int(info.get("shares", 0))
+                _bp     = float(info.get("buy_price", 0))
+                _pnl    = (exit_price - _bp) * _shares if _bp > 0 else 0
+                _ret    = (exit_price - _bp) / _bp if _bp > 0 else 0
+                _name   = info.get("name", ticker)
+                if _shares > 0:
+                    _res = kw.sell(ticker, _shares, exit_price, order_type="3")  # 시장가
+                    if _res.get("success"):
+                        _dash_alert(
+                            f"자동매도 접수: {_name} | {reason} | {_ret:+.2%}",
+                            kind="sell", ticker=ticker
+                        )
+                        tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
+                        _notify_on_fill(
+                            _res.get("order_no", ""), ticker, _name,
+                            action="sell", qty=_shares, price=exit_price,
+                            buy_price=_bp, reason=reason
+                        )
+                    else:
+                        tg(f"⚠️ [{_mode}] 자동매도 실패: {_res.get('error','')}\n종목: {_name}")
+        # ── 포지션 삭제 및 저장 ─────────────────────────
         self.positions.pop(ticker, None)
         save_positions(self.positions)
-        _pending_sell.discard(ticker)  # 키움 미연결 fallback 완료
 
     # ── 보유 종목 체크 (1분, 장중) ──────────────────────
     def check_holdings(self):
         """보유 종목 손절·트레일링·익절·타임스탑 1분 체크"""
         if not is_market_hour():
             return
-        # [TOP10-④] 장초 매매 버퍼 — 09:00~09:05 손절 트리거 차단
-        # 장 시작 직후 5분은 유동성 최저·스프레드 최대 구간
-        # 갭 하락이 일시적이면 억울한 손절, 체결 시 최악 가격 적용 위험
-        _now_t = datetime.now().strftime("%H:%M")
-        if "09:00" <= _now_t < "09:05":
-            log.debug(f"[장초버퍼] {_now_t} 손절 체크 스킵 (09:00~09:05 매매 차단)")
-            return
         if not self.positions:
             return
         alerts = []
-        # [TOP7-⑦] positions 락 — 텔레그램 수동매도와 동시 접근 시 이중 매도 방지
-        with _positions_lock:
-         for ticker, info in list(self.positions.items()):
-            # [BUG-FIX-②] pending 포지션 스킵 — 체결 확인 중인 종목은 판단 제외
-            if info.get("pending"):
-                log.debug(f"[pending스킵] {ticker} 체결 확인 중 — check_holdings 스킵")
-                continue
+        for ticker, info in list(self.positions.items()):
             name   = info.get("name", resolve_name(ticker))
             df     = get_ohlcv(ticker, days=30)
             cp     = get_current_price(ticker)
@@ -5693,11 +4739,6 @@ class EdgeMonitor:
     def scan_universe(self, force_notify: bool = False):
         if not is_market_hour() and not force_notify:
             return
-        # [TOP10-④] 장초 매매 버퍼 — 09:00~09:05 매수 신호 차단
-        _now_t = datetime.now().strftime("%H:%M")
-        if "09:00" <= _now_t < "09:05" and not force_notify:
-            log.debug(f"[장초버퍼] {_now_t} 매수 스캔 스킵 (09:00~09:05 매매 차단)")
-            return
         now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows         = []
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
@@ -5739,9 +4780,6 @@ class EdgeMonitor:
             # ── ④ Edge 급락 경고 ─────────────────────────────
             _prev_edge_val = self.prev_edge.get(ticker, None)
             _curr_edge_int = round(edge * 100)
-            # [v40.0 BUG-FIX] float 오염 보정 (구버전 scan_universe가 0.xx로 저장한 경우)
-            if _prev_edge_val is not None and isinstance(_prev_edge_val, float) and _prev_edge_val < 2.0:
-                _prev_edge_val = round(_prev_edge_val * 100)
             if (_prev_edge_val is not None
                     and _prev_edge_val - _curr_edge_int >= 15
                     and not info.get("edge_drop_alerted")):
@@ -5784,15 +4822,9 @@ class EdgeMonitor:
             cp              = float(df["종가"].iloc[-1])   # 표시용 현재가는 원본 df (최신값)
             slip_ok, exp, req = check_slippage_filter(df_signal, ticker)
             # ⑦ Edge 급등 + 매수 타이밍 통합
-            # [v40.0 BUG-FIX] prev_edge 단위 통일: check_holdings(정수) ↔ scan_universe(float) 교차오염 방지
-            # prev_edge[ticker]는 항상 정수(100배) 형태로 읽고 씀
-            edge_int       = round(edge * 100)
-            prev_int       = self.prev_edge.get(ticker, edge_int)
-            # prev가 float(0.xx)로 오염된 경우 자동 보정
-            if isinstance(prev_int, float) and prev_int < 2.0:
-                prev_int = round(prev_int * 100)
-            edge_surge_int = edge_int - prev_int
-            if edge_surge_int >= round(C["EDGE_SURGE_THRESHOLD"] * 100) and slip_ok:
+            prev       = self.prev_edge.get(ticker, edge)
+            edge_surge = edge - prev
+            if edge_surge >= C["EDGE_SURGE_THRESHOLD"] and slip_ok:
                 guide_s    = calc_entry_guide(df_signal, ticker, self.regime)
                 entry_str  = (f"{guide_s['entry_low']:,.0f} ~ {guide_s['entry_high']:,.0f}원"
                               if guide_s else f"{cp:,.0f}원")
@@ -5800,7 +4832,7 @@ class EdgeMonitor:
                 sl_str     = f"{guide_s['sl_price']:,.0f}원" if guide_s else "-"
                 tg(f"🚀 <b>{name} AI가 주목하기 시작했어요!</b>\n"
                    f"━━━━━━━━━━━━━━━━━━\n"
-                   f"🤖 AI 점수: {prev_int}점 → {edge_int}점 (▲{edge_surge_int}점 급등)\n"
+                   f"🤖 AI 점수: {int(prev*100)}점 → {int(edge*100)}점 (▲{int(edge_surge*100)}점 급등)\n"
                    f"\n"
                    f"지금이 매수 타이밍일 수 있어요\n"
                    f"💰 사기 좋은 가격: {entry_str}\n"
@@ -5810,8 +4842,7 @@ class EdgeMonitor:
                    f"💡 AI 점수가 갑자기 오른 건\n"
                    f"   수급·기술·모멘텀이 동시에 좋아졌다는 신호예요")
                 self.today_alerts += 1
-            # [v40.0 BUG-FIX] prev_edge 정수(100배)로 저장 통일
-            self.prev_edge[ticker] = edge_int
+            self.prev_edge[ticker] = edge
             # 거래량 급증 (미보유 종목 — held_info 없음)
             if ticker not in self.vol_alerted:
                 surge_msg = check_vol_surge(df_signal, ticker, name)
@@ -5835,17 +4866,13 @@ class EdgeMonitor:
             _sec_edges = []
             for _st, _sn in self.universe.items():
                 if get_sector_for_ticker_rt(_st) == _sec and _st != ticker:
-                    _se = self.prev_edge.get(_st, 50)  # [v40.0] 정수(100배) 기준, 기본값 50
-                    # float 오염 보정
-                    if isinstance(_se, float) and _se < 2.0:
-                        _se = round(_se * 100)
+                    _se = self.prev_edge.get(_st, 0.5)
                     _sec_edges.append(_se)
             if _sec_edges:
                 _sec_avg = sum(_sec_edges) / len(_sec_edges)
-                # [v40.0] 정수(100배) 기준 비교: 60 = 0.60, 40 = 0.40
-                if _sec_avg > 60:
+                if _sec_avg > 0.6:
                     edge += C.get("SECTOR_MOMENTUM_BONUS", 0.05)
-                elif _sec_avg < 40:
+                elif _sec_avg < 0.4:
                     edge -= C.get("SECTOR_MOMENTUM_PENALTY", 0.03)
             thr = get_regime_threshold(self.regime)
             # ㊶ 경제 이벤트 당일 커트라인 상향 (STEP3: 루프 밖 _econ_today_flag 참조)
@@ -5998,12 +5025,7 @@ class EdgeMonitor:
             # 장 외 시간 실시간 가격 조회 시 0원 반환 문제 방지
             # → ohlcv_cache 마지막 종가 우선 사용, 없으면 매수가로 표시
             cp = 0.0
-            # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (장외 종가 표시용)
-            cached = None
-            for _days_k in [90, 60, 30, 5]:
-                cached = _ohlcv_cache.get((ticker, _days_k))
-                if cached and cached["df"] is not None and len(cached["df"]) > 0:
-                    break
+            cached = _ohlcv_cache.get(ticker)
             if cached and cached["df"] is not None and len(cached["df"]) > 0:
                 cp = float(cached["df"]["종가"].iloc[-1])
             if cp <= 0:
@@ -6107,64 +5129,6 @@ class EdgeMonitor:
                 pass
         log.info(f"[백업] {', '.join(backed)} → backup/")
 
-    def intraday_reconcile(self):
-        """장중 30분 주기 계좌 잔고 ↔ 내부 포지션 대조.
-        orphan watcher가 놓친 케이스를 장마감 전에 선제 포착.
-        [35차-FIX] 장중에만 실행, pending 종목은 스킵 (추적 중이므로)
-        """
-        from datetime import time as dtime
-        now = datetime.now().time()
-        if not (dtime(9, 0) <= now <= dtime(15, 30)):
-            return   # 장중에만 실행
-        try:
-            kw = kiwoom()
-            if not kw or not self.positions:
-                return
-            _bal = kw.get_balance()
-            if not _bal:
-                return
-            _real = {b["ticker"]: int(b.get("qty", 0)) for b in _bal if b.get("ticker")}
-            _mismatch = []
-            for tk, info in self.positions.items():
-                if info.get("pending") or info.get("pending_sell"):
-                    continue   # watcher 추적 중 → 스킵
-                internal_qty = int(info.get("shares", 0))
-                real_qty = _real.get(tk, 0)
-                if real_qty != internal_qty:
-                    nm = info.get("name", tk)
-                    if real_qty > internal_qty:
-                        # 실계좌 > 내부 → 자동 보정 (잔량 추가체결 누락 가능성)
-                        # [38차-FIX] 실계좌 평균단가(buy_price)도 함께 보정
-                        # get_balance()의 buy_price 필드 = 실계좌 평균단가
-                        _real_bp_entry = next(
-                            (b for b in _bal if b.get("ticker") == tk), {}
-                        )
-                        _real_avg_price = float(_real_bp_entry.get("buy_price", 0))
-                        _bp = _real_avg_price if _real_avg_price > 0 else float(info.get("buy_price", 0))
-                        _bp_changed = _real_avg_price > 0 and abs(_real_avg_price - float(info.get("buy_price", 0))) > 1
-                        with _positions_lock:
-                            self.positions[tk]["shares"] = real_qty
-                            self.positions[tk]["amount"] = _bp * real_qty
-                            if _bp_changed:
-                                self.positions[tk]["buy_price"] = _bp
-                            save_positions(self.positions)
-                        _avg_note = f" / 평균단가 {_bp:,.0f}원으로 보정" if _bp_changed else ""
-                        log.warning(f"[장중대조] {nm}({tk}) {internal_qty}→{real_qty}주 자동보정{_avg_note}")
-                        _mismatch.append(f"  ✅ {nm}({tk}): {internal_qty}→{real_qty}주{_avg_note}")
-                    else:
-                        # 내부 > 실계좌 → 수동 확인 필요
-                        _mismatch.append(f"  ⚠️ {nm}({tk}): 내부 {internal_qty}주 > 실계좌 {real_qty}주")
-            for tk, qty in _real.items():
-                if tk not in self.positions and qty > 0:
-                    _mismatch.append(f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록)")
-            if _mismatch:
-                tg("🔍 <b>[장중 잔고 대조]</b> 불일치 감지\n" + "\n".join(_mismatch))
-                log.warning(f"[장중대조] 불일치 {len(_mismatch)}건")
-            else:
-                log.info("[장중대조] 내부 ↔ 실계좌 일치 ✅")
-        except Exception as e:
-            log.debug(f"[장중대조] 오류: {e}")
-
     def close_report(self):
         if not is_trading_day():
             return
@@ -6200,12 +5164,7 @@ class EdgeMonitor:
                 name   = info.get("name", resolve_name(ticker))
                 buy_p  = float(info.get("buy_price", 0))
                 shares = int(info.get("shares", 0))
-                # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (장마감 리포트용)
-                cached = None
-                for _days_k in [90, 60, 30, 5]:
-                    cached = _ohlcv_cache.get((ticker, _days_k))
-                    if cached and cached.get("df") is not None and len(cached["df"]) > 0:
-                        break
+                cached = _ohlcv_cache.get(ticker)
                 cp = (float(cached["df"]["종가"].iloc[-1])
                       if cached and cached.get("df") is not None
                       and len(cached["df"]) > 0 else buy_p)
@@ -6217,11 +5176,9 @@ class EdgeMonitor:
                 df_sl    = get_ohlcv(ticker, days=30)
                 atr      = calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
-                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
-                _sl_base_cr = buy_p if buy_p > 0 else cp
-                sl_price = round(_sl_base_cr * (1 + dyn_sl), -1)
+                sl_price = round(cp * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
-                    sl_price = round(_sl_base_cr * 0.93, -1)
+                    sl_price = round(cp * 0.93, -1)
                 r_icon = "✅" if ret >= 0 else "🔴"
                 tm_str = "  🔺수익 추적 중" if info.get("trail_active") else ""
                 _ret_comment = ("수익 중이에요 👍" if ret > 0
@@ -6312,91 +5269,6 @@ class EdgeMonitor:
                     f"🏆 승률: {_summary['win_rate']:.1%}"
                 )
             tg(_trade_msg)
-        # [TOP7-④] 장 마감 후 실계좌 잔고 대조 리포트
-        # 자동 수정 없이 불일치만 텔레그램으로 알림 → 운영자가 수동 확인
-        try:
-            kw = kiwoom()
-            if kw and self.positions:
-                _bal = kw.get_balance()   # [{ticker, name, qty, ...}, ...]
-                if _bal:
-                    # [BUG-FIX-③] get_balance()는 "qty" 키 반환 (shares 아님)
-                    # kiwoom_client.py:246 → "qty": abs(_int(h.get("rmnd_qty", 0)))
-                    _real = {b["ticker"]: int(b.get("qty", 0)) for b in _bal
-                             if b.get("ticker")}
-                    _internal = {tk: int(info.get("shares", 0))
-                                 for tk, info in self.positions.items()}
-                    _mismatch = []
-                    # ① 내부 있음 → 실계좌 없거나 수량 다름
-                    for tk, qty in _internal.items():
-                        real_qty = _real.get(tk, 0)
-                        if real_qty != qty:
-                            nm = self.positions[tk].get("name", tk)
-                            _mismatch.append(
-                                f"  ⚠️ {nm}({tk}): 내부 {qty}주 ↔ 실계좌 {real_qty}주"
-                            )
-                    # ② 실계좌 있음 → 내부 없음
-                    for tk, qty in _real.items():
-                        if tk not in _internal and qty > 0:
-                            _mismatch.append(
-                                f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록)"
-                            )
-                    if _mismatch:
-                        # [3순위-FIX] 자동 복구 후보 목록 분류
-                        # ① 실계좌>내부: 실계좌 기준으로 내부를 올릴 수 있음 (안전 복구 가능)
-                        # ② 내부>실계좌: 내부 수량이 과잉 → 운영자 확인 필요 (자동 복구 위험)
-                        # ③ 내부있음/실계좌0: 허위 포지션 → 운영자 확인 필요
-                        # ④ 실계좌있음/내부0: 미등록 종목 → 운영자 확인 후 수동 등록
-                        _auto_candidates = []   # 비교적 안전한 자동 복구 후보
-                        _manual_required  = []  # 반드시 수동 확인 필요
-                        for tk, qty in _internal.items():
-                            real_qty = _real.get(tk, 0)
-                            nm = self.positions[tk].get("name", tk)
-                            if real_qty != qty:
-                                if real_qty > qty:
-                                    # 실계좌가 더 많음 → 잔량 추가체결 누락 가능성 (자동 복구 후보)
-                                    _auto_candidates.append((tk, nm, qty, real_qty))
-                                else:
-                                    # 내부가 더 많음 → 허위 포지션 또는 미체결 주문 잔존
-                                    _manual_required.append(
-                                        f"  ⚠️ {nm}({tk}): 내부 {qty}주 > 실계좌 {real_qty}주 (수동확인)"
-                                    )
-                        for tk, qty in _real.items():
-                            if tk not in _internal and qty > 0:
-                                _manual_required.append(
-                                    f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록 — 수동 등록 필요)"
-                                )
-
-                        # 자동 복구 후보: 실계좌 수량 기준으로 내부 포지션 수정
-                        _auto_fixed = []
-                        for tk, nm, old_qty, real_qty in _auto_candidates:
-                            if tk in self.positions:
-                                with _positions_lock:
-                                    _pos = self.positions[tk]
-                                    _bp  = float(_pos.get("buy_price", 0))
-                                    _pos["shares"] = real_qty
-                                    _pos["amount"] = _bp * real_qty
-                                    save_positions(self.positions)
-                                _auto_fixed.append(
-                                    f"  ✅ {nm}({tk}): {old_qty}주 → {real_qty}주 자동 보정"
-                                )
-                                log.warning(f"[잔고대조-자동보정] {nm}({tk}) {old_qty}→{real_qty}주")
-
-                        # 텔레그램 리포트 조합
-                        _parts = ["🔍 <b>잔고 대조 이상 감지</b>", "━━━━━━━━━━━━━━━━━━"]
-                        if _auto_fixed:
-                            _parts.append("<b>✅ 자동 보정 완료</b>")
-                            _parts += _auto_fixed
-                        if _manual_required:
-                            _parts.append("<b>⚠️ 수동 확인 필요</b>")
-                            _parts += _manual_required
-                            _parts.append("\n직접 확인 후 positions를 수정해주세요.")
-                        tg("\n".join(_parts))
-                        log.warning(f"[잔고대조] 불일치 {len(_mismatch)}건 — 자동보정 {len(_auto_fixed)}건, 수동확인 {len(_manual_required)}건")
-                    else:
-                        log.info("[잔고대조] 내부 포지션 ↔ 실계좌 잔고 일치 ✅")
-        except Exception as _re:
-            log.debug(f"[잔고대조] 조회 실패: {_re}")
-
         self.today_alerts = 0
     # ── ⑧ 주간 성과 집계 (금요일 15:35) ─────────
     def weekly_report(self):
@@ -6460,7 +5332,7 @@ class EdgeMonitor:
         # ── ① 모의 vs 실계좌 비교 리포트 ──────────────────
         try:
             import sqlite3 as _sq3
-            _con = _sq3.connect(TRADE_DB_FILE)  # [BUG-FIX] 상수 통일
+            _con = _sq3.connect(Path("trade_history.db"))
             _con.row_factory = _sq3.Row
             _all_rows = [dict(r) for r in _con.execute(
                 "SELECT * FROM trades WHERE action='sell' ORDER BY date"
@@ -6503,7 +5375,7 @@ class EdgeMonitor:
         # ── ② 슬리피지 주간 경고 ────────────────────────────
         try:
             import sqlite3 as _sq3b
-            _con2 = _sq3b.connect(TRADE_DB_FILE)  # [BUG-FIX] 상수 통일
+            _con2 = _sq3b.connect(Path("trade_history.db"))
             _con2.row_factory = _sq3b.Row
             _buy_rows = [dict(r) for r in _con2.execute(
                 "SELECT * FROM trades WHERE action='buy' AND date>=? ORDER BY date",
@@ -6799,9 +5671,7 @@ class EdgeMonitor:
                 df_h  = get_ohlcv(ticker, days=30)
                 atr   = calc_atr(df_h) if df_h is not None else cp * 0.02
                 dyn_sl= calc_dynamic_sl(atr, cp, ticker, self.regime)
-                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
-                _sl_base_ff = buy_p if buy_p > 0 else cp
-                sl_p  = round(_sl_base_ff * (1 + dyn_sl), -1)
+                sl_p  = round(cp * (1 + dyn_sl), -1)
                 lines.append(
                     f"🔺 <b>{name}</b>  {ret:+.2%}  ({pnl:+,.0f}원)\n"
                     f"   └ {reason}\n"
@@ -6998,22 +5868,15 @@ class EdgeMonitor:
                 shares = int(info.get("shares", 0))
                 df     = get_ohlcv(ticker, days=30)
                 cp_cached = 0.0
-                # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (월간리포트 손절가용)
-                cached = None
-                for _days_k in [90, 60, 30, 5]:
-                    cached = _ohlcv_cache.get((ticker, _days_k))
-                    if cached and cached.get("df") is not None and len(cached["df"]) > 0:
-                        break
+                cached = _ohlcv_cache.get(ticker)
                 if cached and cached["df"] is not None:
                     cp_cached = float(cached["df"]["종가"].iloc[-1])
                 cp = cp_cached if cp_cached > 0 else buy_p
                 atr      = calc_atr(df) if df is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
-                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
-                _sl_base_mr = buy_p if buy_p > 0 else cp
-                sl_price = round(_sl_base_mr * (1 + dyn_sl), -1)
+                sl_price = round(cp * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
-                    sl_price = round(_sl_base_mr * 0.93, -1)
+                    sl_price = round(cp * 0.93, -1)
                 ret      = (cp - buy_p) / buy_p if buy_p > 0 else 0
                 pnl      = (cp - buy_p) * shares
                 r_icon   = "✅" if ret >= 0 else "🔴"
@@ -7081,24 +5944,10 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 EQS V1.0 (Edge Quant Signal) 가동")
+    log.info("  🚀 Edge Score v39.9 통합 엔진 가동")
     log.info("=" * 55)
-
-    # [3순위-FIX] 실계좌 모드에서 EMERGENCY_STOP=True면 시작 차단
-    # 실수로 비상정지 상태인 채로 실계좌를 가동하면 주문 없이 positions만 바뀌는 위험 상황 발생
-    _kw_start = kiwoom()
-    if _kw_start and not _kw_start._mock and EMERGENCY_STOP:
-        log.critical("[CRITICAL] 실계좌 모드에서 EMERGENCY_STOP=True 감지 — 시작 차단")
-        tg("🚨 <b>[시작 차단]</b> 실계좌 모드에서 EMERGENCY_STOP이 켜진 채로 시작됐습니다.\n"
-           "EMERGENCY_STOP=False로 변경 후 재시작해주세요.")
-        raise SystemExit("실계좌 EMERGENCY_STOP 차단")
-
     monitor = EdgeMonitor()
     monitor.update_regime()
-
-    # [35차-FIX] 재시작 시 미체결/pending 상태 복구
-    # positions에 pending=True 종목 → 실계좌 미체결 조회 → _pending_buy/_pending_sell 복원 + watcher 재기동
-    _recover_pending_on_startup(monitor)
     # ── 데이터 소스 진단 ─────────────────────────
     def _diagnose_data_sources():
         status, test_tk = [], "005930"
@@ -7151,13 +6000,8 @@ if __name__ == "__main__":
     # ⑧ 웹 대시보드 API 서버 (선택적 — Flask 설치 시 활성)
     try:
         from dashboard_api import start_dashboard
-        import sys as _sys_dash
         _dash_port = C.get("DASHBOARD_PORT", 5000)
-        # [BUG-FIX-B] importlib.import_module("rt") 이중 로드 방지
-        # python rt.py 실행 시 sys.modules["__main__"]이 rt 본체
-        # → 실행 중인 모듈을 직접 전달해 C/캐시/kiwoom 싱글턴 분리 방지
-        _rt_self = _sys_dash.modules.get("rt") or _sys_dash.modules["__main__"]
-        start_dashboard(monitor, rt_module=_rt_self, port=_dash_port)
+        start_dashboard(monitor, port=_dash_port)
     except ImportError:
         log.info("ℹ️ 대시보드 비활성 (flask 미설치 — pip install flask flask-cors)")
     # ── 재시작 감지 ────────────────────────────────────────────
@@ -7182,7 +6026,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>EQS V1.0 가동</b>\n"
+        f"🚀 <b>Edge Score v39.9 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
@@ -7202,7 +6046,6 @@ if __name__ == "__main__":
     schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.check_holdings)
     schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
     schedule.every(30).minutes.do(monitor.update_regime)
-    schedule.every(30).minutes.do(monitor.intraday_reconcile)   # [35차-FIX] 장중 주기적 잔고 대조
     schedule.every(30).minutes.do(monitor.offhours_check)
     schedule.every().day.at("08:30").do(monitor.do_refresh_universe)
     schedule.every().day.at("08:40").do(monitor.morning_report)
