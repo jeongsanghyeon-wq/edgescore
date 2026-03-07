@@ -2343,13 +2343,21 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                             _pending_buy.discard(ticker)  # [2순위-FIX] 부분체결 확정 후 선점 해제
                             log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정")
                             tg(
-                                f"⚠️ <b>[{_mode}] 매수 부분체결 확정</b>\n"
+                                f"⚠️ <b>[{_mode}] 매수 부분체결 — 잔량 자동 추적 시작</b>\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
                                 f"📌 종목: {name} ({ticker})\n"
                                 f"주문번호: {order_no} | 원인: {_fail_reason}\n"
                                 f"📦 부분체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원\n\n"
-                                f"체결된 수량만 포지션에 반영됐어요.\n"
-                                f"잔량 주문 상태를 실계좌에서 확인해주세요."
+                                f"체결된 수량은 포지션에 반영됐어요.\n"
+                                f"잔량은 백그라운드에서 최대 5분 자동 추적합니다."
+                            )
+                            # [치명-FIX] 잔량 추가 체결 연장 추적 (최대 5분)
+                            _start_orphan_watcher(
+                                order_no, ticker, name, "buy",
+                                confirmed_qty=_last_cntr_qty,
+                                confirmed_uv=_last_cntr_uv,
+                                monitor=monitor,
+                                buy_log_data=buy_log_data,
                             )
                         elif _restore:
                             # 0주 미체결 + 추가매수 → 기존 포지션 복원
@@ -2423,15 +2431,25 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     monitor.today_exited.add(ticker)
                 log.warning(f"[부분매도확정] {name}({ticker}) {_last_cntr_qty}주 체결 → 포지션 {_remain}주 남음")
                 # [1순위-FIX] positions 저장 완료 후 _pending_sell 해제 (역순 금지)
-                _pending_sell.discard(ticker)
+                # [치명-FIX] 잔량 추가 체결을 orphan watcher가 추적하므로
+                #           _pending_sell은 watcher 종료 시 해제 (여기서 해제 금지)
                 tg(
-                    f"⚠️ <b>[{_mode}] 매도 부분체결 확정</b>\n"
+                    f"⚠️ <b>[{_mode}] 매도 부분체결 — 잔량 자동 추적 시작</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"📌 종목: {name} ({ticker})\n"
                     f"주문번호: {order_no} | 원인: {_fail_reason}\n"
                     f"📦 체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원 | 잔여: {_remain:,}주\n"
                     f"{'✅' if _pnl_partial >= 0 else '🔴'} 손익: {_pnl_partial:+,.0f}원 ({_ret_partial:+.2%})\n\n"
-                    f"체결분만 포지션에서 차감됐어요.\n잔량 주문 상태를 실계좌에서 확인해주세요."
+                    f"체결분은 포지션에서 차감됐어요.\n잔량은 백그라운드에서 최대 5분 자동 추적합니다."
+                )
+                # [치명-FIX] 잔량 추가 체결 연장 추적 (최대 5분)
+                # watcher가 is_final 확인 후 _pending_sell.discard 처리
+                _start_orphan_watcher(
+                    order_no, ticker, name, "sell",
+                    confirmed_qty=_last_cntr_qty,
+                    confirmed_uv=_last_cntr_uv,
+                    monitor=monitor,
+                    sell_log_data=sell_log_data,
                 )
             else:
                 # 0주 미체결 — 포지션 유지 후 _pending_sell 해제
@@ -2448,6 +2466,129 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                 )
 
     threading.Thread(target=_wait_and_notify, daemon=True).start()
+
+
+def _start_orphan_watcher(
+    order_no: str, ticker: str, name: str, action: str,
+    confirmed_qty: int, confirmed_uv: int,
+    monitor, buy_log_data: dict = None, sell_log_data: dict = None,
+):
+    """[치명-FIX] 60초 timeout 이후 부분체결 잔량 연장 추적 스레드
+    timeout 시점에 confirmed_qty가 이미 positions에 반영됐다는 전제.
+    이후 추가 체결(cntr_qty > confirmed_qty)을 감지해 delta만큼 추가 반영.
+    최대 5분(30회 × 10초) 추가 폴링 후 미완료면 경고 발송 후 종료.
+    """
+    _mode_str = "연장추적"
+
+    def _watcher():
+        nonlocal confirmed_qty, confirmed_uv
+        _prev_qty = confirmed_qty
+
+        try:
+            kw = kiwoom()
+            if kw:
+                _mode_str2 = "모의" if kw._mock else "실계좌"
+            else:
+                _mode_str2 = "?"
+        except Exception:
+            _mode_str2 = "?"
+
+        log.info(f"[{_mode_str}] {name}({ticker}) {action} — 잔량 연장추적 시작 "
+                 f"(확정 {confirmed_qty}주, 최대 5분)")
+
+        for _i in range(30):  # 10초 × 30 = 최대 5분
+            time.sleep(10)
+            try:
+                kw = kiwoom()
+                if kw is None:
+                    continue
+                fill = kw.get_order_fill(order_no, ticker)
+                if not fill:
+                    continue
+
+                new_qty = fill.get("cntr_qty", 0)
+                new_uv  = fill.get("cntr_uv", 0)
+                delta   = new_qty - _prev_qty  # 이번 루프에서 새로 체결된 수량
+
+                if delta > 0:
+                    log.info(f"[{_mode_str}] {name}({ticker}) {action} 추가체결 +{delta}주 "
+                             f"(누적 {new_qty}주)")
+                    if action == "buy":
+                        if monitor and hasattr(monitor, "positions") and                                 ticker in monitor.positions:
+                            with _positions_lock:
+                                pos = monitor.positions[ticker]
+                                _cur_sh  = int(pos.get("shares", 0))
+                                _cur_px  = float(pos.get("buy_price", 0))
+                                _cur_amt = float(pos.get("amount", 0))
+                                _add_amt = delta * new_uv
+                                _new_sh  = _cur_sh + delta
+                                _new_amt = _cur_amt + _add_amt
+                                pos["shares"]    = _new_sh
+                                pos["buy_price"] = round(_new_amt / _new_sh, 2)
+                                pos["amount"]    = _new_amt
+                                save_positions(monitor.positions)
+                            # 추가 체결분 trade_log
+                            if buy_log_data:
+                                _extra = dict(buy_log_data)
+                                _extra["shares"]    = delta
+                                _extra["buy_price"] = new_uv
+                                _extra["amount"]    = delta * new_uv
+                                _extra["reason"]    = _extra.get("reason","") + "(잔량추가체결)"
+                                append_trade_log(_extra)
+                            tg(f"✅ <b>[잔량체결]</b> {name}({ticker}) 매수 +{delta:,}주 추가 확인\n"
+                               f"누적 {new_qty:,}주 | 단가 {new_uv:,}원")
+                    else:  # sell
+                        if monitor and hasattr(monitor, "positions"):
+                            _bp = sell_log_data.get("buy_price", 0) if sell_log_data else 0
+                            with _positions_lock:
+                                if ticker in monitor.positions:
+                                    _cur_sh = int(monitor.positions[ticker].get("shares", 0))
+                                    _remain = max(0, _cur_sh - delta)
+                                    if _remain > 0:
+                                        monitor.positions[ticker]["shares"] = _remain
+                                        monitor.positions[ticker]["amount"] = _bp * _remain
+                                    else:
+                                        monitor.positions.pop(ticker, None)
+                                        if hasattr(monitor, "today_exited"):
+                                            monitor.today_exited.add(ticker)
+                                    save_positions(monitor.positions)
+                            if sell_log_data:
+                                _pnl = (new_uv - _bp) * delta if _bp else 0
+                                _ret = (new_uv - _bp) / _bp if _bp else 0
+                                _extra = dict(sell_log_data)
+                                _extra["shares"]     = delta
+                                _extra["sell_price"] = new_uv
+                                _extra["exit_price"] = new_uv
+                                _extra["amount"]     = _bp * delta
+                                _extra["pnl"]        = round(_pnl, 0)
+                                _extra["ret"]        = round(_ret, 4)
+                                _extra["reason"]     = _extra.get("reason","") + "(잔량추가체결)"
+                                append_trade_log(_extra)
+                            tg(f"✅ <b>[잔량체결]</b> {name}({ticker}) 매도 +{delta:,}주 추가 확인\n"
+                               f"누적 {new_qty:,}주 | 단가 {new_uv:,}원")
+                    _prev_qty = new_qty
+
+                if fill.get("is_final", False):
+                    log.info(f"[{_mode_str}] {name}({ticker}) {action} — 최종체결 확인, 추적 종료")
+                    # 매도 최종 확정 시 _pending_sell도 보장 해제
+                    if action == "sell":
+                        _pending_sell.discard(ticker)
+                    return
+
+            except Exception as e:
+                log.warning(f"[{_mode_str}] {name}({ticker}) 오류: {e}")
+
+        # 5분 경과 후에도 미완료
+        log.warning(f"[{_mode_str}] {name}({ticker}) {action} — 5분 추적 후에도 미완료. 수동 확인 필요")
+        tg(f"⚠️ <b>[잔량 미확인]</b> {name}({ticker}) {action}\n"
+           f"5분 추적 후에도 잔량 체결 미확인.\n"
+           f"실계좌 주문 상태를 직접 확인해주세요.\n"
+           f"(내부 포지션: 확인된 {_prev_qty:,}주 기준)")
+        if action == "sell":
+            _pending_sell.discard(ticker)
+
+    threading.Thread(target=_watcher, daemon=True, name=f"orphan-{ticker}").start()
+
 
 def _get_env_path() -> str:
     """스크립트 위치 기준 .env 경로 반환"""
@@ -3226,6 +3367,7 @@ class TelegramCommander:
             if _new_position.get("pending"):
                 pass  # _notify_on_fill에서 체결 확인 후 기록
             else:
+                # EMERGENCY_STOP 긴급모드: 주문 없이 즉시 저장 → pending 없음 → 즉시 log
                 append_trade_log({
                     "action": "buy", "ticker": ticker, "name": name,
                     "buy_price": buy_price, "shares": shares, "amount": amount,
@@ -3234,6 +3376,9 @@ class TelegramCommander:
                     "exit_price": 0, "hold_days": 0,
                     "reason": "추가매수" if is_add else "수동매수",
                 })
+                # [중간2-FIX] EMERGENCY_STOP 경로는 _notify_on_fill을 거치지 않으므로
+                # 여기서 _pending_buy 해제 (누락 시 해당 종목 stuck 상태 유지)
+                _pending_buy.discard(ticker)
         # ──────────────────────────────────────────────────────────────────
 
         # 주문 실패 시 완료 메시지 전송 없이 종료
