@@ -1,7 +1,7 @@
 """
-Edge Score v39.9 — 완전 통합 엔진
+EQS V1.0 — Edge Quant Signal
 =====================================================
-v39.9 패치:
+EQS V1.0 패치 이력:
 
   [버그수정] ① sl_warn 리셋 조건 항상 True 수정 (접근 경보 매분 스팸)
     - 기존: _sl_price_check = cp*(1+dyn_sl)*1.02 → 항상 cp 미만 → 조건 항상 True
@@ -5946,7 +5946,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.9 통합 엔진 가동")
+    log.info("  🚀 EQS V1.0 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -6028,7 +6028,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.9 가동</b>\n"
+        f"🚀 <b>EQS V1.0 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
