@@ -1,5 +1,5 @@
 """
-EQS V1.1 백테스트 (Edge Quant Signal)
+EQS V1.2 백테스트 (Edge Quant Signal)
 =====================================================
 EQS V1.0 → V1.1 변경사항:
   [1] ㊷ 코스피200 동적 유니버스 — 기존 고정 8종목에서 코스피200 전체로 확대
@@ -284,7 +284,11 @@ EMAIL_CONFIG = {
 #   시총 1조 미만   → 0.008  (소형)
 # ══════════════════════════════════════════════════════
 
-KOSPI200_REFERENCE_DATE = "20150102"              # 분류 기준 시점 (백테스트 시작 직전)
+# ㊸ 연도별 코스피200 유니버스 (생존 편향 제거)
+# YEARLY_UNIVERSE: {연도(int): set(종목코드)} — 진입 허용 여부 판단에 사용
+# KOSPI200_REFERENCE_DATE: 클러스터 분류 기준 (가장 오래된 연도 기준일)
+KOSPI200_REFERENCE_DATE = "20150102"   # 클러스터 분류 기준 (단일 시점)
+YEARLY_UNIVERSE: dict = {}             # {year: set(code)} — build_yearly_kospi200()이 채움
 LARGE_CAP_THRESHOLD_KRW = 10_000_000_000_000      # 10조 이상 → 대형
 MID_CAP_THRESHOLD_KRW   =  1_000_000_000_000      #  1조 이상 → 중형
 
@@ -342,6 +346,66 @@ def _auto_slippage(market_cap: int) -> float:
         return 0.005
     return 0.008
 
+def build_yearly_kospi200():
+    """
+    ㊸ 연도별 코스피200 구성 종목 캐시 빌드 (생존 편향 제거).
+
+    START_DATE ~ END_DATE 구간의 각 연도 1월 첫 거래일 기준으로
+    코스피200 구성 종목을 조회하여 YEARLY_UNIVERSE에 저장한다.
+
+    pykrx 미설치 또는 조회 실패 시 전 기간 동일 유니버스(폴백) 적용.
+    """
+    global YEARLY_UNIVERSE
+
+    start_year = int(START_DATE[:4])
+    end_year   = int(END_DATE[:4])
+
+    if not PYKRX_AVAILABLE:
+        # 폴백: 전 기간 동일하게 기존 8종목
+        fallback_codes = {"005930","005380","105560","031980","000660","035720","005490","373220"}
+        YEARLY_UNIVERSE = {yr: fallback_codes for yr in range(start_year, end_year + 1)}
+        print("  ⚠️  pykrx 미설치 → 연도별 유니버스 폴백 (8종목)")
+        return
+
+    print(f"  ▶ 연도별 코스피200 유니버스 조회 중 ({start_year}~{end_year})...")
+    all_codes_union = set()
+
+    for year in range(start_year, end_year + 1):
+        ref_date = f"{year}0102"
+        try:
+            # 코스피200 구성 종목 조회 (기준일 기준)
+            try:
+                codes = set(str(c).zfill(6)
+                            for c in stock.get_index_portfolio_deposit_file("1028"))
+                if len(codes) < 10:
+                    raise ValueError("구성 종목 부족")
+            except Exception:
+                # 폴백: 해당 연도 시총 상위 200개
+                cap_tmp = stock.get_market_cap_by_ticker(ref_date, market="KOSPI")
+                codes = set(cap_tmp.sort_values("시가총액", ascending=False)
+                            .head(200).index.astype(str).str.zfill(6).tolist())
+
+            YEARLY_UNIVERSE[year] = codes
+            all_codes_union |= codes
+            print(f"     {year}: {len(codes)}종목")
+
+        except Exception as e:
+            # 해당 연도 조회 실패 → 직전 연도 유니버스 재사용
+            prev = YEARLY_UNIVERSE.get(year - 1)
+            YEARLY_UNIVERSE[year] = prev if prev else set()
+            print(f"     {year}: 조회 실패({e}) → 직전 연도 재사용 ({len(YEARLY_UNIVERSE[year])}종목)")
+
+    print(f"  ✅ 연도별 유니버스 완료 — 전체 유니언: {len(all_codes_union)}종목")
+
+def is_in_yearly_universe(ticker: str, date) -> bool:
+    """해당 날짜 기준으로 종목이 코스피200에 포함되는지 확인."""
+    year = date.year if hasattr(date, 'year') else int(str(date)[:4])
+    universe = YEARLY_UNIVERSE.get(year)
+    if not universe:
+        return True   # 유니버스 없으면 차단하지 않음 (보수적)
+    return ticker in universe
+
+
 def build_kospi200_universe():
     """
     코스피200 유니버스를 동적 구성.
@@ -381,14 +445,18 @@ def build_kospi200_universe():
     try:
         print(f"  ▶ 코스피200 유니버스 조회 중 (기준일: {KOSPI200_REFERENCE_DATE})...")
 
-        # ① 코스피200 구성 종목
-        try:
-            kospi200_codes = stock.get_index_portfolio_deposit_file("1028")
-        except Exception:
-            kospi200_codes = []
-        if not kospi200_codes or len(kospi200_codes) < 10:
-            cap_df_tmp = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
-            kospi200_codes = cap_df_tmp.sort_values("시가총액", ascending=False).head(200).index.tolist()
+        # ① 코스피200 구성 종목 — YEARLY_UNIVERSE 합집합 우선 사용 (전 기간 등장 종목 포함)
+        if YEARLY_UNIVERSE:
+            kospi200_codes = list({c for codes in YEARLY_UNIVERSE.values() for c in codes})
+            print(f"     유니버스 합집합: {len(kospi200_codes)}종목 (연도별 전 기간)")
+        else:
+            try:
+                kospi200_codes = stock.get_index_portfolio_deposit_file("1028")
+            except Exception:
+                kospi200_codes = []
+            if not kospi200_codes or len(kospi200_codes) < 10:
+                cap_df_tmp = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
+                kospi200_codes = cap_df_tmp.sort_values("시가총액", ascending=False).head(200).index.tolist()
 
         # ② 시가총액
         cap_df = stock.get_market_cap_by_ticker(KOSPI200_REFERENCE_DATE, market="KOSPI")
@@ -442,6 +510,7 @@ def build_kospi200_universe():
         return _apply_fallback()
 
 # ── 유니버스 빌드 (모듈 임포트 시 자동 실행) ──────────────
+build_yearly_kospi200()                          # ㊸ 연도별 유니버스 먼저 빌드
 TICKERS, _built_sector_map = build_kospi200_universe()
 SECTOR_MAP.update(_built_sector_map)  # ㊷ 동적 섹터맵 반영
 TOP_TICKERS_MEDVOL = list(TICKERS.values())[:10]
@@ -1610,6 +1679,14 @@ def calc_portfolio_pnl(all_res_data, regime_ser, is_high_corr=False):
             adj_threshold = threshold + econ_uplift
 
             if pos["amount"] == 0 and adj_edge >= adj_threshold:
+                # ㊸ 연도별 코스피200 유니버스 필터 (생존 편향 제거)
+                if YEARLY_UNIVERSE and not is_in_yearly_universe(r_data["ticker"], idx):
+                    blocked_log.append({
+                        "날짜": str(idx)[:10], "종목": name, "국면": curr_regime,
+                        "Edge": round(adj_edge, 3),
+                        "현재가": round(cp_now, 0), "Target_P": 0,
+                        "슬리피지": slip, "차단이유": f"㊸연도별유니버스미포함({idx.year})"})
+                    continue
                 # ㊱ 서킷브레이커 활성 시 신규진입 차단
                 if circuit_active:
                     blocked_log.append({
@@ -2138,7 +2215,7 @@ def build_excel_report(all_res, port_pnl, risk,
     # ── 시트1: 요약 ──
     ws = wb.active; ws.title = "요약 대시보드"
     ws.merge_cells("A1:O1")
-    c = ws["A1"]; c.value = "EQS V1.1 백테스트 요약"
+    c = ws["A1"]; c.value = "EQS V1.2 백테스트 요약"
     c.font = Font(bold=True, size=14, color="1F4E79", name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
@@ -2418,7 +2495,7 @@ def plot_results(all_res, port_pnl):
     n   = len(all_res)
     fig = plt.figure(figsize=(14, n*4+9))
     gs  = fig.add_gridspec(n+2, 2, hspace=0.45, wspace=0.3)
-    fig.suptitle("EQS V1.1 Backtest", fontsize=13, fontweight="bold")
+    fig.suptitle("EQS V1.2 Backtest", fontsize=13, fontweight="bold")
 
     for i, r in enumerate(all_res):
         ax   = fig.add_subplot(gs[i,:])
@@ -2491,8 +2568,8 @@ def plot_results(all_res, port_pnl):
     ax_ev.set_title("㉑㉓㉔ 이벤트 발생 현황", fontsize=10)
     ax_ev.legend(fontsize=8)
 
-    plt.savefig("eqs_v1_1_backtest_result.png", dpi=150, bbox_inches="tight")
-    print("  📊 차트 저장: eqs_v1_1_backtest_result.png")
+    plt.savefig("eqs_v1_2_backtest_result.png", dpi=150, bbox_inches="tight")
+    print("  📊 차트 저장: eqs_v1_2_backtest_result.png")
     plt.close()
 
 
@@ -2504,7 +2581,7 @@ def send_email_report(all_res, port_pnl, excel_file):
     try:
         msg = MIMEMultipart()
         msg["From"] = EMAIL_CONFIG["sender"]; msg["To"] = EMAIL_CONFIG["receiver"]
-        msg["Subject"] = f"EQS V1.1 리포트 ({END_DATE})"
+        msg["Subject"] = f"EQS V1.2 리포트 ({END_DATE})"
         lines = [
             f"포트폴리오: {port_pnl['total_ret']:+.1%} | 알파: {port_pnl['alpha']:+.1%}",
             f"㉓ 트레일링발동: {len(port_pnl['trail_log'])}건 | "
@@ -2537,7 +2614,7 @@ def scheduled_job():
     if not all_res: return
     risk     = calc_portfolio_risk(all_res)
     port_pnl = calc_portfolio_pnl(all_res, all_res[0]["regime_ser"], risk["is_high_corr"])
-    fname    = f"eqs_v1_1_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx"
+    fname    = f"eqs_v1_2_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx"
     ef       = build_excel_report(all_res, port_pnl, risk, fname)
     send_email_report(all_res, port_pnl, ef)
 
@@ -2556,7 +2633,7 @@ def main():
     if "--scheduler" in sys.argv: run_scheduler(); return
 
     print("\n" + "="*62)
-    print("  📊 EQS V1.1 백테스트 (Edge Quant Signal) (코스피200 동적 유니버스)")
+    print("  📊 EQS V1.2 백테스트 (Edge Quant Signal) (코스피200 동적 유니버스)")
     print("="*62)
     print(f"  기간: {START_DATE} ~ {END_DATE}")
     print(f"  ①~㉙ v26.0 전 기능 유지")
@@ -2631,7 +2708,7 @@ def main():
     build_excel_report(all_res, port_pnl, risk, "eqs_v1_1_report.xlsx")
 
     print(f"\n{'='*62}")
-    print("  ✅ EQS V1.1 백테스트 완료")
+    print("  ✅ EQS V1.2 백테스트 완료")
     print(f"{'='*62}")
     print("\n  [실전 전환 체크리스트]")
     print("  □ pip install pykrx                → 실제 KRX 고저가 포함")
