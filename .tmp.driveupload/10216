@@ -3211,8 +3211,10 @@ class TelegramCommander:
             try:
                 sell_shares = int(str(extra[0]).replace(",", ""))
             except:
+                _pending_sell.discard(ticker)  # [BUG-FIX] 검증 실패 → stuck 방지
                 tg("❌ 주식수 형식이 맞지 않아요."); return
             if sell_shares > total_shares:
+                _pending_sell.discard(ticker)  # [BUG-FIX] 검증 실패 → stuck 방지
                 tg(f"❌ 보유 주식수({total_shares:,}주)보다 많아요."); return
             is_partial = sell_shares < total_shares
         else:
@@ -4598,6 +4600,7 @@ class EdgeMonitor:
                             "_is_partial":  False,
                             "_total_shares": shares,
                         }
+                        _pending_sell.add(ticker)  # [BUG-FIX] 자동매도 진행 중 → 중복주문 차단
                         _auto_sell_deferred = True
                         _notify_on_fill(
                             _res.get("order_no", ""), ticker, _name,
@@ -4619,7 +4622,8 @@ class EdgeMonitor:
                         )
 
         if not _kw_order_ok:
-            return   # 주문 실패 → 포지션·trade_log 모두 유지, 다음 체크에서 재시도
+            _pending_sell.discard(ticker)  # [BUG-FIX] 주문 실패 → 잠금 해제, 다음 체크 재시도 허용
+            return   # 포지션·trade_log 모두 유지
 
         # [BUG-FIX] 체결 확인은 _notify_on_fill 백그라운드 스레드가 담당
         if _auto_sell_deferred:
