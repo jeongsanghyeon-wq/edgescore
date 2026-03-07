@@ -842,6 +842,11 @@ _trade_log_lock = threading.Lock()
 # → 모든 positions 읽기/쓰기 경로를 단일 락으로 직렬화
 _positions_lock = threading.Lock()
 
+# [BUG-FIX-③] 수동매도/자동매도 중복 주문 차단용 set
+# _do_sell(텔레그램) 진입 시 추가, 완료 시 제거
+# check_holdings/_log_exit에서 해당 종목 있으면 자동매도 스킵
+_pending_sell: set = set()
+
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
 # ══════════════════════════════════════════════════
@@ -2142,16 +2147,20 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     action: str, qty: int, price: int,
                     buy_price: float = 0.0,
                     reason: str = "",
-                    monitor=None):
+                    monitor=None,
+                    buy_log_data: dict = None):
     """
     백그라운드에서 체결 확인 후 텔레그램 알림 발송
     action: 'buy' or 'sell'
     buy_price: 매도 시 손익 계산용 매수단가
-    monitor: positions 롤백용 Monitor 참조 (매수 미체결 시 사용)
+    monitor: positions 참조 — 클로저로 개별 캡처 (함수 속성 공유 금지)
+    buy_log_data: 매수 체결 후 append_trade_log 호출용 데이터
+                  (접수 시점이 아닌 체결 확인 후 기록하여 미체결 시 log 오염 방지)
     최대 60초간 3초 간격으로 폴링
     """
-    # [BUG-FIX-②] monitor 참조를 함수 속성으로 저장 → _wait_and_notify 클로저에서 접근
-    _notify_on_fill._monitor_ref = monitor
+    # [BUG-FIX-①] monitor를 함수 속성(_monitor_ref)으로 공유하지 않고
+    # _wait_and_notify 클로저가 직접 캡처 → 호출마다 독립 보관
+    # 이전 방식: _notify_on_fill._monitor_ref = monitor (나중 호출이 덮어쓰는 버그)
     def _wait_and_notify():
         kw = kiwoom()
         if not kw:
@@ -2171,12 +2180,18 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     amount   = cntr_qty * cntr_uv
 
                     if action == "buy":
-                        # [BUG-FIX-②] 체결 확인 → pending 플래그 해제
-                        _mon = getattr(_notify_on_fill, "_monitor_ref", None)
-                        if _mon and hasattr(_mon, "positions") and                            ticker in _mon.positions:
+                        # [BUG-FIX-①] 클로저로 캡처한 monitor 직접 사용
+                        # [BUG-FIX-②] 체결 확인 후 pending 해제 + trade_log 기록
+                        if monitor and hasattr(monitor, "positions") and                            ticker in monitor.positions:
                             with _positions_lock:
-                                _mon.positions[ticker].pop("pending", None)
-                                save_positions(_mon.positions)
+                                monitor.positions[ticker].pop("pending", None)
+                                save_positions(monitor.positions)
+                        # 체결 확인 후 trade_log 기록 (접수 시점 아님)
+                        if buy_log_data:
+                            buy_log_data["buy_price"] = cntr_uv   # 실체결가 반영
+                            buy_log_data["shares"]    = cntr_qty  # 실체결수량 반영
+                            buy_log_data["amount"]    = cntr_qty * cntr_uv
+                            append_trade_log(buy_log_data)
                         msg = (
                             f"{_icon} <b>[{_mode}] 매수 체결 완료!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -2207,23 +2222,23 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
             except Exception as e:
                 log.warning(f"[키움] 체결 확인 오류: {e}")
 
-        # [BUG-FIX-②] 60초 후에도 미체결 → 매수 시 pending 포지션 자동 롤백
+        # [BUG-FIX-①②] 60초 후에도 미체결 → 매수 시 pending 포지션 자동 롤백
+        # 클로저 monitor 직접 사용 (함수 속성 공유 버그 해소)
+        # trade_log는 기록하지 않음 (체결 미확인 → log 오염 방지)
         if action == "buy":
-            # 매수 미체결: positions에서 제거하여 허위 포지션 방지
-            _monitor = getattr(_notify_on_fill, "_monitor_ref", None)
-            if _monitor and hasattr(_monitor, "positions"):
+            if monitor and hasattr(monitor, "positions"):
                 with _positions_lock:
-                    if ticker in _monitor.positions and                        _monitor.positions[ticker].get("pending"):
-                        _monitor.positions.pop(ticker, None)
-                        save_positions(_monitor.positions)
-                        log.warning(f"[미체결롤백] {name}({ticker}) 60초 미체결 → positions 자동 제거")
+                    if ticker in monitor.positions and                        monitor.positions[ticker].get("pending"):
+                        monitor.positions.pop(ticker, None)
+                        save_positions(monitor.positions)
+                        log.warning(f"[미체결롤백] {name}({ticker}) 60초 미체결 → positions 자동 제거 (log 미기록)")
                         tg(
                             f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 자동 취소</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
                             f"📌 종목: {name} ({ticker})\n"
                             f"주문번호: {order_no}\n\n"
                             f"60초 내 체결이 확인되지 않아 내부 포지션을 취소했어요.\n"
-                            f"키움에서 실제 주문 상태를 확인해주세요."
+                            f"(trade_log 미기록 — 실계좌 주문 상태를 직접 확인해주세요.)"
                         )
                         return
             tg(
@@ -2938,10 +2953,19 @@ class TelegramCommander:
                     _new_position["pending"] = True
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
-                    _nof = _notify_on_fill(
+                    _notify_on_fill(
                         _res.get("order_no", ""), ticker, name,
                         action="buy", qty=shares, price=buy_price,
-                        monitor=self.monitor
+                        monitor=self.monitor,
+                        buy_log_data={
+                            "action": "buy", "ticker": ticker, "name": name,
+                            "buy_price": buy_price, "shares": shares,
+                            "amount": amount,
+                            "date": str(date.today()),
+                            "entry_date": str(date.today()),
+                            "exit_price": 0, "hold_days": 0,
+                            "reason": "추가매수" if is_add else "수동매수",
+                        }
                     )
                 else:
                     tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
@@ -2965,14 +2989,20 @@ class TelegramCommander:
                 self.monitor.universe[ticker] = name
                 save_universe(self.monitor.universe)
 
-            append_trade_log({
-                "action": "buy", "ticker": ticker, "name": name,
-                "buy_price": buy_price, "shares": shares, "amount": amount,
-                "date": str(date.today()),       # api_performance equity_curve용
-                "entry_date": str(date.today()),
-                "exit_price": 0, "hold_days": 0,
-                "reason": "추가매수" if is_add else "수동매수",
-            })
+            # [BUG-FIX-②] trade_log는 체결 확인 후 기록 (접수 시점 기록 제거)
+            # 미체결 롤백 시 log가 남는 버그 방지 — buy_log_data를 _notify_on_fill에 전달
+            # 키움 미연결/긴급모드(pending 없음)는 즉시 기록
+            if _new_position.get("pending"):
+                pass  # _notify_on_fill에서 체결 확인 후 기록
+            else:
+                append_trade_log({
+                    "action": "buy", "ticker": ticker, "name": name,
+                    "buy_price": buy_price, "shares": shares, "amount": amount,
+                    "date": str(date.today()),
+                    "entry_date": str(date.today()),
+                    "exit_price": 0, "hold_days": 0,
+                    "reason": "추가매수" if is_add else "수동매수",
+                })
         # ──────────────────────────────────────────────────────────────────
 
         # 주문 실패 시 완료 메시지 전송 없이 종료
@@ -3118,8 +3148,16 @@ class TelegramCommander:
             )
             return
 
+        # [BUG-FIX-③] 자동매도(_log_exit)와 수동매도(_do_sell) 중복 주문 차단
+        if ticker in _pending_sell:
+            tg(f"⚠️ {ticker} 자동매도 처리 중이에요. 잠시 후 다시 시도해주세요.")
+            return
+        # 수동매도 진행 중 표시 → 자동매도(_log_exit)가 스킵
+        _pending_sell.add(ticker)
+
         pos = self.monitor.positions.get(ticker)
         if not pos:
+            _pending_sell.discard(ticker)
             tg("⚠️ 보유 종목에 없어요."); return
 
         name         = pos.get("name", resolve_name(ticker))
@@ -3193,6 +3231,7 @@ class TelegramCommander:
                     )
 
         if not _kw_order_ok:
+            _pending_sell.discard(ticker)  # [BUG-FIX-③] 주문 실패 시 자동매도 재개
             return   # 주문 실패 → 포지션·trade_log 모두 유지
 
         # ── 주문 성공(또는 키움 미연결) → 기록·삭제 ─────────
@@ -3251,6 +3290,8 @@ class TelegramCommander:
                   {"text": "🏠 메인 메뉴",      "callback_data": "menu"}]]
             )
         log.info(f"[매도] {name} {sell_price:,.0f}원 {sell_shares}주 {ret:+.2%}")
+        # [BUG-FIX-③] 수동매도 완료 → 자동매도 재개 허용
+        _pending_sell.discard(ticker)
 
     # ════════════════════════════════════════════
     # 종목 상세 분석
@@ -4425,6 +4466,11 @@ class EdgeMonitor:
 
     def _log_exit(self, ticker: str, info: dict,
                   exit_price: float, reason: str):
+        # [BUG-FIX-③] 수동매도(_do_sell)가 이미 처리 중이면 자동매도 스킵
+        # 같은 종목에 수동+자동 매도 주문이 동시에 나가는 경쟁조건 방지
+        if ticker in _pending_sell:
+            log.warning(f"[중복매도차단] {ticker} 수동매도 진행 중 — 자동매도({reason}) 스킵")
+            return
         buy_price  = float(info.get("buy_price", 0))
         shares     = int(info.get("shares", 0))
         amount     = buy_price * shares
