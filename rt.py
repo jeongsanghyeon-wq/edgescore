@@ -2342,7 +2342,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                 append_trade_log(buy_log_data)
                             # [치명-FIX] _pending_buy는 여기서 해제 금지
                             # 잔량 주문이 브로커에 살아 있는 동안 추가매수 차단을 유지해야 함
-                            # orphan watcher가 is_final=True / 5분 타임아웃 시 해제
+                            # orphan watcher가 is_final=True / 장마감(15:35) 시 해제
                             log.warning(f"[부분체결확정] {name}({ticker}) {_last_cntr_qty}주 부분체결 → 포지션 확정, _pending_buy 유지")
                             tg(
                                 f"⚠️ <b>[{_mode}] 매수 부분체결 — 잔량 자동 추적 시작</b>\n"
@@ -2351,9 +2351,9 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                                 f"주문번호: {order_no} | 원인: {_fail_reason}\n"
                                 f"📦 부분체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원\n\n"
                                 f"체결된 수량은 포지션에 반영됐어요.\n"
-                                f"잔량은 백그라운드에서 최대 5분 자동 추적합니다."
+                                f"잔량은 백그라운드에서 장마감(15:35)까지 자동 추적합니다."
                             )
-                            # [치명-FIX] 잔량 추가 체결 연장 추적 (최대 5분)
+                            # [38차-FIX] 문구 수정: "최대 5분" → "장마감까지 자동 추적"
                             _start_orphan_watcher(
                                 order_no, ticker, name, "buy",
                                 confirmed_qty=_last_cntr_qty,
@@ -2442,9 +2442,9 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     f"주문번호: {order_no} | 원인: {_fail_reason}\n"
                     f"📦 체결: {_last_cntr_qty:,}주 @ {_last_cntr_uv:,}원 | 잔여: {_remain:,}주\n"
                     f"{'✅' if _pnl_partial >= 0 else '🔴'} 손익: {_pnl_partial:+,.0f}원 ({_ret_partial:+.2%})\n\n"
-                    f"체결분은 포지션에서 차감됐어요.\n잔량은 백그라운드에서 최대 5분 자동 추적합니다."
+                    f"체결분은 포지션에서 차감됐어요.\n잔량은 백그라운드에서 장마감(15:35)까지 자동 추적합니다."
                 )
-                # [치명-FIX] 잔량 추가 체결 연장 추적 (최대 5분)
+                # [38차-FIX] 문구 수정: "최대 5분" → "장마감까지 자동 추적"
                 # watcher가 is_final 확인 후 _pending_sell.discard 처리
                 _start_orphan_watcher(
                     order_no, ticker, name, "sell",
@@ -2474,10 +2474,13 @@ def _recover_pending_on_startup(monitor) -> None:
     """재시작 시 미체결/pending 주문 상태를 실계좌 기준으로 복구.
 
     복구 대상:
-    ① positions에 pending=True가 남아 있는 종목
+    ① positions에 pending=True / pending_sell=True 종목
        → 실계좌 미체결 주문 조회 후 order_no 매핑
        → _pending_buy/_pending_sell 복원 + orphan watcher 재기동
-    ② 실계좌에 미체결 주문이 있지만 내부 positions에 흔적이 없는 경우
+    ② [37차-FIX] ticker는 positions에 있으나 pending 마커 누락 + live order 존재
+       (케이스 A: 추가매수 pending 저장 전 다운 / 케이스 B: kw.sell 후 pending_sell 저장 전 다운)
+       → 마커 뒤늦게 영속 저장 + _pending_buy/_pending_sell 복원 + orphan watcher 재기동
+    ③ 실계좌에 미체결 주문이 있지만 내부 positions 자체가 없는 경우
        → 경고만 발송 (자동 처리 불가 — 운영자 확인 필요)
     """
     try:
@@ -2520,59 +2523,163 @@ def _recover_pending_on_startup(monitor) -> None:
                 continue
 
             # 미체결 주문 있음 → pending 복원 + orphan watcher 재기동
-            for o in matched:
-                order_no   = o["order_no"]
-                action     = o["action"]
-                cntr_qty   = o["cntr_qty"]
-                ord_qty    = o["ord_qty"]
-                remaining  = o["remaining_qty"]
+            # [38차-FIX] 복수 live order 시 watcher 중복 방지:
+            #   action별로 remaining_qty 최대 1개만 선택 → watcher 1개만 기동
+            #   나머지 주문은 orphan 경고로 분류
+            _buy_orders  = sorted([o for o in matched if o["action"] == "buy"],
+                                   key=lambda x: x["remaining_qty"], reverse=True)
+            _sell_orders = sorted([o for o in matched if o["action"] == "sell"],
+                                   key=lambda x: x["remaining_qty"], reverse=True)
 
-                if action == "buy" and is_buy_pending:
-                    with _pending_buy_lock:
-                        _pending_buy.add(ticker)
-                    _recovered_buy.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
-                    log.info(f"[재시작복구] {name}({ticker}) 매수 _pending_buy 복원 + watcher 재기동")
-                    # 이미 부분체결분은 positions에 반영됐다고 전제
-                    _start_orphan_watcher(
-                        order_no, ticker, name, "buy",
-                        confirmed_qty=cntr_qty,
-                        confirmed_uv=int(monitor.positions.get(ticker, {}).get("buy_price", 0)),
-                        monitor=monitor,
-                        buy_log_data={
-                            "action": "buy", "ticker": ticker, "name": name,
-                            "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
-                            "shares": cntr_qty, "amount": 0,
-                            "reason": "재시작복구(잔량추적)",
-                        },
+            def _warn_extra(extras, action_label):
+                for ex in extras:
+                    _orphan_warn.append(
+                        f"  ⚠️ {name}({ticker}) {action_label} 주문:{ex['order_no']} "
+                        f"잔량:{ex['remaining_qty']}주 [복수주문 — 수동확인 필요]"
                     )
-                elif action == "sell" and is_sell_pending:
-                    with _pending_sell_lock:
-                        _pending_sell.add(ticker)
-                    _recovered_sell.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
-                    log.info(f"[재시작복구] {name}({ticker}) 매도 _pending_sell 복원 + watcher 재기동")
-                    sell_data = {
+
+            if is_buy_pending and _buy_orders:
+                o = _buy_orders[0]   # remaining_qty 최대 주문 1개만 추적
+                _warn_extra(_buy_orders[1:], "매수")
+                order_no, cntr_qty, ord_qty, remaining = (
+                    o["order_no"], o["cntr_qty"], o["ord_qty"], o["remaining_qty"])
+                with _pending_buy_lock:
+                    _pending_buy.add(ticker)
+                _recovered_buy.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
+                log.info(f"[재시작복구] {name}({ticker}) 매수 _pending_buy 복원 + watcher 재기동")
+                _start_orphan_watcher(
+                    order_no, ticker, name, "buy",
+                    confirmed_qty=cntr_qty,
+                    confirmed_uv=int(monitor.positions.get(ticker, {}).get("buy_price", 0)),
+                    monitor=monitor,
+                    buy_log_data={
+                        "action": "buy", "ticker": ticker, "name": name,
+                        "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
+                        "shares": cntr_qty, "amount": 0,
+                        "reason": "재시작복구(잔량추적)",
+                    },
+                )
+
+            if is_sell_pending and _sell_orders:
+                o = _sell_orders[0]   # remaining_qty 최대 주문 1개만 추적
+                _warn_extra(_sell_orders[1:], "매도")
+                order_no, cntr_qty, ord_qty, remaining = (
+                    o["order_no"], o["cntr_qty"], o["ord_qty"], o["remaining_qty"])
+                with _pending_sell_lock:
+                    _pending_sell.add(ticker)
+                _recovered_sell.append(f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주")
+                log.info(f"[재시작복구] {name}({ticker}) 매도 _pending_sell 복원 + watcher 재기동")
+                _start_orphan_watcher(
+                    order_no, ticker, name, "sell",
+                    confirmed_qty=cntr_qty,
+                    confirmed_uv=0,
+                    monitor=monitor,
+                    sell_log_data={
                         "action": "sell", "ticker": ticker, "name": name,
                         "buy_price": monitor.positions.get(ticker, {}).get("buy_price", 0),
                         "shares": cntr_qty, "amount": 0,
                         "_total_shares": ord_qty,
                         "reason": "재시작복구(잔량추적)",
-                    }
-                    _start_orphan_watcher(
-                        order_no, ticker, name, "sell",
-                        confirmed_qty=cntr_qty,
-                        confirmed_uv=0,
-                        monitor=monitor,
-                        sell_log_data=sell_data,
-                    )
+                    },
+                )
 
-        # ③ 실계좌에 미체결 주문이 있지만 내부 positions에 흔적 없음 → 경고
+        # ③ 실계좌 live order가 있는데 내부 pending 마커가 없는 모든 케이스 처리
+        # [37차-FIX] 기존: ticker not in positions일 때만 경고
+        #            수정: ticker는 있는데 pending 마커 없이 live order 있는 케이스도 자동 복구
+        #   - 케이스 A: 추가매수 직후 pending 저장 전 다운 → ticker는 positions에 있음
+        #   - 케이스 B: kw.sell() 직후 pending_sell 저장 전 다운 → 동일
         for ticker, orders in live_by_ticker.items():
-            if ticker not in monitor.positions:
+            info = monitor.positions.get(ticker)
+
+            if info is None:
+                # 케이스 C: 내부 포지션 자체가 없음 → 수동 확인 필요
                 for o in orders:
                     _orphan_warn.append(
                         f"  ❓ {ticker} {o['action']} 주문:{o['order_no']} "
                         f"(내부 포지션 없음 — 수동 확인 필요)"
                     )
+                continue
+
+            # ticker는 positions에 있음 — pending 마커 누락 여부 확인
+            has_pending      = bool(info.get("pending"))
+            has_pending_sell = bool(info.get("pending_sell"))
+            name = info.get("name", ticker)
+
+            # [38차-FIX] action별로 remaining_qty 최대 주문 1개만 선택 → watcher 중복 방지
+            _ab_buy_orders  = sorted([o for o in orders if o["action"] == "buy"],
+                                      key=lambda x: x["remaining_qty"], reverse=True)
+            _ab_sell_orders = sorted([o for o in orders if o["action"] == "sell"],
+                                      key=lambda x: x["remaining_qty"], reverse=True)
+
+            def _warn_extra_ab(extras, action_label):
+                for ex in extras:
+                    _orphan_warn.append(
+                        f"  ⚠️ {name}({ticker}) {action_label} 주문:{ex['order_no']} "
+                        f"잔량:{ex['remaining_qty']}주 [복수주문 — 수동확인 필요]"
+                    )
+
+            if _ab_buy_orders and not has_pending:
+                # 케이스 A: 매수 live order 있는데 pending 마커 없음 → 자동 복구 (1개만)
+                o = _ab_buy_orders[0]
+                _warn_extra_ab(_ab_buy_orders[1:], "매수")
+                order_no = o["order_no"]; cntr_qty = o["cntr_qty"]
+                ord_qty  = o["ord_qty"];  remaining = o["remaining_qty"]
+                with _pending_buy_lock:
+                    _pending_buy.add(ticker)
+                with _positions_lock:
+                    monitor.positions[ticker]["pending"] = True
+                    save_positions(monitor.positions)
+                _recovered_buy.append(
+                    f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주 [마커누락복구]"
+                )
+                log.warning(
+                    f"[재시작복구] {name}({ticker}) 매수 pending 마커 누락 감지 → "
+                    f"_pending_buy 복원 + watcher 재기동"
+                )
+                _start_orphan_watcher(
+                    order_no, ticker, name, "buy",
+                    confirmed_qty=cntr_qty,
+                    confirmed_uv=int(info.get("buy_price", 0)),
+                    monitor=monitor,
+                    buy_log_data={
+                        "action": "buy", "ticker": ticker, "name": name,
+                        "buy_price": info.get("buy_price", 0),
+                        "shares": cntr_qty, "amount": 0,
+                        "reason": "재시작복구(마커누락)",
+                    },
+                )
+
+            if _ab_sell_orders and not has_pending_sell:
+                # 케이스 B: 매도 live order 있는데 pending_sell 마커 없음 → 자동 복구 (1개만)
+                o = _ab_sell_orders[0]
+                _warn_extra_ab(_ab_sell_orders[1:], "매도")
+                order_no = o["order_no"]; cntr_qty = o["cntr_qty"]
+                ord_qty  = o["ord_qty"];  remaining = o["remaining_qty"]
+                with _pending_sell_lock:
+                    _pending_sell.add(ticker)
+                with _positions_lock:
+                    monitor.positions[ticker]["pending_sell"] = True
+                    save_positions(monitor.positions)
+                _recovered_sell.append(
+                    f"  {name}({ticker}) 주문:{order_no} 잔량:{remaining}주 [마커누락복구]"
+                )
+                log.warning(
+                    f"[재시작복구] {name}({ticker}) 매도 pending_sell 마커 누락 감지 → "
+                    f"_pending_sell 복원 + watcher 재기동"
+                )
+                _start_orphan_watcher(
+                    order_no, ticker, name, "sell",
+                    confirmed_qty=cntr_qty,
+                    confirmed_uv=0,
+                    monitor=monitor,
+                    sell_log_data={
+                        "action": "sell", "ticker": ticker, "name": name,
+                        "buy_price": info.get("buy_price", 0),
+                        "shares": cntr_qty, "amount": 0,
+                        "_total_shares": ord_qty,
+                        "reason": "재시작복구(마커누락)",
+                    },
+                )
 
         # ④ 복구 결과 텔레그램 발송
         if _recovered_buy or _recovered_sell or _orphan_warn:
@@ -6027,13 +6134,23 @@ class EdgeMonitor:
                     nm = info.get("name", tk)
                     if real_qty > internal_qty:
                         # 실계좌 > 내부 → 자동 보정 (잔량 추가체결 누락 가능성)
-                        _bp = float(info.get("buy_price", 0))
+                        # [38차-FIX] 실계좌 평균단가(buy_price)도 함께 보정
+                        # get_balance()의 buy_price 필드 = 실계좌 평균단가
+                        _real_bp_entry = next(
+                            (b for b in _bal if b.get("ticker") == tk), {}
+                        )
+                        _real_avg_price = float(_real_bp_entry.get("buy_price", 0))
+                        _bp = _real_avg_price if _real_avg_price > 0 else float(info.get("buy_price", 0))
+                        _bp_changed = _real_avg_price > 0 and abs(_real_avg_price - float(info.get("buy_price", 0))) > 1
                         with _positions_lock:
                             self.positions[tk]["shares"] = real_qty
                             self.positions[tk]["amount"] = _bp * real_qty
+                            if _bp_changed:
+                                self.positions[tk]["buy_price"] = _bp
                             save_positions(self.positions)
-                        log.warning(f"[장중대조] {nm}({tk}) {internal_qty}→{real_qty}주 자동보정")
-                        _mismatch.append(f"  ✅ {nm}({tk}): {internal_qty}→{real_qty}주 자동보정")
+                        _avg_note = f" / 평균단가 {_bp:,.0f}원으로 보정" if _bp_changed else ""
+                        log.warning(f"[장중대조] {nm}({tk}) {internal_qty}→{real_qty}주 자동보정{_avg_note}")
+                        _mismatch.append(f"  ✅ {nm}({tk}): {internal_qty}→{real_qty}주{_avg_note}")
                     else:
                         # 내부 > 실계좌 → 수동 확인 필요
                         _mismatch.append(f"  ⚠️ {nm}({tk}): 내부 {internal_qty}주 > 실계좌 {real_qty}주")
