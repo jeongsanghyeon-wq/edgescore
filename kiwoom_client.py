@@ -1,5 +1,8 @@
 # ═══════════════════════════════════════════════════════════════
-# kiwoom_client.py  — 키움 REST API 클라이언트 v1.3
+# kiwoom_client.py  — 키움 REST API 클라이언트 v1.4
+# v1.4 패치:
+#   [BUG-FIX] get_order_fill ord_dt: "" → 오늘 날짜 명시 (YYYYMMDD)
+#             빈 문자열 전달 시 키움 API가 오늘 주문 미조회 가능
 # 공식 문서 기준 엔드포인트/API ID
 #   토큰발급  : POST /oauth2/token          (au10001)
 #   현재가    : POST /api/dostk/stkinfo     (ka10001)  → cur_prc
@@ -333,7 +336,7 @@ class KiwoomClient:
         반환: {"filled": True/False, "cntr_qty": 체결수량, "cntr_uv": 체결단가}
         """
         payload = {
-            "ord_dt":       "",
+            "ord_dt":       datetime.now().strftime("%Y%m%d"),  # [v1.4 BUG-FIX] "" → 오늘 날짜 명시
             "stk_bond_tp":  "1",   # 주식
             "mrkt_tp":      "0",   # 전체
             "sell_tp":      "0",   # 전체

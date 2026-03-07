@@ -1,5 +1,5 @@
 """
-Edge Score v39.9 — Dashboard API Server v1.8
+Edge Score v40.0 — Dashboard API Server v1.9
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -39,6 +39,7 @@ _rt_module = None
 # ══════════════════════════════════════════
 _cache = {}
 _CACHE_TTL = 3
+_CACHE_TTL_ACCOUNT = 30   # [v1.9] api_account 전용 30초 캐시 (키움 API 과호출 방지)
 
 
 def _cached(endpoint_key):
@@ -105,7 +106,7 @@ def start_dashboard(monitor, port=5000):
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API v1.8 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API v1.9 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -115,7 +116,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.8",
+        return jsonify({"status": "ok", "version": "v1.9",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
@@ -123,7 +124,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "v39.9", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v40.0", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -152,7 +153,9 @@ def _create_app():
                 df_sl = rt.get_ohlcv(ticker, days=30)
                 atr = rt.calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl = rt.calc_dynamic_sl(atr, cp, ticker, _safe_attr("regime", "SIDE"))
-                sl_price = round(cp * (1 + dyn_sl), -1)
+                # [v1.9 BUG-FIX] 손절가 표시를 실제 트리거와 동일하게 매수가 기준으로
+                _sl_base = buy_p if buy_p > 0 else cp
+                sl_price = round(_sl_base * (1 + dyn_sl), -1)
                 df_edge = rt.get_ohlcv(ticker, days=60)
                 edge = 0
                 if df_edge is not None:
@@ -370,7 +373,8 @@ def _create_app():
                 "current_price": round(cp), "ret": round(ret, 4),
                 "edge": round(edge * 100), "hold_days": hold_days,
                 "action": action, "reasons": reasons,
-                "sl_price": round(cp * (1 + dyn_sl), -1),
+                # [v1.9 BUG-FIX] 매수가 기준 손절가 표시 (실제 트리거와 동일)
+                "sl_price": round((buy_p if buy_p > 0 else cp) * (1 + dyn_sl), -1),
                 "trail_active": trail,
             })
         except Exception as e:
@@ -745,6 +749,7 @@ def _create_app():
 
     # ── ⑥⑦ 투자 모드 + 예수금 ────────────────────────────
     @app.route("/api/account")
+    @_cached("account", ttl=_CACHE_TTL_ACCOUNT)   # [v1.9] 30초 캐시
     def api_account():
         rt = _rt_module
         result = {
@@ -781,17 +786,14 @@ def _create_app():
 
 # ── 유틸 ────────────────────────────────────
 def _get_sector(ticker):
-    SECTOR_MAP = {
-        "005930": "반도체", "000660": "반도체", "042700": "반도체",
-        "005380": "자동차", "012330": "자동차",
-        "012450": "방산", "047810": "방산", "079550": "방산",
-        "010950": "정유", "096770": "정유", "267250": "정유",
-        "035420": "IT", "035720": "IT",
-        "068270": "바이오", "207940": "바이오",
-        "105560": "금융", "055550": "금융",
-        "006400": "2차전지", "373220": "2차전지",
-    }
-    return SECTOR_MAP.get(ticker, "기타")
+    """섹터 조회 — rt.SECTOR_MAP_RT 기준으로 위임 (v1.9: dashboard 독립 맵 제거, 불일치 해소)"""
+    try:
+        if _rt_module is not None and hasattr(_rt_module, "get_sector_for_ticker_rt"):
+            return _rt_module.get_sector_for_ticker_rt(ticker)
+    except Exception:
+        pass
+    # fallback: rt 미로드 시 기본값
+    return "기타"
 
 
 def log_alert(icon, msg, alert_type="info", responded=False):

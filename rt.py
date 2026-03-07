@@ -1,7 +1,18 @@
 """
-Edge Score v39.9 — 완전 통합 엔진
+Edge Score v40.0 — 완전 통합 엔진
 =====================================================
-v39.9 패치:
+v40.0 패치:
+
+  [버그수정-CRITICAL] ① prev_edge 단위 불일치 (check_holdings=정수↔scan_universe=float 교차오염)
+    - 증상: Edge 급등/급락 알림 비정상 발동, 섹터 모멘텀 항상 보너스 적용
+    - 수정: 정수(100배) 통일 + float 오염 자동 보정
+  [버그수정] ② sl_price 표시 불일치 전체 수정
+    - _status, _sell_opinion, close_report, friday_force_exit, morning_report
+    - cp*(1+dyn_sl) → buy_p*(1+dyn_sl) (실제 트리거와 동일 기준)
+  [버그수정] ③ _optimizer_preview 최소 건수 3→5 (apply와 통일)
+  [버그수정] ④ get_order_fill ord_dt "" → 오늘 날짜 명시 (kiwoom_client.py)
+
+v39.9 패치 (이전):
 
   [버그수정] ① sl_warn 리셋 조건 항상 True 수정 (접근 경보 매분 스팸)
     - 기존: _sl_price_check = cp*(1+dyn_sl)*1.02 → 항상 cp 미만 → 조건 항상 True
@@ -2625,9 +2636,11 @@ class TelegramCommander:
             df     = get_ohlcv(ticker, days=30)
             atr    = calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = calc_dynamic_sl(atr, cp, ticker, regime)
-            sl_price = cp * (1 + dyn_sl)
+            # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
+            _sl_base = buy_price if buy_price > 0 else cp
+            sl_price = _sl_base * (1 + dyn_sl)
             if np.isnan(sl_price) or sl_price <= 0:
-                sl_price = cp * 0.93   # nan 방지: 현재가의 93%
+                sl_price = _sl_base * 0.93
 
             entry_date = info.get("entry_date", "")
             hold_days  = (date.today() - date.fromisoformat(entry_date)).days \
@@ -3185,7 +3198,9 @@ class TelegramCommander:
             pnl = (cp - buy_p) * shares
             atr = calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = calc_dynamic_sl(atr, cp, ticker, regime)
-            sl_price = round(cp * (1 + dyn_sl), -1)
+            # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
+            _sl_base_so = buy_p if buy_p > 0 else cp
+            sl_price = round(_sl_base_so * (1 + dyn_sl), -1)
 
             # Edge 점수
             df_signal = get_closed_df(df) if df is not None else None
@@ -3852,7 +3867,7 @@ class TelegramCommander:
     def _optimizer_preview(self):
         logs   = load_trade_log()
         closed = [t for t in logs if t.get("exit_price", 0) > 0]
-        if len(closed) < 3:
+        if len(closed) < 5:  # [v40.0] apply와 동일하게 5건으로 통일
             tg_btn(
                 f"❌ <b>거래 데이터 부족</b>\n"
                 f"현재 {len(closed)}건\n"
@@ -4780,6 +4795,9 @@ class EdgeMonitor:
             # ── ④ Edge 급락 경고 ─────────────────────────────
             _prev_edge_val = self.prev_edge.get(ticker, None)
             _curr_edge_int = round(edge * 100)
+            # [v40.0 BUG-FIX] float 오염 보정 (구버전 scan_universe가 0.xx로 저장한 경우)
+            if _prev_edge_val is not None and isinstance(_prev_edge_val, float) and _prev_edge_val < 2.0:
+                _prev_edge_val = round(_prev_edge_val * 100)
             if (_prev_edge_val is not None
                     and _prev_edge_val - _curr_edge_int >= 15
                     and not info.get("edge_drop_alerted")):
@@ -4822,9 +4840,15 @@ class EdgeMonitor:
             cp              = float(df["종가"].iloc[-1])   # 표시용 현재가는 원본 df (최신값)
             slip_ok, exp, req = check_slippage_filter(df_signal, ticker)
             # ⑦ Edge 급등 + 매수 타이밍 통합
-            prev       = self.prev_edge.get(ticker, edge)
-            edge_surge = edge - prev
-            if edge_surge >= C["EDGE_SURGE_THRESHOLD"] and slip_ok:
+            # [v40.0 BUG-FIX] prev_edge 단위 통일: check_holdings(정수) ↔ scan_universe(float) 교차오염 방지
+            # prev_edge[ticker]는 항상 정수(100배) 형태로 읽고 씀
+            edge_int       = round(edge * 100)
+            prev_int       = self.prev_edge.get(ticker, edge_int)
+            # prev가 float(0.xx)로 오염된 경우 자동 보정
+            if isinstance(prev_int, float) and prev_int < 2.0:
+                prev_int = round(prev_int * 100)
+            edge_surge_int = edge_int - prev_int
+            if edge_surge_int >= round(C["EDGE_SURGE_THRESHOLD"] * 100) and slip_ok:
                 guide_s    = calc_entry_guide(df_signal, ticker, self.regime)
                 entry_str  = (f"{guide_s['entry_low']:,.0f} ~ {guide_s['entry_high']:,.0f}원"
                               if guide_s else f"{cp:,.0f}원")
@@ -4832,7 +4856,7 @@ class EdgeMonitor:
                 sl_str     = f"{guide_s['sl_price']:,.0f}원" if guide_s else "-"
                 tg(f"🚀 <b>{name} AI가 주목하기 시작했어요!</b>\n"
                    f"━━━━━━━━━━━━━━━━━━\n"
-                   f"🤖 AI 점수: {int(prev*100)}점 → {int(edge*100)}점 (▲{int(edge_surge*100)}점 급등)\n"
+                   f"🤖 AI 점수: {prev_int}점 → {edge_int}점 (▲{edge_surge_int}점 급등)\n"
                    f"\n"
                    f"지금이 매수 타이밍일 수 있어요\n"
                    f"💰 사기 좋은 가격: {entry_str}\n"
@@ -4842,7 +4866,8 @@ class EdgeMonitor:
                    f"💡 AI 점수가 갑자기 오른 건\n"
                    f"   수급·기술·모멘텀이 동시에 좋아졌다는 신호예요")
                 self.today_alerts += 1
-            self.prev_edge[ticker] = edge
+            # [v40.0 BUG-FIX] prev_edge 정수(100배)로 저장 통일
+            self.prev_edge[ticker] = edge_int
             # 거래량 급증 (미보유 종목 — held_info 없음)
             if ticker not in self.vol_alerted:
                 surge_msg = check_vol_surge(df_signal, ticker, name)
@@ -4866,13 +4891,17 @@ class EdgeMonitor:
             _sec_edges = []
             for _st, _sn in self.universe.items():
                 if get_sector_for_ticker_rt(_st) == _sec and _st != ticker:
-                    _se = self.prev_edge.get(_st, 0.5)
+                    _se = self.prev_edge.get(_st, 50)  # [v40.0] 정수(100배) 기준, 기본값 50
+                    # float 오염 보정
+                    if isinstance(_se, float) and _se < 2.0:
+                        _se = round(_se * 100)
                     _sec_edges.append(_se)
             if _sec_edges:
                 _sec_avg = sum(_sec_edges) / len(_sec_edges)
-                if _sec_avg > 0.6:
+                # [v40.0] 정수(100배) 기준 비교: 60 = 0.60, 40 = 0.40
+                if _sec_avg > 60:
                     edge += C.get("SECTOR_MOMENTUM_BONUS", 0.05)
-                elif _sec_avg < 0.4:
+                elif _sec_avg < 40:
                     edge -= C.get("SECTOR_MOMENTUM_PENALTY", 0.03)
             thr = get_regime_threshold(self.regime)
             # ㊶ 경제 이벤트 당일 커트라인 상향 (STEP3: 루프 밖 _econ_today_flag 참조)
@@ -5176,9 +5205,11 @@ class EdgeMonitor:
                 df_sl    = get_ohlcv(ticker, days=30)
                 atr      = calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
-                sl_price = round(cp * (1 + dyn_sl), -1)
+                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
+                _sl_base_cr = buy_p if buy_p > 0 else cp
+                sl_price = round(_sl_base_cr * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
-                    sl_price = round(cp * 0.93, -1)
+                    sl_price = round(_sl_base_cr * 0.93, -1)
                 r_icon = "✅" if ret >= 0 else "🔴"
                 tm_str = "  🔺수익 추적 중" if info.get("trail_active") else ""
                 _ret_comment = ("수익 중이에요 👍" if ret > 0
@@ -5671,7 +5702,9 @@ class EdgeMonitor:
                 df_h  = get_ohlcv(ticker, days=30)
                 atr   = calc_atr(df_h) if df_h is not None else cp * 0.02
                 dyn_sl= calc_dynamic_sl(atr, cp, ticker, self.regime)
-                sl_p  = round(cp * (1 + dyn_sl), -1)
+                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
+                _sl_base_ff = buy_p if buy_p > 0 else cp
+                sl_p  = round(_sl_base_ff * (1 + dyn_sl), -1)
                 lines.append(
                     f"🔺 <b>{name}</b>  {ret:+.2%}  ({pnl:+,.0f}원)\n"
                     f"   └ {reason}\n"
@@ -5874,9 +5907,11 @@ class EdgeMonitor:
                 cp = cp_cached if cp_cached > 0 else buy_p
                 atr      = calc_atr(df) if df is not None else cp * 0.02
                 dyn_sl   = calc_dynamic_sl(atr, cp, ticker, self.regime)
-                sl_price = round(cp * (1 + dyn_sl), -1)
+                # [v40.0 BUG-FIX] 표시 손절가를 실제 트리거와 동일하게 매수가 기준으로 통일
+                _sl_base_mr = buy_p if buy_p > 0 else cp
+                sl_price = round(_sl_base_mr * (1 + dyn_sl), -1)
                 if np.isnan(sl_price) or sl_price <= 0:
-                    sl_price = round(cp * 0.93, -1)
+                    sl_price = round(_sl_base_mr * 0.93, -1)
                 ret      = (cp - buy_p) / buy_p if buy_p > 0 else 0
                 pnl      = (cp - buy_p) * shares
                 r_icon   = "✅" if ret >= 0 else "🔴"
@@ -5944,7 +5979,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.9 통합 엔진 가동")
+    log.info("  🚀 Edge Score v40.0 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -6026,7 +6061,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.9 가동</b>\n"
+        f"🚀 <b>Edge Score v40.0 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
