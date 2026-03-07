@@ -3004,6 +3004,18 @@ class TelegramCommander:
                                 self.monitor.positions)
         existing = self.monitor.positions.get(ticker)
 
+        # [BUG-FIX] pending 중인 종목은 체결 확인 완료 전까지 추가매수 금지
+        # 미확정 주문을 실제 보유처럼 누적 계산하는 버그 방지 (매도의 _pending_sell과 동일 구조)
+        if existing and existing.get("pending"):
+            tg_btn(
+                f"⚠️ <b>{name}({ticker}) 매수 대기 중</b>\n\n"
+                f"아직 이전 매수 주문의 체결이 확인되지 않았어요.\n"
+                f"체결 확인 후 추가매수 가능해요.\n\n"
+                f"(최대 60초 후 자동 처리됩니다)",
+                [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
+            )
+            return
+
         if existing:
             old_price    = float(existing.get("buy_price", buy_price))
             old_shares   = int(existing.get("shares", 0))
