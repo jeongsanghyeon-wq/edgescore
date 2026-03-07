@@ -2470,6 +2470,34 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
     threading.Thread(target=_wait_and_notify, daemon=True).start()
 
 
+def _release_pending(
+    action: str, ticker: str, name: str, monitor,
+    is_final: bool, prev_qty: int,
+):
+    """orphan watcher 종료 시 공통 선점 플래그 해제 헬퍼.
+    is_final=True: 정상 전량 체결 완료
+    is_final=False: 장 마감 도달 등 추적 강제 종료 (경고 발송)
+    """
+    if action == "buy":
+        _pending_buy.discard(ticker)
+        log.info(f"[연장추적] {name}({ticker}) 매수 _pending_buy 해제 (is_final={is_final})")
+    else:  # sell
+        if monitor and hasattr(monitor, "positions") and ticker in monitor.positions:
+            with _positions_lock:
+                monitor.positions[ticker].pop("pending_sell", None)
+                save_positions(monitor.positions)
+        _pending_sell.discard(ticker)
+        log.info(f"[연장추적] {name}({ticker}) 매도 _pending_sell 해제 (is_final={is_final})")
+
+    if not is_final:
+        # 장 마감 / 강제 종료 경고
+        log.warning(f"[연장추적-마감종료] {name}({ticker}) {action} — 추적 강제 종료, 수동 확인 필요")
+        tg(f"⚠️ <b>[잔량 미확인]</b> {name}({ticker}) {action}\n"
+           f"장 마감으로 잔량 추적이 종료됐어요.\n"
+           f"실계좌 주문 상태를 직접 확인해주세요.\n"
+           f"(내부 포지션: 확인된 {prev_qty:,}주 기준)")
+
+
 def _start_orphan_watcher(
     order_no: str, ticker: str, name: str, action: str,
     confirmed_qty: int, confirmed_uv: int,
@@ -2478,7 +2506,8 @@ def _start_orphan_watcher(
     """[치명-FIX] 60초 timeout 이후 부분체결 잔량 연장 추적 스레드
     timeout 시점에 confirmed_qty가 이미 positions에 반영됐다는 전제.
     이후 추가 체결(cntr_qty > confirmed_qty)을 감지해 delta만큼 추가 반영.
-    최대 5분(30회 × 10초) 추가 폴링 후 미완료면 경고 발송 후 종료.
+    [34차-FIX] 5분 제한 제거 → is_final=True 또는 당일 장 마감(15:35)까지 무제한 추적.
+    장 마감 도달 시 _release_pending으로 선점 해제 + 경고 발송.
     """
     _mode_str = "연장추적"
 
@@ -2486,19 +2515,19 @@ def _start_orphan_watcher(
         nonlocal confirmed_qty, confirmed_uv
         _prev_qty = confirmed_qty
 
-        try:
-            kw = kiwoom()
-            if kw:
-                _mode_str2 = "모의" if kw._mock else "실계좌"
-            else:
-                _mode_str2 = "?"
-        except Exception:
-            _mode_str2 = "?"
-
         log.info(f"[{_mode_str}] {name}({ticker}) {action} — 잔량 연장추적 시작 "
-                 f"(확정 {confirmed_qty}주, 최대 5분)")
+                 f"(확정 {confirmed_qty}주, is_final 또는 장마감까지 무제한 추적)")
 
-        for _i in range(30):  # 10초 × 30 = 최대 5분
+        # [34차-FIX] 방법 B: is_final=True 또는 장 마감(15:35)까지 무제한 추적
+        # 5분 제한 제거 — 실계좌 잔량 체결이 얼마나 늦어도 내부와 동기화
+        _MARKET_CLOSE = datetime.now().replace(hour=15, minute=35, second=0, microsecond=0)
+
+        while True:
+            # 장 마감 후에도 추적이 계속되면 강제 종료
+            if datetime.now() >= _MARKET_CLOSE:
+                log.warning(f"[{_mode_str}] {name}({ticker}) {action} — 장 마감 도달, 추적 종료")
+                _release_pending(action, ticker, name, monitor, is_final=False, prev_qty=_prev_qty)
+                return
             time.sleep(10)
             try:
                 kw = kiwoom()
@@ -2572,40 +2601,11 @@ def _start_orphan_watcher(
 
                 if fill.get("is_final", False):
                     log.info(f"[{_mode_str}] {name}({ticker}) {action} — 최종체결 확인, 추적 종료")
-                    # [치명-FIX] watcher 종료 시 선점 플래그 해제 (순서: positions 확정 완료 후)
-                    if action == "buy":
-                        _pending_buy.discard(ticker)
-                        log.info(f"[연장추적] {name}({ticker}) 매수 _pending_buy 해제")
-                    else:  # sell
-                        # positions의 pending_sell 플래그도 정리
-                        if monitor and hasattr(monitor, "positions") and                                 ticker in monitor.positions:
-                            with _positions_lock:
-                                monitor.positions[ticker].pop("pending_sell", None)
-                                save_positions(monitor.positions)
-                        _pending_sell.discard(ticker)
-                        log.info(f"[연장추적] {name}({ticker}) 매도 _pending_sell 해제")
+                    _release_pending(action, ticker, name, monitor, is_final=True, prev_qty=_prev_qty)
                     return
 
             except Exception as e:
                 log.warning(f"[{_mode_str}] {name}({ticker}) 오류: {e}")
-
-        # 5분 경과 후에도 미완료 — 선점 플래그 반드시 해제 후 경고
-        # [치명-FIX] 타임아웃 시에도 _pending_buy/_pending_sell 고착 방지
-        if action == "buy":
-            _pending_buy.discard(ticker)
-            log.warning(f"[연장추적-타임아웃] {name}({ticker}) 매수 _pending_buy 해제")
-        else:
-            if monitor and hasattr(monitor, "positions") and                     ticker in monitor.positions:
-                with _positions_lock:
-                    monitor.positions[ticker].pop("pending_sell", None)
-                    save_positions(monitor.positions)
-            _pending_sell.discard(ticker)
-            log.warning(f"[연장추적-타임아웃] {name}({ticker}) 매도 _pending_sell 해제")
-        log.warning(f"[{_mode_str}] {name}({ticker}) {action} — 5분 추적 후에도 미완료. 수동 확인 필요")
-        tg(f"⚠️ <b>[잔량 미확인]</b> {name}({ticker}) {action}\n"
-           f"5분 추적 후에도 잔량 체결 미확인.\n"
-           f"실계좌 주문 상태를 직접 확인해주세요.\n"
-           f"(내부 포지션: 확인된 {_prev_qty:,}주 기준)")
 
     threading.Thread(target=_watcher, daemon=True, name=f"orphan-{ticker}").start()
 
@@ -6040,15 +6040,57 @@ class EdgeMonitor:
                                 f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록)"
                             )
                     if _mismatch:
-                        _rec_msg = (
-                            "🔍 <b>잔고 대조 이상 감지</b>\n"
-                            "━━━━━━━━━━━━━━━━━━\n"
-                            + "\n".join(_mismatch) +
-                            "\n\n⚠️ 수동으로 확인 후 positions를 직접 수정해주세요.\n"
-                            "(자동 수정 없음 — 안전 우선)"
-                        )
-                        tg(_rec_msg)
-                        log.warning(f"[잔고대조] 불일치 {len(_mismatch)}건 감지")
+                        # [3순위-FIX] 자동 복구 후보 목록 분류
+                        # ① 실계좌>내부: 실계좌 기준으로 내부를 올릴 수 있음 (안전 복구 가능)
+                        # ② 내부>실계좌: 내부 수량이 과잉 → 운영자 확인 필요 (자동 복구 위험)
+                        # ③ 내부있음/실계좌0: 허위 포지션 → 운영자 확인 필요
+                        # ④ 실계좌있음/내부0: 미등록 종목 → 운영자 확인 후 수동 등록
+                        _auto_candidates = []   # 비교적 안전한 자동 복구 후보
+                        _manual_required  = []  # 반드시 수동 확인 필요
+                        for tk, qty in _internal.items():
+                            real_qty = _real.get(tk, 0)
+                            nm = self.positions[tk].get("name", tk)
+                            if real_qty != qty:
+                                if real_qty > qty:
+                                    # 실계좌가 더 많음 → 잔량 추가체결 누락 가능성 (자동 복구 후보)
+                                    _auto_candidates.append((tk, nm, qty, real_qty))
+                                else:
+                                    # 내부가 더 많음 → 허위 포지션 또는 미체결 주문 잔존
+                                    _manual_required.append(
+                                        f"  ⚠️ {nm}({tk}): 내부 {qty}주 > 실계좌 {real_qty}주 (수동확인)"
+                                    )
+                        for tk, qty in _real.items():
+                            if tk not in _internal and qty > 0:
+                                _manual_required.append(
+                                    f"  ❓ {tk}: 실계좌에만 {qty}주 (내부 미등록 — 수동 등록 필요)"
+                                )
+
+                        # 자동 복구 후보: 실계좌 수량 기준으로 내부 포지션 수정
+                        _auto_fixed = []
+                        for tk, nm, old_qty, real_qty in _auto_candidates:
+                            if tk in self.positions:
+                                with _positions_lock:
+                                    _pos = self.positions[tk]
+                                    _bp  = float(_pos.get("buy_price", 0))
+                                    _pos["shares"] = real_qty
+                                    _pos["amount"] = _bp * real_qty
+                                    save_positions(self.positions)
+                                _auto_fixed.append(
+                                    f"  ✅ {nm}({tk}): {old_qty}주 → {real_qty}주 자동 보정"
+                                )
+                                log.warning(f"[잔고대조-자동보정] {nm}({tk}) {old_qty}→{real_qty}주")
+
+                        # 텔레그램 리포트 조합
+                        _parts = ["🔍 <b>잔고 대조 이상 감지</b>", "━━━━━━━━━━━━━━━━━━"]
+                        if _auto_fixed:
+                            _parts.append("<b>✅ 자동 보정 완료</b>")
+                            _parts += _auto_fixed
+                        if _manual_required:
+                            _parts.append("<b>⚠️ 수동 확인 필요</b>")
+                            _parts += _manual_required
+                            _parts.append("\n직접 확인 후 positions를 수정해주세요.")
+                        tg("\n".join(_parts))
+                        log.warning(f"[잔고대조] 불일치 {len(_mismatch)}건 — 자동보정 {len(_auto_fixed)}건, 수동확인 {len(_manual_required)}건")
                     else:
                         log.info("[잔고대조] 내부 포지션 ↔ 실계좌 잔고 일치 ✅")
         except Exception as _re:
