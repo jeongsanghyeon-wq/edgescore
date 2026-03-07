@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# kiwoom_client.py  — 키움 REST API 클라이언트 v1.2
+# kiwoom_client.py  — 키움 REST API 클라이언트 v1.3
 # 공식 문서 기준 엔드포인트/API ID
 #   토큰발급  : POST /oauth2/token          (au10001)
 #   현재가    : POST /api/dostk/stkinfo     (ka10001)  → cur_prc
@@ -163,8 +163,8 @@ class KiwoomClient:
         payload = {
             "dmst_stex_tp": "KRX",
             "stk_cd":       ticker,
-            "ord_qty":      str(qty),
-            "ord_uv":       str(price) if price > 0 else "",
+            "ord_qty":      str(int(qty)),
+            "ord_uv":       str(int(price)) if price > 0 else "",  # float→int: "48500.0"→"48500"
             "trde_tp":      order_type,
             "cond_uv":      "",
         }
@@ -188,8 +188,8 @@ class KiwoomClient:
         payload = {
             "dmst_stex_tp": "KRX",
             "stk_cd":       ticker,
-            "ord_qty":      str(qty),
-            "ord_uv":       str(price) if price > 0 else "",
+            "ord_qty":      str(int(qty)),
+            "ord_uv":       str(int(price)) if price > 0 else "",  # float→int: "48500.0"→"48500"
             "trde_tp":      order_type,
             "cond_uv":      "",
         }
@@ -232,12 +232,11 @@ class KiwoomClient:
         if data and data.get("return_code") == 0:
             holdings = data.get("stk_acnt_evlt_prst", [])
             result = []
+            def _int(s):
+                v = str(s).replace(",", "").replace("+", "").strip()
+                return int(v) if v else 0
             for h in holdings:
                 try:
-                    def _int(s):
-                        v = str(s).replace(",", "").replace("+", "").strip()
-                        return int(v) if v else 0
-
                     result.append({
                         "ticker":     h.get("stk_cd", "").strip().lstrip("A"),
                         "name":       h.get("stk_nm", ""),
@@ -300,11 +299,11 @@ class KiwoomClient:
         rows = data.get("stk_dt_pole_chart_qry", [])
         if not rows:
             return []
+        def _v(s):
+            return abs(int(str(s).replace(",", "").replace("+", "").replace("-", "") or "0"))
         result = []
         for r in rows:
             try:
-                def _v(s):
-                    return abs(int(str(s).replace(",", "").replace("+", "").replace("-", "") or "0"))
                 dt_s = str(r.get("dt", ""))
                 if len(dt_s) != 8:
                     continue

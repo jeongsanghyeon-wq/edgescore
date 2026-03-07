@@ -1,5 +1,5 @@
 """
-Edge Score v39.6 — Dashboard API Server v1.5
+Edge Score v39.6 — Dashboard API Server v1.8
 =============================================================
 v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
@@ -168,7 +168,8 @@ def _create_app():
                     "ret": round(ret, 4), "pnl": round(pnl),
                     "edge": round(edge * 100), "sl_price": sl_price,
                     "trail_active": bool(info.get("trail_active", False)),
-                    "hold_days": int(info.get("hold_days", 0)),
+                    "hold_days": (date.today() - date.fromisoformat(info["entry_date"])).days
+                             if info.get("entry_date") else 0,
                     "atr_alerted": bool(info.get("atr_alerted", False)),
                     "price_history": price_history,
                 })
@@ -304,6 +305,14 @@ def _create_app():
         last_fri = date(today.year, today.month, last_day)
         while last_fri.weekday() != 4:
             last_fri -= timedelta(days=1)
+        # 경제이벤트 당일/내일 여부 계산
+        def __parse_econ_date(s):
+            try: return date.fromisoformat(s)
+            except: return None
+        _econ_list = C.get("ECON_EVENTS_2025_2026", [])
+        _econ_dates = [d for s in _econ_list for d in [__parse_econ_date(s)] if d]
+        _econ_today_def    = today in _econ_dates
+        _econ_tomorrow_def = (today + timedelta(days=1)) in _econ_dates
         return {
             "circuit_breaker": {"active": _safe_attr("_circuit_active", False), "threshold": C.get("DAILY_DRAWDOWN_LIMIT", -0.05)},
             "capital_protection": {"floor": C.get("TOTAL_CAPITAL", 10_000_000) * C.get("CAPITAL_FLOOR_RATIO", 0.70), "ok": True},
@@ -311,6 +320,7 @@ def _create_app():
             "atr_stop": {"interval": "1분", "active": True},
             "trailing": {"active_count": sum(1 for v in positions.values() if v.get("trail_active")), "threshold": C.get("TRAIL_ACTIVATE", 0.07)},
             "monthly_optimization": {"next_date": last_fri.isoformat(), "days_left": (last_fri - today).days},
+            "econ_event": {"today": _econ_today_def, "tomorrow": _econ_tomorrow_def},
         }
 
     @app.route("/api/sell_opinion/<ticker>")
@@ -331,7 +341,9 @@ def _create_app():
                 edge = rt.calculate_edge_v27(df, kind_adj, ticker)
             atr = rt.calc_atr(df) if df is not None else cp * 0.02
             dyn_sl = rt.calc_dynamic_sl(atr, cp, ticker, _safe_attr("regime", "SIDE"))
-            hold_days = int(info.get("hold_days", 0))
+            _entry_d  = info.get("entry_date", "")
+            hold_days = ((date.today() - date.fromisoformat(_entry_d)).days
+                         if _entry_d else 0)
             trail = bool(info.get("trail_active", False))
             reasons = []
             action = "보유유지"

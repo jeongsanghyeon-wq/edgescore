@@ -1,5 +1,5 @@
 """
-Edge Score v39.5 — 완전 통합 엔진
+Edge Score v39.7 — 완전 통합 엔진
 =====================================================
 v37.1 패치:
 
@@ -67,7 +67,7 @@ v36.0 기능 전체 유지. 원래 v34 → v36 변경사항:
                  requests schedule beautifulsoup4
 """
 
-import json, time, logging, hashlib, threading, sqlite3
+import json, time, logging, hashlib, threading, sqlite3, re
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -171,6 +171,7 @@ DEFAULT_CONFIG = {
     # ── ATR 손절 ──────────────────────────────
     "ATR_MULT_LARGE": 1.2,
     "ATR_MULT_SMALL": 2.0,
+    "ATR_MULT_TECH":  1.5,   # 기술대형주·기타 ATR 배수 (BT ATR_MULT_BY_CLUSTER 동일)
     "ATR_BEAR_MULT":  0.8,
 
     # ── 트레일링 스탑 ─────────────────────────
@@ -250,6 +251,10 @@ DEFAULT_CONFIG = {
     # ── 네트워크 체크 ─────────────────────────
     "NET_CHECK_URL":      "https://api.telegram.org",
     "NET_CHECK_INTERVAL": 60,   # 초
+
+    # ── 경제 이벤트 (매수 제한 날짜 목록) ──────
+    # 형식: ["2025-01-15", "2025-01-29", ...] — FOMC·CPI·금통위 등 주요 발표일
+    "ECON_EVENTS_2025_2026": [],
 }
 
 _ENV_ONLY_KEYS = {"TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"}  # .env 전용 — config.json 불저장
@@ -1518,15 +1523,17 @@ def get_cluster_name(ticker: str) -> str:
 #       ATR_MULT_LARGE/SMALL이 반영되지 않고 기동 당시 값으로 계속 동작
 # 수정: 호출 시마다 C.get()으로 읽음 → 런타임 config 변경 즉시 반영
 def get_atr_mult_rt(cluster: str) -> float:
-    """클러스터별 ATR 배수 반환 — config 변경 즉시 반영 (동적)"""
+    """클러스터별 ATR 배수 반환 — config 변경 즉시 반영 (동적)
+    기술대형주/기타: ATR_MULT_TECH (기본값 1.5, BT ATR_MULT_BY_CLUSTER와 동일)
+    """
     _map = {
         "대형가치주":   C.get("ATR_MULT_LARGE", 1.2),
         "금융주":       C.get("ATR_MULT_LARGE", 1.2),
         "중소형성장주": C.get("ATR_MULT_SMALL", 2.0),
-        "기술대형주":   1.5,  # BT ATR_MULT_BY_CLUSTER["기술대형주"]=1.5와 일치
-        "기타":         1.5,  # BT ATR_MULT_BY_CLUSTER["기타"]=1.5와 일치
+        "기술대형주":   C.get("ATR_MULT_TECH",  1.5),  # config 동적 반영
+        "기타":         C.get("ATR_MULT_TECH",  1.5),  # BT 기본값 1.5
     }
-    return _map.get(cluster, 1.5)
+    return _map.get(cluster, C.get("ATR_MULT_TECH", 1.5))
 
 def calc_dynamic_sl(atr: float, price: float,
                     ticker: str, regime: str) -> float:
@@ -1695,8 +1702,8 @@ def update_trailing(pos: dict, cp: float,
     # 클러스터별 트레일링 ATR 배수 적용 (백테스트 TRAIL_ATR_MULT 동일)
     ticker   = pos.get("ticker", "")
     mult     = get_trail_atr_mult(ticker)
-    if peak_ret >= C["TRAIL_TIGHTEN_RET"]: mult *= C["TRAIL_TIGHTEN_MULT"]
-    if regime  == "BEAR":                  mult *= C["TRAIL_BEAR_MULT"]
+    if peak_ret >= C.get("TRAIL_TIGHTEN_RET", 0.25): mult *= C.get("TRAIL_TIGHTEN_MULT", 0.7)
+    if regime  == "BEAR":                            mult *= C.get("TRAIL_BEAR_MULT",    0.8)
 
     atr_ratio          = atr / pos["peak_price"] if pos["peak_price"] > 0 else 0.02
     gap                = pos["peak_price"] * atr_ratio * mult
@@ -1825,7 +1832,7 @@ def load_trade_log() -> list:
 def _db_init():
     """SQLite trade_history.db 테이블 초기화 (없으면 생성)"""
     try:
-        con = sqlite3.connect(TRADE_DB_FILE)
+        con = sqlite3.connect(TRADE_DB_FILE, check_same_thread=False)
         con.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1869,7 +1876,7 @@ def _db_insert(entry: dict):
             _price = float(entry.get("exit_price") or entry.get("sell_price") or 0)
         else:
             _price = float(entry.get("buy_price") or 0)
-        con = sqlite3.connect(TRADE_DB_FILE)
+        con = sqlite3.connect(TRADE_DB_FILE, check_same_thread=False)
         # mode 결정: entry에 명시 → kiwoom 상태 → 'unknown'
         _mode = entry.get("mode", None)
         if _mode is None:
@@ -1901,7 +1908,7 @@ def _db_insert(entry: dict):
 def db_query_today() -> list:
     """오늘 체결 내역 조회 (list of dict)"""
     try:
-        con = sqlite3.connect(TRADE_DB_FILE)
+        con = sqlite3.connect(TRADE_DB_FILE, check_same_thread=False)
         con.row_factory = sqlite3.Row
         cur = con.execute(
             "SELECT * FROM trades WHERE date = ? ORDER BY id",
@@ -1919,7 +1926,7 @@ def db_daily_summary(target_date: str = None) -> dict:
     if target_date is None:
         target_date = str(date.today())
     try:
-        con = sqlite3.connect(TRADE_DB_FILE)
+        con = sqlite3.connect(TRADE_DB_FILE, check_same_thread=False)
         con.row_factory = sqlite3.Row
         rows = [dict(r) for r in con.execute(
             "SELECT * FROM trades WHERE date = ?", (target_date,)
@@ -2914,9 +2921,13 @@ class TelegramCommander:
             sell_shares = total_shares
             is_partial  = False
 
-        sell_amount = sell_price * sell_shares
+        sell_amount  = sell_price * sell_shares
+        _buy_amt_m   = buy_price * sell_shares
+        _sell_amt_m  = sell_price * sell_shares
+        _commission_m= (_buy_amt_m + _sell_amt_m) * COMMISSION_RATE
+        _tax_m       = _sell_amt_m * TAX_RATE
         ret  = (sell_price - buy_price) / buy_price if buy_price > 0 else 0
-        pnl  = (sell_price - buy_price) * sell_shares
+        pnl  = (_sell_amt_m - _buy_amt_m) - _commission_m - _tax_m  # 수수료·세금 반영
         pnl_icon = "✅" if pnl >= 0 else "🔴"
 
         _cluster_manual = get_cluster_name(ticker)
@@ -4222,6 +4233,17 @@ class EdgeMonitor:
                         )
                     else:
                         tg(f"⚠️ [{_mode}] 자동매도 실패: {_res.get('error','')}\n종목: {_name}")
+        # ── 포지션 삭제 및 저장 ─────────────────────────
+        self.positions.pop(ticker, None)
+        save_positions(self.positions)
+
+    # ── 보유 종목 체크 (1분, 장중) ──────────────────────
+    def check_holdings(self):
+        """보유 종목 손절·트레일링·익절·타임스탑 1분 체크"""
+        if not is_market_hour():
+            return
+        if not self.positions:
+            return
         alerts = []
         for ticker, info in list(self.positions.items()):
             name   = info.get("name", resolve_name(ticker))
@@ -4445,6 +4467,9 @@ class EdgeMonitor:
                     )
                     info["timestop_alerted"] = True
                     self._log_exit(ticker, info, cp, "타임스탑")
+                    continue  # 포지션 삭제됨 → 이하 처리 skip
+            if ticker not in self.positions:
+                continue      # 타임스탑으로 삭제된 경우
             if ret <= dyn_sl and not info.get("atr_alerted"):
                 pnl = (cp - buy_p) * shares
                 alerts.append(
@@ -4481,6 +4506,9 @@ class EdgeMonitor:
                        f"💡 연속 손절은 운이 나쁜 게 아니라\n"
                        f"   시장 흐름이 바뀌었다는 신호일 수 있어요")
                     self.today_alerts += 1
+                continue  # 포지션 삭제됨 → 이하 처리 skip
+            if ticker not in self.positions:
+                continue  # ATR손절로 삭제된 경우
             # ── 원칙2: 최대 보유일 경고 ──────────────────────────
             # FIX-3: 타임스탑 이미 발동된 종목은 MAX_HOLD 경고 skip (알림 중복 방지)
             _entry_d  = info.get("entry_date", "")
@@ -4671,7 +4699,13 @@ class EdgeMonitor:
         # STEP3: 경제이벤트 플래그 루프 밖 사전계산
         _econ_today_dt = date.today()
         _econ_list_cached = C.get("ECON_EVENTS_2025_2026", [])
-        _econ_today_flag = (_econ_today_dt.month, _econ_today_dt.day) in [tuple(e) for e in _econ_list_cached]
+        def __try_parse_date(s):
+            try: return date.fromisoformat(s)
+            except: return None
+        _econ_today_flag = _econ_today_dt in [
+            __d for __s in _econ_list_cached
+            for __d in [__try_parse_date(__s)] if __d
+        ]
         for ticker, name in self.universe.items():
             if ticker in held: continue
             if ticker in self.today_exited: continue   # ③ 재진입 차단
@@ -5567,9 +5601,12 @@ class EdgeMonitor:
             try:
                 log.info("🤖 자동 최적화 시작")
                 tg("🤖 <b>월간 자동 최적화 시작...</b>\n실거래 데이터를 분석하고 있어요")
-                opt_file = Path(__file__).parent / "edge_optimizer.py"
+                # opt.py(기본) 또는 edge_optimizer.py 중 존재하는 파일 사용
+                opt_file = Path(__file__).parent / "opt.py"
                 if not opt_file.exists():
-                    tg("❌ edge_optimizer.py 파일이 없어요\n같은 폴더에 놓아주세요")
+                    opt_file = Path(__file__).parent / "edge_optimizer.py"
+                if not opt_file.exists():
+                    tg("❌ opt.py 파일이 없어요\n같은 폴더에 놓아주세요")
                     return
                 import importlib.util
                 import sys as _sys
@@ -5634,6 +5671,7 @@ class EdgeMonitor:
     def morning_report(self):
         # ㊱ 서킷브레이커 매일 해제 + 해제 알림
         if getattr(self, '_circuit_active', False):
+            self._circuit_active = False   # ✅ 매일 아침 서킷브레이커 자동 해제
             tg("✅ <b>다시 정상 운영이에요!</b>\n"
                "━━━━━━━━━━━━━━━━━━\n"
                "어제는 보유 종목이 많이 떨어져서\n"
@@ -5687,8 +5725,12 @@ class EdgeMonitor:
         _today_mr = date.today()
         _tomorrow_mr = _today_mr + timedelta(days=1)
         _econ_mr = C.get("ECON_EVENTS_2025_2026", [])
-        _econ_today = (_today_mr.month, _today_mr.day) in [tuple(e) for e in _econ_mr]
-        _econ_tomorrow = (_tomorrow_mr.month, _tomorrow_mr.day) in [tuple(e) for e in _econ_mr]
+        def __try_parse_date(s):
+            try: return date.fromisoformat(s)
+            except: return None
+        _econ_dates = [__d for __s in _econ_mr for __d in [__try_parse_date(__s)] if __d]
+        _econ_today    = _today_mr    in _econ_dates
+        _econ_tomorrow = _tomorrow_mr in _econ_dates
         if _econ_today:
             tg("🔴 <b>오늘 중요한 경제 발표가 있어요!</b>\n"
                "━━━━━━━━━━━━━━━━━━\n"
@@ -5794,7 +5836,7 @@ class EdgeMonitor:
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  🚀 Edge Score v39.5 통합 엔진 가동")
+    log.info("  🚀 Edge Score v39.6 통합 엔진 가동")
     log.info("=" * 55)
     monitor = EdgeMonitor()
     monitor.update_regime()
@@ -5876,7 +5918,7 @@ if __name__ == "__main__":
     # ── 가동 메시지 최우선 발송 ──────────────────────────────────
     src_lines = "\n".join(f"  {s}" for s in data_status)
     tg(
-        f"🚀 <b>Edge Score v39.5 가동</b>\n"
+        f"🚀 <b>Edge Score v39.6 가동</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 <b>데이터 소스 진단</b>\n"
         f"{src_lines}\n"
@@ -5893,7 +5935,7 @@ if __name__ == "__main__":
         f"{_restart_flag}"
     )
     # ── 스케줄 ──────────────────────────────────
-    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.scan_universe)
+    schedule.every(C["HOLD_CHECK_MIN"]).minutes.do(monitor.check_holdings)
     schedule.every(C["SCAN_CHECK_MIN"]).minutes.do(monitor.scan_universe)
     schedule.every(30).minutes.do(monitor.update_regime)
     schedule.every(30).minutes.do(monitor.offhours_check)
