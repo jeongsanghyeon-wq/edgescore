@@ -832,6 +832,9 @@ class NetworkMonitor:
 # ══════════════════════════════════════════════════
 
 _ohlcv_cache: dict = {}
+# [BUG-FIX-C] trade_log.json read-modify-write 경쟁 조건 방지
+# check_holdings(메인 스케줄 스레드) + _do_buy/_do_sell(텔레그램 커맨더 스레드) 동시 호출 가능
+_trade_log_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
@@ -947,7 +950,10 @@ def fetch_kospi_top_by_volume_naver(pool_size: int = 60) -> dict:
 
 def get_ohlcv(ticker: str, days: int = 90):
     now    = time.time()
-    cached = _ohlcv_cache.get(ticker)
+    # [BUG-FIX-A] 캐시 키에 days 포함 — ticker만 사용 시 days=30/60/90이 서로 덮어쓰는 버그 수정
+    # check_holdings에서 동일 ticker에 days=30(ATR)과 days=60(Edge) 순차 호출 시 오염 방지
+    _cache_key = (ticker, int(days))
+    cached = _ohlcv_cache.get(_cache_key)
     # 장중 60초 / 장외 3600초(1시간) — 일봉은 하루에 한 번만 바뀜
     eff_ttl = 60 if is_market_hour() else 3600
     if cached and (now - cached["ts"]) < eff_ttl:
@@ -1075,7 +1081,7 @@ def get_ohlcv(ticker: str, days: int = 90):
             log.debug(f"yfinance [{ticker}]: {e}")
 
     if df is not None:
-        _ohlcv_cache[ticker] = {"df": df, "ts": now}
+        _ohlcv_cache[_cache_key] = {"df": df, "ts": now}
     return df
 
 # Edge 계산 결과 캐시
@@ -1096,7 +1102,9 @@ def _purge_edge_cache() -> int:
 def invalidate_cache(ticker: str = None):
     """ohlcv_cache 무효화. ticker 미지정 시 전체 삭제."""
     if ticker:
-        _ohlcv_cache.pop(ticker, None)
+        # [BUG-FIX-A] days별 복수 캐시 키 전체 삭제
+        for _k in [k for k in _ohlcv_cache if isinstance(k, tuple) and k[0] == ticker]:
+            _ohlcv_cache.pop(_k, None)
         _foreign_net_cache.pop(ticker, None)
         # 해당 ticker df의 edge_cache는 id 기반이라 자동 미스 처리됨
     else:
@@ -1994,17 +2002,17 @@ def db_daily_summary(target_date: str = None) -> dict:
         return {"buy_count": 0, "sell_count": 0, "total_pnl": 0, "win_rate": 0}
 
 def append_trade_log(entry: dict):
-    # [설계 의도] positions 저장 직후 기록 → 앱 재시작 시 포지션-로그 일관성 보장
-    # 키움 주문 실패 시 로그는 남지만 positions도 이미 업데이트된 상태이므로 허용
-    # JSON 백업
-    logs = load_trade_log()
-    logs.append(entry)
-    try:
-        with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
-    except Exception as e:
-        log.error(f"거래로그 저장 실패: {e}")
-    # SQLite 동시 기록
+    # [BUG-FIX-C] threading.Lock으로 read-modify-write 경쟁 조건 방지
+    # check_holdings(스케줄 스레드) + _do_buy/_do_sell(텔레그램 스레드) 동시 호출 시 로그 유실 방지
+    with _trade_log_lock:
+        logs = load_trade_log()
+        logs.append(entry)
+        try:
+            with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            log.error(f"거래로그 저장 실패: {e}")
+    # SQLite는 자체 락 보유 — Lock 밖에서 호출 (교착방지)
     _db_insert(entry)
 
 def calc_performance(logs: list = None) -> dict:
@@ -4304,8 +4312,9 @@ class EdgeMonitor:
         # invalidate_cache() 전체 삭제 대신 미사용 종목만 제거하여
         # 보유 종목 데이터는 유지 → 다음 check_holdings에서 API 재호출 불필요
         active_tickers = set(self.universe.keys()) | set(self.positions.keys())
+        # [BUG-FIX-A] 캐시 키가 (ticker, days) 튜플 형태 → ticker 추출 후 비교
         stale_ohlcv    = [tk for tk in list(_ohlcv_cache.keys())
-                          if tk not in active_tickers]
+                          if (tk[0] if isinstance(tk, tuple) else tk) not in active_tickers]
         for tk in stale_ohlcv:
             _ohlcv_cache.pop(tk, None)
             _foreign_net_cache.pop(tk, None)  # 외국인 순매수 캐시도 함께 정리
@@ -5112,7 +5121,12 @@ class EdgeMonitor:
             # 장 외 시간 실시간 가격 조회 시 0원 반환 문제 방지
             # → ohlcv_cache 마지막 종가 우선 사용, 없으면 매수가로 표시
             cp = 0.0
-            cached = _ohlcv_cache.get(ticker)
+            # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (장외 종가 표시용)
+            cached = None
+            for _days_k in [90, 60, 30, 5]:
+                cached = _ohlcv_cache.get((ticker, _days_k))
+                if cached and cached["df"] is not None and len(cached["df"]) > 0:
+                    break
             if cached and cached["df"] is not None and len(cached["df"]) > 0:
                 cp = float(cached["df"]["종가"].iloc[-1])
             if cp <= 0:
@@ -5251,7 +5265,12 @@ class EdgeMonitor:
                 name   = info.get("name", resolve_name(ticker))
                 buy_p  = float(info.get("buy_price", 0))
                 shares = int(info.get("shares", 0))
-                cached = _ohlcv_cache.get(ticker)
+                # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (장마감 리포트용)
+                cached = None
+                for _days_k in [90, 60, 30, 5]:
+                    cached = _ohlcv_cache.get((ticker, _days_k))
+                    if cached and cached.get("df") is not None and len(cached["df"]) > 0:
+                        break
                 cp = (float(cached["df"]["종가"].iloc[-1])
                       if cached and cached.get("df") is not None
                       and len(cached["df"]) > 0 else buy_p)
@@ -5959,7 +5978,12 @@ class EdgeMonitor:
                 shares = int(info.get("shares", 0))
                 df     = get_ohlcv(ticker, days=30)
                 cp_cached = 0.0
-                cached = _ohlcv_cache.get(ticker)
+                # [BUG-FIX-A] days 키별 캐시 중 가장 긴 days 우선 사용 (월간리포트 손절가용)
+                cached = None
+                for _days_k in [90, 60, 30, 5]:
+                    cached = _ohlcv_cache.get((ticker, _days_k))
+                    if cached and cached.get("df") is not None and len(cached["df"]) > 0:
+                        break
                 if cached and cached["df"] is not None:
                     cp_cached = float(cached["df"]["종가"].iloc[-1])
                 cp = cp_cached if cp_cached > 0 else buy_p
@@ -6093,8 +6117,13 @@ if __name__ == "__main__":
     # ⑧ 웹 대시보드 API 서버 (선택적 — Flask 설치 시 활성)
     try:
         from dashboard_api import start_dashboard
+        import sys as _sys_dash
         _dash_port = C.get("DASHBOARD_PORT", 5000)
-        start_dashboard(monitor, port=_dash_port)
+        # [BUG-FIX-B] importlib.import_module("rt") 이중 로드 방지
+        # python rt.py 실행 시 sys.modules["__main__"]이 rt 본체
+        # → 실행 중인 모듈을 직접 전달해 C/캐시/kiwoom 싱글턴 분리 방지
+        _rt_self = _sys_dash.modules.get("rt") or _sys_dash.modules["__main__"]
+        start_dashboard(monitor, rt_module=_rt_self, port=_dash_port)
     except ImportError:
         log.info("ℹ️ 대시보드 비활성 (flask 미설치 — pip install flask flask-cors)")
     # ── 재시작 감지 ────────────────────────────────────────────

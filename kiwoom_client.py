@@ -261,10 +261,13 @@ class KiwoomClient:
 
     @staticmethod
     def calc_qty(budget: int, price: int) -> int:
-        """예산/가격으로 매수 수량 계산"""
+        """예산/가격으로 매수 수량 계산
+        [BUG-FIX-E] 예산 부족 시 0주 반환 (이전: max(1,...) → 초과 주문 유도 위험)
+        예) budget=50,000 price=80,000 → 이전: 1주, 수정 후: 0주
+        """
         if price <= 0:
             return 0
-        return max(1, budget // price)
+        return max(0, int(budget // price))
 
     # ══════════════════════════════════════════════════════════
     # ⑨ 일봉 조회  ka10081 → /api/dostk/chart

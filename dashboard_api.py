@@ -99,24 +99,33 @@ def _safe_attr(attr, default=None):
             return default
 
 
-def start_dashboard(monitor, port=5000):
+def start_dashboard(monitor, rt_module=None, port=5000):
     global _monitor, _rt_module
     _monitor = monitor
     if not FLASK_OK:
         log.warning("⚠️ Flask 미설치 — 대시보드 비활성. pip install flask flask-cors")
         return
-    import importlib
-    try:
-        _rt_module = importlib.import_module("rt")
-    except Exception as e:
-        log.error(f"rt 모듈 import 실패: {e}")
-        return
+    # [BUG-FIX-B] importlib.import_module("rt") 이중 로드 방지
+    # python rt.py 실행 시 "rt"와 "__main__"이 별개 모듈 → C/캐시/kiwoom 싱글턴 분리 위험
+    # rt.py에서 sys.modules["__main__"]을 직접 전달받아 동일 인스턴스 공유
+    if rt_module is not None:
+        _rt_module = rt_module
+    else:
+        # 폴백: 직접 import 시도 (단독 실행 또는 테스트 목적)
+        import importlib, sys as _sys
+        _rt_module = _sys.modules.get("rt") or _sys.modules.get("__main__")
+        if _rt_module is None:
+            try:
+                _rt_module = importlib.import_module("rt")
+            except Exception as e:
+                log.error(f"rt 모듈 로드 실패: {e}")
+                return
     app = _create_app()
     t = threading.Thread(target=lambda: app.run(
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API v1.9 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API v1.9.2 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -126,7 +135,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "v1.9.1",
+        return jsonify({"status": "ok", "version": "v1.9.2",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
@@ -201,7 +210,10 @@ def _create_app():
                 "total_ret": round((total_eval - total_inv) / total_inv, 4) if total_inv > 0 else 0,
                 "capital": capital, "floor": floor,
                 "floor_remaining": round(max(0, total_eval - floor)),
-                "available_cash": round(max(0, capital - total_eval)),   # [BUG-FIX] Dashboard 가용현금 표시용
+                # [BUG-FIX-D] available_cash: 이론적 추정값 (capital - total_eval)
+                # 실제 주문가능예수금은 미체결/수수료/세금 반영으로 다를 수 있음
+                # → Dashboard에서 account.deposit(실제 예수금)과 나란히 표시 권장
+                "available_cash": round(max(0, capital - total_eval)),   # 이론적 여유자금 (추정)
                 "count": len(holdings),
                 "trail_active_count": sum(1 for h in holdings if h["trail_active"]),
             }
