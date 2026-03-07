@@ -3760,6 +3760,12 @@ class TelegramCommander:
                         "_is_partial": is_partial,
                         "_total_shares": total_shares,
                     }
+                    # [36차-FIX] 주문 접수 성공 → positions에 pending_sell=True 영속 저장
+                    # 재시작 시 _recover_pending_on_startup이 이 마커를 보고 매도 복구 수행
+                    with _positions_lock:
+                        if ticker in self.monitor.positions:
+                            self.monitor.positions[ticker]["pending_sell"] = True
+                            save_positions(self.monitor.positions)
                     _sell_deferred = True
                     _notify_on_fill(
                         _res.get("order_no", ""), ticker, name,
@@ -5092,6 +5098,12 @@ class EdgeMonitor:
                             "_is_partial":  False,
                             "_total_shares": shares,
                         }
+                        # [36차-FIX] 주문 접수 성공 → positions에 pending_sell=True 영속 저장
+                        # 재시작 시 _recover_pending_on_startup이 이 마커로 매도 복구 수행
+                        with _positions_lock:
+                            if ticker in self.positions:
+                                self.positions[ticker]["pending_sell"] = True
+                                save_positions(self.positions)
                         _auto_sell_deferred = True
                         _notify_on_fill(
                             _res.get("order_no", ""), ticker, _name,
