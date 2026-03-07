@@ -2188,6 +2188,12 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     cntr_uv  = fill["cntr_uv"]
                     cntr_tm  = fill.get("cntr_tm", "")
                     amount   = cntr_qty * cntr_uv
+                    # [BUG-FIX] 부분체결 vs 전량체결 구분
+                    # is_final=False → 부분체결 진행 중 → 계속 폴링, 확정 금지
+                    if not fill.get("is_final", True):
+                        _rem = fill.get("remaining_qty", 0)
+                        log.info(f"[부분체결] {ticker} {_action} {cntr_qty}주 체결, 잔량 {_rem}주 — 계속 대기")
+                        continue
 
                     if action == "buy":
                         # [BUG-FIX] 실체결 기준 positions 최종 확정 — 추가매수 평균단가 재계산 포함

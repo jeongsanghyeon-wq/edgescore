@@ -357,13 +357,23 @@ class KiwoomClient:
             if str(o.get("ord_no", "")).strip().lstrip("0") == str(order_no).strip().lstrip("0"):
                 cntr_qty = int(str(o.get("cntr_qty", "0")).replace(",", "") or "0")
                 cntr_uv  = int(str(o.get("cntr_uv",  "0")).replace(",", "") or "0")
+                # ord_qty: 원래 주문수량 (API 필드명 ord_qty)
+                ord_qty  = int(str(o.get("ord_qty",  "0")).replace(",", "") or "0")
+                remaining = max(0, ord_qty - cntr_qty) if ord_qty > 0 else 0
+                # [BUG-FIX] is_final: 주문 전량 체결 완료 여부
+                # cntr_qty > 0이어도 부분체결일 수 있음 → ord_qty와 비교
+                is_final = (cntr_qty > 0) and (ord_qty <= 0 or cntr_qty >= ord_qty)
                 return {
-                    "filled":   cntr_qty > 0,
-                    "cntr_qty": cntr_qty,
-                    "cntr_uv":  cntr_uv,
-                    "cntr_tm":  o.get("cntr_tm", ""),
+                    "filled":        cntr_qty > 0,   # 부분체결 포함 "체결 있음"
+                    "is_final":      is_final,        # 전량 체결 완료 여부
+                    "cntr_qty":      cntr_qty,        # 누적 체결수량
+                    "cntr_uv":       cntr_uv,         # 체결단가
+                    "cntr_tm":       o.get("cntr_tm", ""),
+                    "ord_qty":       ord_qty,         # 주문수량
+                    "remaining_qty": remaining,       # 미체결 잔량
                 }
-        return {"filled": False, "cntr_qty": 0, "cntr_uv": 0}
+        return {"filled": False, "is_final": False, "cntr_qty": 0, "cntr_uv": 0,
+                "ord_qty": 0, "remaining_qty": 0}
 
     def test_connection(self) -> bool:
         ok = self._issue_token()
