@@ -2141,13 +2141,17 @@ def save_universe(univ: dict):
 def _notify_on_fill(order_no: str, ticker: str, name: str,
                     action: str, qty: int, price: int,
                     buy_price: float = 0.0,
-                    reason: str = ""):
+                    reason: str = "",
+                    monitor=None):
     """
     백그라운드에서 체결 확인 후 텔레그램 알림 발송
     action: 'buy' or 'sell'
     buy_price: 매도 시 손익 계산용 매수단가
+    monitor: positions 롤백용 Monitor 참조 (매수 미체결 시 사용)
     최대 60초간 3초 간격으로 폴링
     """
+    # [BUG-FIX-②] monitor 참조를 함수 속성으로 저장 → _wait_and_notify 클로저에서 접근
+    _notify_on_fill._monitor_ref = monitor
     def _wait_and_notify():
         kw = kiwoom()
         if not kw:
@@ -2167,6 +2171,12 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                     amount   = cntr_qty * cntr_uv
 
                     if action == "buy":
+                        # [BUG-FIX-②] 체결 확인 → pending 플래그 해제
+                        _mon = getattr(_notify_on_fill, "_monitor_ref", None)
+                        if _mon and hasattr(_mon, "positions") and                            ticker in _mon.positions:
+                            with _positions_lock:
+                                _mon.positions[ticker].pop("pending", None)
+                                save_positions(_mon.positions)
                         msg = (
                             f"{_icon} <b>[{_mode}] 매수 체결 완료!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -2197,12 +2207,36 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
             except Exception as e:
                 log.warning(f"[키움] 체결 확인 오류: {e}")
 
-        # 60초 후에도 미체결 → 미체결 알림
-        tg(
-            f"⚠️ <b>[{_mode}] {_action} 미체결</b>\n"
-            f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
-            f"직접 확인이 필요해요."
-        )
+        # [BUG-FIX-②] 60초 후에도 미체결 → 매수 시 pending 포지션 자동 롤백
+        if action == "buy":
+            # 매수 미체결: positions에서 제거하여 허위 포지션 방지
+            _monitor = getattr(_notify_on_fill, "_monitor_ref", None)
+            if _monitor and hasattr(_monitor, "positions"):
+                with _positions_lock:
+                    if ticker in _monitor.positions and                        _monitor.positions[ticker].get("pending"):
+                        _monitor.positions.pop(ticker, None)
+                        save_positions(_monitor.positions)
+                        log.warning(f"[미체결롤백] {name}({ticker}) 60초 미체결 → positions 자동 제거")
+                        tg(
+                            f"⚠️ <b>[{_mode}] 매수 미체결 — 포지션 자동 취소</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 종목: {name} ({ticker})\n"
+                            f"주문번호: {order_no}\n\n"
+                            f"60초 내 체결이 확인되지 않아 내부 포지션을 취소했어요.\n"
+                            f"키움에서 실제 주문 상태를 확인해주세요."
+                        )
+                        return
+            tg(
+                f"⚠️ <b>[{_mode}] 매수 미체결</b>\n"
+                f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
+                f"직접 확인이 필요해요."
+            )
+        else:
+            tg(
+                f"⚠️ <b>[{_mode}] 매도 미체결</b>\n"
+                f"종목: {name} ({ticker}) | 주문번호: {order_no}\n"
+                f"직접 확인이 필요해요."
+            )
 
     threading.Thread(target=_wait_and_notify, daemon=True).start()
 
@@ -2899,11 +2933,15 @@ class TelegramCommander:
                 _res  = kw.buy(ticker, shares, buy_price, order_type="0")
                 if _res.get("success"):
                     _order_sent = True
+                    # [BUG-FIX-②] pending=True: 체결 확인 전 임시 상태 표시
+                    # _notify_on_fill이 체결 확인 후 제거 or 롤백
+                    _new_position["pending"] = True
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
-                    _notify_on_fill(
+                    _nof = _notify_on_fill(
                         _res.get("order_no", ""), ticker, name,
-                        action="buy", qty=shares, price=buy_price
+                        action="buy", qty=shares, price=buy_price,
+                        monitor=self.monitor
                     )
                 else:
                     tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
@@ -4466,10 +4504,12 @@ class EdgeMonitor:
         })
         self.today_exited.add(ticker)   # ③ 당일 재진입 차단
         # ── 포지션 삭제 및 저장 ─────────────────────────
-        # [TOP7-⑦] positions 락 — check_holdings와 동시 접근 직렬화
-        with _positions_lock:
-            self.positions.pop(ticker, None)
-            save_positions(self.positions)
+        # [BUG-FIX-①] _log_exit 내부 _positions_lock 제거 — 데드락 방지
+        # check_holdings()가 이미 with _positions_lock: 안에서 _log_exit()를 호출하므로
+        # _log_exit 내부에서 다시 같은 락을 잡으면 threading.Lock 재진입 불가 → 영구 블로킹
+        # _do_sell/_do_buy(텔레그램 스레드)는 _log_exit를 직접 호출하지 않으므로 락 불필요
+        self.positions.pop(ticker, None)
+        save_positions(self.positions)
 
     # ── 보유 종목 체크 (1분, 장중) ──────────────────────
     def check_holdings(self):
@@ -4489,6 +4529,10 @@ class EdgeMonitor:
         # [TOP7-⑦] positions 락 — 텔레그램 수동매도와 동시 접근 시 이중 매도 방지
         with _positions_lock:
          for ticker, info in list(self.positions.items()):
+            # [BUG-FIX-②] pending 포지션 스킵 — 체결 확인 중인 종목은 판단 제외
+            if info.get("pending"):
+                log.debug(f"[pending스킵] {ticker} 체결 확인 중 — check_holdings 스킵")
+                continue
             name   = info.get("name", resolve_name(ticker))
             df     = get_ohlcv(ticker, days=30)
             cp     = get_current_price(ticker)
@@ -5455,9 +5499,11 @@ class EdgeMonitor:
         try:
             kw = kiwoom()
             if kw and self.positions:
-                _bal = kw.get_balance()   # [{ticker, name, shares, ...}, ...]
+                _bal = kw.get_balance()   # [{ticker, name, qty, ...}, ...]
                 if _bal:
-                    _real = {b["ticker"]: int(b.get("shares", 0)) for b in _bal
+                    # [BUG-FIX-③] get_balance()는 "qty" 키 반환 (shares 아님)
+                    # kiwoom_client.py:246 → "qty": abs(_int(h.get("rmnd_qty", 0)))
+                    _real = {b["ticker"]: int(b.get("qty", 0)) for b in _bal
                              if b.get("ticker")}
                     _internal = {tk: int(info.get("shares", 0))
                                  for tk, info in self.positions.items()}
