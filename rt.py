@@ -3033,24 +3033,22 @@ class TelegramCommander:
         pnl_icon = "✅" if pnl >= 0 else "🔴"
 
         _cluster_manual = get_cluster_name(ticker)
-        append_trade_log({
-            "action": "sell", "ticker": ticker, "name": name,
-            "buy_price": buy_price, "sell_price": sell_price,
-            "shares": sell_shares, "amount": buy_price * sell_shares,
-            "date": str(date.today()),       # api_performance equity_curve용
-            "entry_date": entry_date, "exit_date": str(date.today()),
-            "exit_price": sell_price, "hold_days": hold_days,
-            "ret": round(ret, 4), "pnl": round(pnl, 0),
-            "reason": "일부청산" if is_partial else "수동청산",
-            "regime": self.monitor.regime,
-            "edge_at_exit": pos.get("last_edge", 0),
-            "cluster":       _cluster_manual,
-            # [Fix-BUG-1] atr_mult_orig 추가 (수동청산도 OPT 분석 대상)
-            "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
-            "carry_over":   False,
-        })
 
-        # ── 키움 실주문 + 체결 대기 알림 ────────────────────
+        # ── [MEDIUM-1 FIX] 지정가 미체결 리스크 경고 ────────────────
+        _cp_now = get_current_price(ticker)
+        if _cp_now > 0 and sell_price < _cp_now * 0.97:
+            tg(
+                f"⚠️ <b>지정가 미체결 주의</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"입력 매도가 <b>{sell_price:,.0f}원</b>이\n"
+                f"현재가({_cp_now:,.0f}원)보다 {(_cp_now - sell_price) / _cp_now:.1%} 낮아요.\n\n"
+                f"주가가 계속 하락 중이면 체결이 안 될 수 있어요.\n"
+                f"시장가 매도를 원하면 현재가로 다시 입력해주세요.\n"
+                f"현재가: <code>{ticker} {int(_cp_now)}</code>"
+            )
+
+        # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
+        _kw_order_ok = True
         if not EMERGENCY_STOP:
             kw = kiwoom()
             if kw:
@@ -3065,8 +3063,36 @@ class TelegramCommander:
                         buy_price=buy_price
                     )
                 else:
-                    tg(f"⚠️ [{_mode}] 매도주문 실패: {_res.get('error','')}\n종목: {name}")
-        # ─────────────────────────────────────────────────────
+                    _kw_order_ok = False
+                    tg_btn(
+                        f"🚨 <b>[{_mode}] 매도주문 실패!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"종목: {name} | 오류: {_res.get('error','')}\n\n"
+                        f"⚠️ <b>포지션이 유지됩니다.</b>\n"
+                        f"다시 시도해주세요.",
+                        [[{"text": "💸 다시 매도", "callback_data": "sell_start"},
+                          {"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
+                    )
+
+        if not _kw_order_ok:
+            return   # 주문 실패 → 포지션·trade_log 모두 유지
+
+        # ── 주문 성공(또는 키움 미연결) → 기록·삭제 ─────────
+        append_trade_log({
+            "action": "sell", "ticker": ticker, "name": name,
+            "buy_price": buy_price, "sell_price": sell_price,
+            "shares": sell_shares, "amount": buy_price * sell_shares,
+            "date": str(date.today()),       # api_performance equity_curve용
+            "entry_date": entry_date, "exit_date": str(date.today()),
+            "exit_price": sell_price, "hold_days": hold_days,
+            "ret": round(ret, 4), "pnl": round(pnl, 0),
+            "reason": "일부청산" if is_partial else "수동청산",
+            "regime": self.monitor.regime,
+            "edge_at_exit": pos.get("last_edge", 0),
+            "cluster":       _cluster_manual,
+            "atr_mult_orig": get_atr_mult_rt(_cluster_manual),
+            "carry_over":   False,
+        })
 
         if is_partial:
             remain = total_shares - sell_shares
@@ -4291,10 +4317,50 @@ class EdgeMonitor:
         pnl        = (_sell_amt - _buy_amt) - _commission - _tax
         ret        = pnl / _buy_amt if _buy_amt > 0 else 0
         _cluster_name = get_cluster_name(ticker)
+        _name         = info.get("name", ticker)
+
+        # ── [CRITICAL-1/2 FIX] 키움 주문 먼저 → 성공 시에만 기록·삭제 ──
+        # 키움 미연결(kw=None)이면 True로 유지 → 모의/오프라인 모드 기존 동작 유지
+        _kw_order_ok = True
+        if not EMERGENCY_STOP:
+            kw = kiwoom()
+            if kw:
+                _mode = "모의" if kw._mock else "실계좌"
+                _bp   = float(info.get("buy_price", 0))
+                _ret  = (exit_price - _bp) / _bp if _bp > 0 else 0
+                if shares > 0:
+                    _res = kw.sell(ticker, shares, exit_price, order_type="3")  # 시장가
+                    if _res.get("success"):
+                        _dash_alert(
+                            f"자동매도 접수: {_name} | {reason} | {_ret:+.2%}",
+                            kind="sell", ticker=ticker
+                        )
+                        tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
+                        _notify_on_fill(
+                            _res.get("order_no", ""), ticker, _name,
+                            action="sell", qty=shares, price=exit_price,
+                            buy_price=_bp, reason=reason
+                        )
+                    else:
+                        _kw_order_ok = False
+                        tg(
+                            f"🚨 <b>[{_mode}] 자동매도 주문 실패!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"종목: {_name} | 사유: {reason}\n"
+                            f"오류: {_res.get('error','')}\n\n"
+                            f"⚠️ <b>포지션이 유지됩니다.</b>\n"
+                            f"다음 1분 체크에서 자동 재시도합니다.\n"
+                            f"지속 실패 시 수동으로 매도해주세요."
+                        )
+
+        if not _kw_order_ok:
+            return   # 주문 실패 → 포지션·trade_log 모두 유지, 다음 체크에서 재시도
+
+        # ── 주문 성공(또는 키움 미연결) → 기록·삭제 ─────────
         append_trade_log({
             "action":     "sell",
             "ticker":     ticker,
-            "name":       info.get("name", ticker),
+            "name":       _name,
             "buy_price":  buy_price,
             "sell_price": exit_price,
             "shares":     shares,
@@ -4315,32 +4381,6 @@ class EdgeMonitor:
             "trail_active": bool(info.get("trail_active", False)),
         })
         self.today_exited.add(ticker)   # ③ 당일 재진입 차단
-
-        # ── 키움 자동 실주문 + 체결 대기 알림 ───────────────
-        if not EMERGENCY_STOP:
-            kw = kiwoom()
-            if kw:
-                _mode   = "모의" if kw._mock else "실계좌"
-                _shares = int(info.get("shares", 0))
-                _bp     = float(info.get("buy_price", 0))
-                _pnl    = (exit_price - _bp) * _shares if _bp > 0 else 0
-                _ret    = (exit_price - _bp) / _bp if _bp > 0 else 0
-                _name   = info.get("name", ticker)
-                if _shares > 0:
-                    _res = kw.sell(ticker, _shares, exit_price, order_type="3")  # 시장가
-                    if _res.get("success"):
-                        _dash_alert(
-                            f"자동매도 접수: {_name} | {reason} | {_ret:+.2%}",
-                            kind="sell", ticker=ticker
-                        )
-                        tg(f"📨 [{_mode}] 자동매도 접수 → 체결 대기 중...\n종목: {_name} | {reason}")
-                        _notify_on_fill(
-                            _res.get("order_no", ""), ticker, _name,
-                            action="sell", qty=_shares, price=exit_price,
-                            buy_price=_bp, reason=reason
-                        )
-                    else:
-                        tg(f"⚠️ [{_mode}] 자동매도 실패: {_res.get('error','')}\n종목: {_name}")
         # ── 포지션 삭제 및 저장 ─────────────────────────
         self.positions.pop(ticker, None)
         save_positions(self.positions)
