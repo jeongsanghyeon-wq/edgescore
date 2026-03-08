@@ -524,7 +524,7 @@ def build_kospi200_universe():
 build_yearly_kospi200()                          # ㊸ 연도별 유니버스 먼저 빌드
 TICKERS, _built_sector_map = build_kospi200_universe()
 SECTOR_MAP.update(_built_sector_map)  # ㊷ 동적 섹터맵 반영
-TOP_TICKERS_MEDVOL = list(TICKERS.values())[:10]
+TOP_TICKERS_MEDVOL = list(TICKERS.values())[:50]
 
 def get_cluster_params(ticker):
     for name, p in CLUSTER_PARAMS.items():
@@ -1158,7 +1158,7 @@ def calc_med_vol(mkt, w=5):
         vd = {}
         sd = pd.Timestamp(START_DATE).strftime("%Y-%m-%d")
         ed = pd.Timestamp(END_DATE).strftime("%Y-%m-%d")
-        for tk in TOP_TICKERS_MEDVOL[:5]:   # 5개로 축소 (속도)
+        for tk in TOP_TICKERS_MEDVOL[:50]:  # 50종목
             try:
                 tmp = yf.download(f"{tk}.KS", start=sd, end=ed,
                                   auto_adjust=True, progress=False)

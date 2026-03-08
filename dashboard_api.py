@@ -88,18 +88,21 @@ def _safe_attr(attr, default=None):
             return default
 
 
-def start_dashboard(monitor, port=5000):
+def start_dashboard(monitor, rt_module=None, port=5000):
     global _monitor, _rt_module
     _monitor = monitor
+    if rt_module is not None:
+        _rt_module = rt_module
     if not FLASK_OK:
         log.warning("⚠️ Flask 미설치 — 대시보드 비활성. pip install flask flask-cors")
         return
-    import importlib
-    try:
-        _rt_module = importlib.import_module("rt")
-    except Exception as e:
-        log.error(f"rt 모듈 import 실패: {e}")
-        return
+    if _rt_module is None:
+        import importlib
+        try:
+            _rt_module = importlib.import_module("rt")
+        except Exception as e:
+            log.error(f"rt 모듈 import 실패: {e}")
+            return
     app = _create_app()
     t = threading.Thread(target=lambda: app.run(
         host="0.0.0.0", port=port, debug=False, use_reloader=False
@@ -872,7 +875,8 @@ def _create_app():
 
     @app.route("/api/bt/apply", methods=["POST"])
     def api_bt_apply():
-        """백테스트 파라미터를 rt.py 설정에 적용 (런타임 즉시 반영)"""
+        """백테스트 파라미터를 rt.py 런타임 + 소스 파일 동시 적용"""
+        import re
         try:
             rt = _rt_module
             if not rt:
@@ -882,22 +886,44 @@ def _create_app():
             slip = body.get("slip")
             pos  = body.get("pos")
 
-            if not hasattr(rt, "C"):
-                return jsonify({"ok": False, "error": "rt.C 없음"}), 500
-
             changed = {}
-            if slip is not None:
-                rt.C["SLIPPAGE_FILTER_RATIO"] = float(slip)
-                changed["SLIPPAGE_FILTER_RATIO"] = float(slip)
-            if pos is not None:
-                rt.C["MAX_POSITION_RATIO"] = float(pos)
-                changed["MAX_POSITION_RATIO"] = float(pos)
+
+            # ① 런타임 즉시 반영
+            if hasattr(rt, "C"):
+                if slip is not None:
+                    rt.C["SLIPPAGE_FILTER_RATIO"] = float(slip)
+                    changed["SLIPPAGE_FILTER_RATIO"] = float(slip)
+                if pos is not None:
+                    rt.C["MAX_POSITION_RATIO"] = float(pos)
+                    changed["MAX_POSITION_RATIO"] = float(pos)
+
+            # ② rt.py 소스 파일 직접 패치
+            rt_path = Path(rt.__file__) if rt else None
+            if rt_path and rt_path.exists():
+                src = rt_path.read_text(encoding="utf-8")
+                original = src
+                if slip is not None:
+                    src = re.sub(
+                        r'(SLIPPAGE_FILTER_RATIO\s*=\s*)[0-9.]+',
+                        r'\g<1>' + str(float(slip)),
+                        src
+                    )
+                if pos is not None:
+                    src = re.sub(
+                        r'(MAX_POSITION_RATIO\s*=\s*)[0-9.]+',
+                        r'\g<1>' + str(float(pos)),
+                        src
+                    )
+                if src != original:
+                    rt_path.write_text(src, encoding="utf-8")
+                    changed["source_patched"] = str(rt_path)
+                    log.info(f"[bt_apply] rt.py 소스 패치 완료: {changed}")
 
             if changed:
-                log.info(f"[bt_apply] 파라미터 적용: {changed}")
-                return jsonify({"ok": True, "applied": changed})
+                return jsonify({"ok": True, "applied": changed, "msg": "런타임 + 소스 파일 동시 적용 완료"})
             return jsonify({"ok": False, "error": "적용할 파라미터 없음"})
         except Exception as e:
+            log.error(f"[bt_apply] 오류: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/opt/run", methods=["POST"])
