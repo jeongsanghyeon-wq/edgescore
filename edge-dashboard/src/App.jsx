@@ -184,8 +184,10 @@ export default function Dashboard(){
     [def,setDef]=useState(null),[kospi,setKospi]=useState(null),[risk,setRisk]=useState(null),
     [market,setMarket]=useState(null),[sentiment,setSentiment]=useState(null),[system,setSystem]=useState(null),
     [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null),
-    [btParams,setBtParams]=useState({slip:2.0,pos:0.20,start:"20230101",end:"20260301"}),[btRunning,setBtRunning]=useState(false),[btResults,setBtResults]=useState([]),[btCurrent,setBtCurrent]=useState(null),[btError,setBtError]=useState(null),[btDownloading,setBtDownloading]=useState(false),[btElapsed,setBtElapsed]=useState(0),[btRunElapsed,setBtRunElapsed]=useState(0),
-    [todayTrades,setTodayTrades]=useState(null),[account,setAccount]=useState(null),[trades,setTrades]=useState([]);
+    [todayTrades,setTodayTrades]=useState(null),[account,setAccount]=useState(null),[trades,setTrades]=useState([]),
+    [btParams,setBtParams]=useState({slip:2.0,pos:0.20,start:"20230101",end:"20260301"}),
+    [btRunning,setBtRunning]=useState(false),[btResults,setBtResults]=useState([]),
+    [btCurrent,setBtCurrent]=useState(null),[btError,setBtError]=useState(null);
 
   const fetchBtResults=useCallback(async()=>{
     try{const r=await fetch(`${API}/api/bt/results`);const d=await r.json();setBtResults(d.results||[]);}catch{}
@@ -254,7 +256,7 @@ export default function Dashboard(){
 
     {/* ── 탭 (모바일: 스크롤) ── */}
     <div style={{display:"flex",borderBottom:"1px solid #1e293b",background:"#0f172a",overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
-      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"},{k:"trades",l:mobile?"📋":"📋 체결내역"},{k:"backtest",l:mobile?"🔬":"🔬 백테스트"}].map(t=>
+      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"},{k:"trades",l:mobile?"📋":"📋 체결내역"},{k:"backtest",l:mobile?"🧪":"🧪 백테스트"}].map(t=>
         <button key={t.k} onClick={()=>setTab(t.k)} style={{padding:mobile?"8px 12px":"9px 16px",background:tab===t.k?"#1e293b":"transparent",border:"none",borderBottom:tab===t.k?"2px solid #3b82f6":"2px solid transparent",color:tab===t.k?"#e2e8f0":"#64748b",cursor:"pointer",fontSize:mobile?12:11,fontWeight:600,fontFamily:"inherit",whiteSpace:"nowrap",minWidth:mobile?40:"auto"}}>{t.l}</button>)}
     </div>
 
@@ -406,7 +408,36 @@ export default function Dashboard(){
               :<div style={{color:"#64748b",textAlign:"center",padding:16}}>로딩...</div>}</div></div></>}
 
         {/* ═══ 시스템 ═══ */}
-        {tab==="system"&&system&&<><div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
+        {tab==="system"&&system&&<>
+
+          {/* ── ENGINE HALTED 배너 ── */}
+          {system.critical_halt&&<div style={{background:"#7f1d1d",border:"1px solid #ef4444",borderRadius:8,padding:"10px 14px",marginBottom:12,display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:18}}>🚨</span>
+            <div>
+              <div style={{fontWeight:700,color:"#fca5a5",fontSize:13}}>ENGINE HALTED — 신규 매수 차단 중</div>
+              <div style={{fontSize:10,color:"#fca5a5",marginTop:2}}>
+                {Object.entries(system.critical_counts||{}).filter(([,v])=>v>0).map(([k,v])=>`${k}: ${v}회 실패`).join("  /  ")||"오류 누적"}
+              </div>
+              <div style={{fontSize:10,color:"#fca5a5aa",marginTop:2}}>텔레그램에서 /비상정지해제 로 복구하세요</div>
+            </div>
+          </div>}
+
+          {/* ── RECONCILE 상태 카드 ── */}
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:"8px 12px",marginBottom:12,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>🔍 마지막 잔고 대사</span>
+            <span style={{fontSize:11,fontWeight:600,color:
+              system.last_reconcile?.status==="ok"?"#22c55e":
+              system.last_reconcile?.status==="issues"?"#f59e0b":
+              system.last_reconcile?.status==="error"?"#ef4444":"#64748b"}}>
+              {system.last_reconcile?.status==="ok"&&"✅ 전체 일치"}
+              {system.last_reconcile?.status==="issues"&&`⚠️ ${system.last_reconcile.issues}건 수정됨`}
+              {system.last_reconcile?.status==="error"&&"❌ 오류"}
+              {system.last_reconcile?.status==="unknown"&&"⏳ 미확인"}
+              {system.last_reconcile?.ts&&<span style={{color:"#475569",marginLeft:6,fontWeight:400}}>{system.last_reconcile.ts.slice(11,19)}</span>}
+            </span>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>📡 데이터 소스</div>
             {system.active_source&&<div style={{marginBottom:6,padding:"4px 8px",background:"#22c55e22",border:"1px solid #22c55e44",borderRadius:4,fontSize:10,color:"#22c55e"}}>🟢 현재 사용: <b>{system.active_source}</b></div>}
@@ -461,8 +492,7 @@ export default function Dashboard(){
           </table></div>}
         </>}
 
-
-        {/* ═══ 백테스트 ═══ */}
+      {/* ═══ 백테스트 ═══ */}
         {tab==="backtest"&&<>
           <div style={{fontSize:13,fontWeight:700,marginBottom:16}}>🔬 백테스트</div>
 
@@ -477,29 +507,12 @@ export default function Dashboard(){
               <button onClick={async()=>{
                 const r=await fetch(`${API}/api/bt/download`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({start:btParams.start,end:btParams.end})});
                 const d=await r.json();
-                if(d.ok){
-                  setBtDownloading(true); setBtElapsed(0); setBtError(null);
-                  const t=setInterval(()=>setBtElapsed(s=>{
-                    if(s>=300){clearInterval(t);setBtDownloading(false);setBtError("✅ 다운로드 완료 (추정)");return s;}
-                    return s+1;
-                  }),1000);
-                  setTimeout(()=>{clearInterval(t);setBtDownloading(false);setBtError("✅ 다운로드 완료");},180000);
-                } else setBtError(d.error||"실패");
+                setBtError(d.ok?"✅ 다운로드 시작 (백그라운드 실행 중...)":d.error||"실패");
               }} style={{background:"#1e3a5f",border:"1px solid #3b82f644",color:"#60a5fa",borderRadius:6,padding:"6px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
                 📥 다운로드
               </button>
               <span style={{fontSize:10,color:"#64748b"}}>yfinance로 코스피200 종목 데이터 캐싱</span>
             </div>
-            {btDownloading&&<div style={{marginTop:10}}>
-              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#64748b",marginBottom:4}}>
-                <span>⏳ 다운로드 중... ({btElapsed}초 경과)</span>
-                <span>{Math.min(Math.round(btElapsed/180*100),99)}%</span>
-              </div>
-              <div style={{height:6,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
-                <div style={{height:6,width:`${Math.min(btElapsed/180*100,99)}%`,background:"linear-gradient(90deg,#3b82f6,#8b5cf6)",borderRadius:3,transition:"width 1s linear",animation:"shimmer 2s infinite"}}/>
-              </div>
-              <div style={{fontSize:9,color:"#64748b",marginTop:4}}>코스피200 종목 데이터 수신 중 — 약 1~3분 소요</div>
-            </div>}
           </div>
 
           {/* ── 파라미터 설정 ── */}
@@ -514,10 +527,10 @@ export default function Dashboard(){
                   <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>{label}</div>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
                     <button onClick={()=>setBtParams(p=>({...p,[key]:Math.max(min,+(p[key]-step).toFixed(2))}))}
-                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
-                    <span style={{fontSize:14,fontWeight:700,minWidth:36,textAlign:"center"}}>{btParams[key]}</span>
+                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>−</button>
+                    <span style={{fontSize:15,fontWeight:700,minWidth:38,textAlign:"center",color:"#e2e8f0"}}>{btParams[key]}</span>
                     <button onClick={()=>setBtParams(p=>({...p,[key]:Math.min(max,+(p[key]+step).toFixed(2))}))}
-                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>+</button>
                   </div>
                 </div>
               ))}
@@ -534,8 +547,7 @@ export default function Dashboard(){
             </div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
               <button onClick={async()=>{
-                setBtRunning(true); setBtError(null); setBtCurrent(null); setBtRunElapsed(0);
-                const _t=setInterval(()=>setBtRunElapsed(s=>s+1),1000);
+                setBtRunning(true);setBtError(null);setBtCurrent(null);
                 try{
                   const r=await fetch(`${API}/api/bt/run`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(btParams)});
                   const d=await r.json();
@@ -543,32 +555,32 @@ export default function Dashboard(){
                     const r2=await fetch(`${API}/api/bt/results`);const d2=await r2.json();setBtResults(d2.results||[]);}
                   else setBtError(d.error||"실행 실패");
                 }catch(e){setBtError(String(e));}
-                clearInterval(_t); setBtRunning(false);
+                setBtRunning(false);
               }} disabled={btRunning}
                 style={{background:btRunning?"#1e293b":"linear-gradient(135deg,#1d4ed8,#7c3aed)",border:"none",color:"#fff",borderRadius:6,padding:"8px 20px",cursor:btRunning?"not-allowed":"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit"}}>
-                {btRunning?`⏳ 실행 중... (${btRunElapsed}초 경과)`:"▶️ 백테스트 실행"}
+                {btRunning?"⏳ 실행 중 (최대 5분)...":"▶️ 백테스트 실행"}
               </button>
               <button onClick={async()=>{const r=await fetch(`${API}/api/bt/results`);const d=await r.json();setBtResults(d.results||[]);}}
                 style={{background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",borderRadius:6,padding:"8px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
-                🔄 결과 새로고침
+                🔄 이력 새로고침
               </button>
             </div>
             {btError&&<div style={{marginTop:8,padding:"6px 10px",background:btError.startsWith("✅")?"#14532d11":"#450a0a",border:`1px solid ${btError.startsWith("✅")?"#22c55e33":"#ef444433"}`,borderRadius:6,fontSize:11,color:btError.startsWith("✅")?"#4ade80":"#fca5a5"}}>{btError}</div>}
           </div>
 
-          {/* ── 현재 실행 결과 ── */}
+          {/* ── 방금 실행 결과 ── */}
           {btCurrent&&<div style={{background:"#0f172a",border:"2px solid #3b82f644",borderRadius:8,padding:14,marginBottom:12}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
               <span style={{fontSize:12,fontWeight:700,color:"#60a5fa"}}>✅ 방금 실행 결과</span>
               <button onClick={async()=>{
                 const r=await fetch(`${API}/api/bt/apply`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slip:btCurrent.slip,pos:btCurrent.pos})});
                 const d=await r.json();
-                setBtError(d.ok?"✅ rt.py에 적용 완료!":d.error||"적용 실패");
-              }} style={{background:"linear-gradient(135deg,#14532d,#166534)",border:"1px solid #22c55e44",color:"#4ade80",borderRadius:6,padding:"6px 14px",cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"inherit"}}>
+                setBtError(d.ok?"✅ rt.py에 적용 완료! (런타임+소스 동시 반영)":d.error||"적용 실패");
+              }} style={{background:"linear-gradient(135deg,#14532d,#166534)",border:"1px solid #22c55e44",color:"#4ade80",borderRadius:6,padding:"6px 16px",cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"inherit"}}>
                 ✅ rt.py에 적용
               </button>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+            <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(4,1fr)",gap:8}}>
               {[
                 {l:"전략수익률",v:`+${btCurrent.total_ret}%`,c:"#22c55e"},
                 {l:"알파",v:`+${btCurrent.alpha}%`,c:"#3b82f6"},
@@ -577,19 +589,19 @@ export default function Dashboard(){
                 {l:"총 매매",v:`${btCurrent.total_trades}건`,c:"#94a3b8"},
                 {l:"슬리피지",v:`${btCurrent.slip}×`,c:"#8b5cf6"},
                 {l:"최대비중",v:`${(btCurrent.pos*100).toFixed(0)}%`,c:"#8b5cf6"},
-                {l:"기간",v:`${btCurrent.start}~${btCurrent.end}`,c:"#64748b"},
+                {l:"기간",v:`${btCurrent.start?.slice(0,4)}~${btCurrent.end?.slice(0,4)}`,c:"#64748b"},
               ].map(({l,v,c},i)=>(
-                <div key={i} style={{background:"#111827",borderRadius:6,padding:8}}>
+                <div key={i} style={{background:"#111827",borderRadius:6,padding:8,textAlign:"center"}}>
                   <div style={{fontSize:9,color:"#64748b"}}>{l}</div>
-                  <div style={{fontSize:12,fontWeight:700,color:c,marginTop:2}}>{v}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:c,marginTop:2}}>{v}</div>
                 </div>
               ))}
             </div>
           </div>}
 
-          {/* ── 과거 결과 비교 테이블 ── */}
-          {btResults.length>0&&<div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,overflow:"hidden"}}>
-            <div style={{padding:"10px 14px",borderBottom:"1px solid #1e293b",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          {/* ── 과거 이력 비교 테이블 ── */}
+          {btResults.length>0&&<div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,overflow:"hidden",marginBottom:12}}>
+            <div style={{padding:"10px 14px",borderBottom:"1px solid #1e293b"}}>
               <span style={{fontSize:12,fontWeight:700}}>📊 백테스트 이력 ({btResults.length}건)</span>
             </div>
             <div style={{overflowX:"auto"}}>
@@ -626,7 +638,7 @@ export default function Dashboard(){
           </div>}
 
           {/* ── opt.py 실행 ── */}
-          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:14,marginTop:12}}>
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:14}}>
             <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:6}}>🧠 opt.py 실전 최적화</div>
             <div style={{fontSize:10,color:"#64748b",marginBottom:10}}>실거래 데이터(trade_history.db) 기반으로 파라미터 재최적화</div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -647,6 +659,7 @@ export default function Dashboard(){
             </div>
           </div>
         </>}
+
       </div>
 
       {/* ── 사이드바 (PC만) ── */}
@@ -673,7 +686,7 @@ export default function Dashboard(){
       </div>}
     </div>
     <style>{`
-      @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}} @keyframes shimmer{0%{opacity:1}50%{opacity:0.7}100%{opacity:1}}
+      @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
       ::-webkit-scrollbar{width:4px}
       ::-webkit-scrollbar-track{background:#0a0e1a}
       ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}

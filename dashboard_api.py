@@ -88,18 +88,22 @@ def _safe_attr(attr, default=None):
             return default
 
 
-def start_dashboard(monitor, port=5000):
+def start_dashboard(monitor, rt_module=None, port=5000):
     global _monitor, _rt_module
     _monitor = monitor
     if not FLASK_OK:
         log.warning("⚠️ Flask 미설치 — 대시보드 비활성. pip install flask flask-cors")
         return
-    import importlib
-    try:
-        _rt_module = importlib.import_module("rt")
-    except Exception as e:
-        log.error(f"rt 모듈 import 실패: {e}")
-        return
+    # rt_module 직접 주입 시 import 불필요 (순환참조 방지)
+    if rt_module is not None:
+        _rt_module = rt_module
+    else:
+        import importlib
+        try:
+            _rt_module = importlib.import_module("rt")
+        except Exception as e:
+            log.error(f"rt 모듈 import 실패: {e}")
+            return
     app = _create_app()
     t = threading.Thread(target=lambda: app.run(
         host="0.0.0.0", port=port, debug=False, use_reloader=False
@@ -812,6 +816,153 @@ def _create_app():
         except Exception as e:
             pass
         return result
+
+
+    # ══════════════════════════════════════════
+    # 백테스트 API
+    # ══════════════════════════════════════════
+
+    @app.route("/api/bt/results")
+    def api_bt_results():
+        """과거 백테스트 결과 목록"""
+        try:
+            import glob
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            result_dir = base / "bt_results"
+            result_dir.mkdir(exist_ok=True)
+            files = sorted(glob.glob(str(result_dir / "bt_*.json")), reverse=True)[:20]
+            results = []
+            for f in files:
+                try:
+                    data = json.loads(Path(f).read_text(encoding="utf-8"))
+                    results.append(data)
+                except Exception:
+                    pass
+            return jsonify({"results": results})
+        except Exception as e:
+            return jsonify({"results": [], "error": str(e)})
+
+    @app.route("/api/bt/run", methods=["POST"])
+    def api_bt_run():
+        """백테스트 실행 (bt.py subprocess)"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            bt_path = base / "bt.py"
+            if not bt_path.exists():
+                return jsonify({"error": "bt.py 없음"}), 404
+
+            body = request.get_json(silent=True) or {}
+            slip  = body.get("slip",  2.0)
+            pos   = body.get("pos",   0.20)
+            start = body.get("start", "20230101")
+            end   = body.get("end",   "20260301")
+
+            cmd = [
+                "python3", str(bt_path),
+                f"--slip={slip}", f"--pos={pos}",
+                f"--start={start}", f"--end={end}",
+                "--json", "--save"
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+                cwd=str(base)
+            )
+            out = proc.stdout.strip()
+            lines = [l for l in out.split("\n") if l.strip().startswith("{")]
+            if lines:
+                result = json.loads(lines[-1])
+                return jsonify({"ok": True, "result": result})
+            return jsonify({"ok": False, "error": proc.stderr[-500:] or "결과 없음"})
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "타임아웃 (5분 초과)"}), 408
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bt/download", methods=["POST"])
+    def api_bt_download():
+        """yfinance 데이터 사전 다운로드"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            bt_path = base / "bt.py"
+            body = request.get_json(silent=True) or {}
+            start = body.get("start", "20200101")
+            end   = body.get("end",   "20260301")
+            cmd = ["python3", str(bt_path), f"--start={start}", f"--end={end}", "--json"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(base))
+            return jsonify({"ok": True, "msg": f"{start}~{end} 다운로드 시작", "pid": proc.pid})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bt/apply", methods=["POST"])
+    def api_bt_apply():
+        """백테스트 파라미터를 rt.py 런타임 + 소스 파일 동시 적용"""
+        import re
+        try:
+            rt = _rt_module
+            if not rt:
+                return jsonify({"ok": False, "error": "rt 모듈 없음"}), 500
+
+            body = request.get_json(silent=True) or {}
+            slip = body.get("slip")
+            pos  = body.get("pos")
+            changed = {}
+
+            # ① 런타임 즉시 반영
+            if hasattr(rt, "C"):
+                if slip is not None:
+                    rt.C["SLIPPAGE_FILTER_RATIO"] = float(slip)
+                    changed["SLIPPAGE_FILTER_RATIO"] = float(slip)
+                if pos is not None:
+                    rt.C["MAX_POSITION_RATIO"] = float(pos)
+                    changed["MAX_POSITION_RATIO"] = float(pos)
+
+            # ② rt.py 소스 파일 직접 패치
+            rt_path = Path(rt.__file__) if rt else None
+            if rt_path and rt_path.exists():
+                src = rt_path.read_text(encoding="utf-8")
+                original = src
+                if slip is not None:
+                    src = re.sub(r'(SLIPPAGE_FILTER_RATIO\s*=\s*)[0-9.]+', f'\\g<1>{float(slip)}', src)
+                if pos is not None:
+                    src = re.sub(r'(MAX_POSITION_RATIO\s*=\s*)[0-9.]+', f'\\g<1>{float(pos)}', src)
+                if src != original:
+                    rt_path.write_text(src, encoding="utf-8")
+                    changed["source_patched"] = str(rt_path)
+                    log.info(f"[bt_apply] rt.py 소스 패치 완료: {changed}")
+
+            if changed:
+                return jsonify({"ok": True, "applied": changed, "msg": "런타임 + 소스 파일 동시 적용 완료"})
+            return jsonify({"ok": False, "error": "적용할 파라미터 없음"})
+        except Exception as e:
+            log.error(f"[bt_apply] 오류: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/opt/run", methods=["POST"])
+    def api_opt_run():
+        """opt.py 실행"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            opt_path = base / "opt.py"
+            if not opt_path.exists():
+                return jsonify({"error": "opt.py 없음"}), 404
+            body = request.get_json(silent=True) or {}
+            samples  = body.get("samples", 400)
+            seed     = body.get("seed",    42)
+            do_apply = body.get("apply",   False)
+            cmd = ["python3", str(opt_path), "--fast", f"--samples={samples}", f"--seed={seed}"]
+            if do_apply:
+                cmd += ["--apply", "--tg"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(base))
+            return jsonify({"ok": True, "msg": f"opt.py 시작 (samples={samples})", "pid": proc.pid})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     return app
 

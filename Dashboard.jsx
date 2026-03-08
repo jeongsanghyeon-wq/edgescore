@@ -184,7 +184,14 @@ export default function Dashboard(){
     [def,setDef]=useState(null),[kospi,setKospi]=useState(null),[risk,setRisk]=useState(null),
     [market,setMarket]=useState(null),[sentiment,setSentiment]=useState(null),[system,setSystem]=useState(null),
     [tab,setTab]=useState("portfolio"),[time,setTime]=useState(new Date()),[sellModal,setSellModal]=useState(null),
-    [todayTrades,setTodayTrades]=useState(null),[account,setAccount]=useState(null),[trades,setTrades]=useState([]);
+    [todayTrades,setTodayTrades]=useState(null),[account,setAccount]=useState(null),[trades,setTrades]=useState([]),
+    [btParams,setBtParams]=useState({slip:2.0,pos:0.20,start:"20230101",end:"20260301"}),
+    [btRunning,setBtRunning]=useState(false),[btResults,setBtResults]=useState([]),
+    [btCurrent,setBtCurrent]=useState(null),[btError,setBtError]=useState(null);
+
+  const fetchBtResults=useCallback(async()=>{
+    try{const r=await fetch(`${API}/api/bt/results`);const d=await r.json();setBtResults(d.results||[]);}catch{}
+  },[]);
 
   const fetchAll=useCallback(async(signal)=>{
     const s=await api("/status",signal);if(!s){setConn(false);return;}setConn(true);setSt(s);
@@ -192,7 +199,7 @@ export default function Dashboard(){
     if(p)setPort(p);if(w)setWatch(w.watchlist||[]);if(a)setAlerts(a.alerts||[]);if(pf)setPerf(pf);if(d)setDef(d);if(k)setKospi(k);if(r)setRisk(r);if(m)setMarket(m);if(se)setSentiment(se);if(sy)setSystem(sy);if(tt)setTodayTrades(tt);if(ac)setAccount(ac);if(tr)setTrades(tr.trades||[]);
   },[]);
 
-  useEffect(()=>{const ac=new AbortController();fetchAll(ac.signal);const iv=setInterval(()=>{fetchAll(ac.signal);setTime(new Date())},TICK);return()=>{ac.abort();clearInterval(iv)}},[fetchAll]);
+  useEffect(()=>{const ac=new AbortController();fetchAll(ac.signal);fetchBtResults();const iv=setInterval(()=>{fetchAll(ac.signal);setTime(new Date())},TICK);return()=>{ac.abort();clearInterval(iv)}},[fetchAll,fetchBtResults]);
   const fetchSell=async t=>{const r=await api(`/sell_opinion/${t}`);if(r)setSellModal(r);};
   const r_=RM[st?.regime]||RM.SIDE, sm=port?.summary||{}, hld=port?.holdings||[], emo=sentiment?.emotion;
 
@@ -249,7 +256,7 @@ export default function Dashboard(){
 
     {/* ── 탭 (모바일: 스크롤) ── */}
     <div style={{display:"flex",borderBottom:"1px solid #1e293b",background:"#0f172a",overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
-      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"},{k:"trades",l:mobile?"📋":"📋 체결내역"}].map(t=>
+      {[{k:"portfolio",l:mobile?"📊":"📊 포트폴리오"},{k:"signals",l:mobile?"⚡":"⚡ 신호"},{k:"risk",l:mobile?"🛡️":"🛡️ 리스크"},{k:"alerts",l:mobile?`🔔${alerts.length}`:`🔔 알림(${alerts.length})`},{k:"performance",l:mobile?"📈":"📈 성과"},{k:"market",l:mobile?"🌍":"🌍 시장"},{k:"system",l:mobile?"⚙️":"⚙️ 시스템"},{k:"trades",l:mobile?"📋":"📋 체결내역"},{k:"backtest",l:mobile?"🧪":"🧪 백테스트"}].map(t=>
         <button key={t.k} onClick={()=>setTab(t.k)} style={{padding:mobile?"8px 12px":"9px 16px",background:tab===t.k?"#1e293b":"transparent",border:"none",borderBottom:tab===t.k?"2px solid #3b82f6":"2px solid transparent",color:tab===t.k?"#e2e8f0":"#64748b",cursor:"pointer",fontSize:mobile?12:11,fontWeight:600,fontFamily:"inherit",whiteSpace:"nowrap",minWidth:mobile?40:"auto"}}>{t.l}</button>)}
     </div>
 
@@ -439,7 +446,7 @@ export default function Dashboard(){
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>⚙️ 파라미터</div>
             {system.current_params&&Object.entries(system.current_params).map(([k,v],i)=>v!=null&&<div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e293b",fontSize:10}}>
-              <span style={{color:"#94a3b8"}}>{k}</span><span style={{fontWeight:600}}>{typeof v==="number"?v.toFixed?.(4)??v:String(v)}</span></div>)}</div></div></div></>}
+              <span style={{color:"#94a3b8"}}>{k}</span><span style={{fontWeight:600}}>{typeof v==="number"?v.toFixed?.(4)??v:String(v)}</span></div>)}</div></div></>}
 
         {/* ═══ 체결내역 ═══ */}
         {tab==="trades"&&<>
@@ -483,6 +490,174 @@ export default function Dashboard(){
               </tr>;
             })}</tbody>
           </table></div>}
+        </>}
+
+      {/* ═══ 백테스트 ═══ */}
+        {tab==="backtest"&&<>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:16}}>🔬 백테스트</div>
+
+          {/* ── 데이터 다운로드 ── */}
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:14,marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:10}}>📥 데이터 다운로드</div>
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <select value={btParams.start.slice(0,4)} onChange={e=>setBtParams(p=>({...p,start:e.target.value+"0101"}))}
+                style={{background:"#0f172a",border:"1px solid #1e293b",color:"#e2e8f0",borderRadius:6,padding:"6px 10px",fontSize:12}}>
+                {[2020,2021,2022,2023,2024].map(y=><option key={y} value={y}>{y}년부터</option>)}
+              </select>
+              <button onClick={async()=>{
+                const r=await fetch(`${API}/api/bt/download`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({start:btParams.start,end:btParams.end})});
+                const d=await r.json();
+                setBtError(d.ok?"✅ 다운로드 시작 (백그라운드 실행 중...)":d.error||"실패");
+              }} style={{background:"#1e3a5f",border:"1px solid #3b82f644",color:"#60a5fa",borderRadius:6,padding:"6px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+                📥 다운로드
+              </button>
+              <span style={{fontSize:10,color:"#64748b"}}>yfinance로 코스피200 종목 데이터 캐싱</span>
+            </div>
+          </div>
+
+          {/* ── 파라미터 설정 ── */}
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:14,marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:10}}>⚙️ 파라미터 설정</div>
+            <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(4,1fr)",gap:10,marginBottom:12}}>
+              {[
+                {label:"슬리피지 필터",key:"slip",step:0.5,min:1.0,max:5.0},
+                {label:"최대 포지션 비중",key:"pos",step:0.05,min:0.05,max:0.50},
+              ].map(({label,key,step,min,max})=>(
+                <div key={key}>
+                  <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>{label}</div>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    <button onClick={()=>setBtParams(p=>({...p,[key]:Math.max(min,+(p[key]-step).toFixed(2))}))}
+                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>−</button>
+                    <span style={{fontSize:15,fontWeight:700,minWidth:38,textAlign:"center",color:"#e2e8f0"}}>{btParams[key]}</span>
+                    <button onClick={()=>setBtParams(p=>({...p,[key]:Math.min(max,+(p[key]+step).toFixed(2))}))}
+                      style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:4,width:26,height:26,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit"}}>+</button>
+                  </div>
+                </div>
+              ))}
+              <div>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>시작일</div>
+                <input type="text" value={btParams.start} onChange={e=>setBtParams(p=>({...p,start:e.target.value}))}
+                  style={{background:"#0f172a",border:"1px solid #1e293b",color:"#e2e8f0",borderRadius:6,padding:"5px 8px",fontSize:12,width:"100%",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>종료일</div>
+                <input type="text" value={btParams.end} onChange={e=>setBtParams(p=>({...p,end:e.target.value}))}
+                  style={{background:"#0f172a",border:"1px solid #1e293b",color:"#e2e8f0",borderRadius:6,padding:"5px 8px",fontSize:12,width:"100%",boxSizing:"border-box"}}/>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button onClick={async()=>{
+                setBtRunning(true);setBtError(null);setBtCurrent(null);
+                try{
+                  const r=await fetch(`${API}/api/bt/run`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(btParams)});
+                  const d=await r.json();
+                  if(d.ok){setBtCurrent(d.result);
+                    const r2=await fetch(`${API}/api/bt/results`);const d2=await r2.json();setBtResults(d2.results||[]);}
+                  else setBtError(d.error||"실행 실패");
+                }catch(e){setBtError(String(e));}
+                setBtRunning(false);
+              }} disabled={btRunning}
+                style={{background:btRunning?"#1e293b":"linear-gradient(135deg,#1d4ed8,#7c3aed)",border:"none",color:"#fff",borderRadius:6,padding:"8px 20px",cursor:btRunning?"not-allowed":"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit"}}>
+                {btRunning?"⏳ 실행 중 (최대 5분)...":"▶️ 백테스트 실행"}
+              </button>
+              <button onClick={async()=>{const r=await fetch(`${API}/api/bt/results`);const d=await r.json();setBtResults(d.results||[]);}}
+                style={{background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",borderRadius:6,padding:"8px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+                🔄 이력 새로고침
+              </button>
+            </div>
+            {btError&&<div style={{marginTop:8,padding:"6px 10px",background:btError.startsWith("✅")?"#14532d11":"#450a0a",border:`1px solid ${btError.startsWith("✅")?"#22c55e33":"#ef444433"}`,borderRadius:6,fontSize:11,color:btError.startsWith("✅")?"#4ade80":"#fca5a5"}}>{btError}</div>}
+          </div>
+
+          {/* ── 방금 실행 결과 ── */}
+          {btCurrent&&<div style={{background:"#0f172a",border:"2px solid #3b82f644",borderRadius:8,padding:14,marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <span style={{fontSize:12,fontWeight:700,color:"#60a5fa"}}>✅ 방금 실행 결과</span>
+              <button onClick={async()=>{
+                const r=await fetch(`${API}/api/bt/apply`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slip:btCurrent.slip,pos:btCurrent.pos})});
+                const d=await r.json();
+                setBtError(d.ok?"✅ rt.py에 적용 완료! (런타임+소스 동시 반영)":d.error||"적용 실패");
+              }} style={{background:"linear-gradient(135deg,#14532d,#166534)",border:"1px solid #22c55e44",color:"#4ade80",borderRadius:6,padding:"6px 16px",cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"inherit"}}>
+                ✅ rt.py에 적용
+              </button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(4,1fr)",gap:8}}>
+              {[
+                {l:"전략수익률",v:`+${btCurrent.total_ret}%`,c:"#22c55e"},
+                {l:"알파",v:`+${btCurrent.alpha}%`,c:"#3b82f6"},
+                {l:"MDD",v:`${btCurrent.mdd}%`,c:"#ef4444"},
+                {l:"승률",v:`${btCurrent.win_rate}%`,c:"#eab308"},
+                {l:"총 매매",v:`${btCurrent.total_trades}건`,c:"#94a3b8"},
+                {l:"슬리피지",v:`${btCurrent.slip}×`,c:"#8b5cf6"},
+                {l:"최대비중",v:`${(btCurrent.pos*100).toFixed(0)}%`,c:"#8b5cf6"},
+                {l:"기간",v:`${btCurrent.start?.slice(0,4)}~${btCurrent.end?.slice(0,4)}`,c:"#64748b"},
+              ].map(({l,v,c},i)=>(
+                <div key={i} style={{background:"#111827",borderRadius:6,padding:8,textAlign:"center"}}>
+                  <div style={{fontSize:9,color:"#64748b"}}>{l}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:c,marginTop:2}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {/* ── 과거 이력 비교 테이블 ── */}
+          {btResults.length>0&&<div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,overflow:"hidden",marginBottom:12}}>
+            <div style={{padding:"10px 14px",borderBottom:"1px solid #1e293b"}}>
+              <span style={{fontSize:12,fontWeight:700}}>📊 백테스트 이력 ({btResults.length}건)</span>
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                <thead><tr style={{borderBottom:"1px solid #1e293b",color:"#64748b",fontSize:10}}>
+                  {["날짜","기간","SLIP","POS","전략수익","알파","MDD","승률","매매","적용"].map(h=>(
+                    <th key={h} style={{padding:"6px 8px",textAlign:h==="날짜"||h==="기간"?"left":"center",whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>{btResults.map((r,i)=>(
+                  <tr key={i} style={{borderBottom:"1px solid #1e293b11",background:i%2?"#0f172a33":"transparent"}}>
+                    <td style={{padding:"6px 8px",color:"#64748b",fontSize:10,whiteSpace:"nowrap"}}>{r.ts?.slice(0,8)}</td>
+                    <td style={{padding:"6px 8px",fontSize:10,whiteSpace:"nowrap"}}>{r.start?.slice(0,4)}~{r.end?.slice(0,4)}</td>
+                    <td style={{padding:"6px 8px",textAlign:"center",fontWeight:600}}>{r.slip}</td>
+                    <td style={{padding:"6px 8px",textAlign:"center"}}>{(r.pos*100).toFixed(0)}%</td>
+                    <td style={{padding:"6px 8px",textAlign:"center",color:"#22c55e",fontWeight:700}}>+{r.total_ret}%</td>
+                    <td style={{padding:"6px 8px",textAlign:"center",color:"#3b82f6"}}>+{r.alpha}%</td>
+                    <td style={{padding:"6px 8px",textAlign:"center",color:"#ef4444"}}>{r.mdd}%</td>
+                    <td style={{padding:"6px 8px",textAlign:"center",color:"#eab308"}}>{r.win_rate}%</td>
+                    <td style={{padding:"6px 8px",textAlign:"center"}}>{r.total_trades}</td>
+                    <td style={{padding:"6px 8px",textAlign:"center"}}>
+                      <button onClick={async()=>{
+                        const res=await fetch(`${API}/api/bt/apply`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slip:r.slip,pos:r.pos})});
+                        const d=await res.json();
+                        setBtError(d.ok?"✅ rt.py에 적용 완료!":d.error||"실패");
+                      }} style={{background:"#22c55e22",border:"1px solid #22c55e44",color:"#22c55e",borderRadius:4,padding:"2px 8px",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>
+                        적용
+                      </button>
+                    </td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </div>}
+
+          {/* ── opt.py 실행 ── */}
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:14}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:6}}>🧠 opt.py 실전 최적화</div>
+            <div style={{fontSize:10,color:"#64748b",marginBottom:10}}>실거래 데이터(trade_history.db) 기반으로 파라미터 재최적화</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button onClick={async()=>{
+                const r=await fetch(`${API}/api/opt/run`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({samples:400,seed:42,apply:false})});
+                const d=await r.json();
+                setBtError(d.ok?"✅ opt.py 실행 시작 (백그라운드)":d.error||"실패");
+              }} style={{background:"#1e1b4b",border:"1px solid #4338ca44",color:"#a5b4fc",borderRadius:6,padding:"7px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+                🧠 최적화 실행 (400회)
+              </button>
+              <button onClick={async()=>{
+                const r=await fetch(`${API}/api/opt/run`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({samples:800,seed:42,apply:true})});
+                const d=await r.json();
+                setBtError(d.ok?"✅ opt.py 실행+자동적용 시작":d.error||"실패");
+              }} style={{background:"#14532d",border:"1px solid #22c55e44",color:"#4ade80",borderRadius:6,padding:"7px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+                🚀 최적화 + 자동 적용 (800회)
+              </button>
+            </div>
+          </div>
         </>}
 
       </div>

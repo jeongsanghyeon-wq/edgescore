@@ -1110,8 +1110,15 @@ def get_ohlcv(ticker: str, days: int = 90):
             sym = f"{ticker}.KS"
             raw = yf.download(sym, period="3mo", progress=False, auto_adjust=True)
             if not raw.empty:
-                raw.columns = [c[0] if isinstance(c, tuple) else c
-                               for c in raw.columns]
+                # [DELIST-FIX] MultiIndex columns에서 None 필드명 방어
+                raw.columns = [
+                    (c[0] if isinstance(c, tuple) else c) or ""
+                    for c in raw.columns
+                ]
+                # None/빈 컬럼명 있으면 상장폐지 의심 → 스킵
+                if any(c == "" for c in raw.columns):
+                    log.warning(f"[OHLCV] {ticker}: yfinance columns 이상 (상장폐지 의심) → 스킵")
+                    raw = type(raw)()  # 빈 DataFrame으로 교체
                 df = pd.DataFrame({
                     "종가":        raw["Close"].values.flatten(),
                     "고가":        raw["High"].values.flatten(),
@@ -1124,7 +1131,11 @@ def get_ohlcv(ticker: str, days: int = 90):
                 _ohlcv_source = "yfinance"
                 log.debug(f"[{ticker}] yfinance(15분지연) 사용")
         except Exception as e:
-            log.debug(f"yfinance [{ticker}]: {e}")
+            _e_str = str(e)
+            if "404" in _e_str or "401" in _e_str or "delisted" in _e_str.lower():
+                log.warning(f"[OHLCV] {ticker}: yfinance {_e_str[:80]} → 상장폐지 의심, 유니버스에서 제거 권장")
+            else:
+                log.debug(f"yfinance [{ticker}]: {e}")
 
     # [TOP10-③] OHLCV 극단값 필터
     # 0 가격, 전일 대비 ±30% 초과 이상값이 edge·ATR·손절가 계산에 흘러들어가는 것 방지
