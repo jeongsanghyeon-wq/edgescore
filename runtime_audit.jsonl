@@ -132,3 +132,5 @@
 {"ts": "2026-03-08T12:28:09", "event": "startup", "mode": "mock", "health": "mode=mock | regime=SIDE | positions=0 | universe=10 | emergency_stop=False"}
 {"ts": "2026-03-08T12:28:36", "event": "shutdown", "mode": "mock", "emergency_stop": false}
 {"ts": "2026-03-08T12:31:00", "event": "startup", "mode": "mock", "health": "mode=mock | regime=SIDE | positions=0 | universe=10 | emergency_stop=False"}
+{"ts": "2026-03-08T12:52:57", "event": "shutdown", "mode": "mock", "emergency_stop": false}
+{"ts": "2026-03-08T12:53:06", "event": "startup", "mode": "mock", "health": "mode=mock | regime=SIDE | positions=0 | universe=10 | emergency_stop=False"}
