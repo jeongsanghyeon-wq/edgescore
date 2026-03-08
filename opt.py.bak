@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5
+EQS V1.1 (Edge Quant Signal) — Auto Optimizer
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 실거래 결과(trade_log.json)를 분석해서
   1) 최적 파라미터를 그리드 서치로 도출
@@ -15,7 +15,6 @@ EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5
 """
 
 import json, re, sys, time, math
-from opt_fast_helpers import random_search
 import numpy as np
 from pathlib import Path
 from datetime import datetime, date
@@ -23,9 +22,6 @@ from itertools import product
 
 DRY_RUN   = "--apply" not in sys.argv
 SEND_TG   = "--tg"    in sys.argv
-FAST_MODE = "--fast"  in sys.argv
-SAMPLE_COUNT = next((int(a.split("=",1)[1]) for a in sys.argv if a.startswith("--samples=")), 400)
-RANDOM_SEED  = next((int(a.split("=",1)[1]) for a in sys.argv if a.startswith("--seed=")), 42)
 
 BASE           = Path(__file__).parent
 TRADE_LOG_FILE = BASE / "trade_log.json"
@@ -363,7 +359,7 @@ def grid_search(trades: list, stats: dict, cfg: dict = None) -> dict:
     핵심 파라미터 그리드 서치
     목적함수: 샤프지수 최대화 (MDD 패널티 포함)
     """
-    print("\n🔍 최적화 실행 중...")
+    print("\n🔍 그리드 서치 실행 중...")
 
     # 탐색 공간 정의
     # [BUG-5 수정] atr_mult_large/small 추가로 조합이 480,000개(원본 20x) → 실용 불가
@@ -403,19 +399,6 @@ def grid_search(trades: list, stats: dict, cfg: dict = None) -> dict:
 
     cfg = cfg or {}
     _max_pos = cfg.get("MAX_POSITION_RATIO", 0.30)
-
-    if FAST_MODE:
-        result = random_search(
-            trades, grid, cfg, simulate_params,
-            samples=SAMPLE_COUNT, seed=RANDOM_SEED, topn=20
-        )
-        _meta = result.get("meta", {})
-        print(f"   완료: {_meta.get('samples', SAMPLE_COUNT)}개 샘플 탐색")
-        print(f"   최적: {result.get('params', {})}")
-        _br = result.get('result', {})
-        print(f"   성과: 수익률 {_br.get('total_ret',0):+.2%} | 승률 {_br.get('win_rate',0):.1%} | MDD {_br.get('mdd',0):.1%} | 샤프 {_br.get('sharpe',0):.2f}")
-        print(f"   부가: seed={_meta.get('seed', RANDOM_SEED)} | topN 저장=optimizer_topn.json")
-        return result
     best_score  = -999
     best_params = {}
     best_result = {}
@@ -933,11 +916,10 @@ def build_report(stats: dict, updates: dict, prev_cfg: dict,
 # ════════════════════════════════════════════════
 def main():
     print("\n" + "=" * 55)
-    print("  🤖 EQS V1.0 (Edge Quant Signal) — Auto Optimizer v1.5")
+    print("  🤖 EQS V1.1 (Edge Quant Signal) — Auto Optimizer")
     print("=" * 55)
     print(f"  모드: {'미리보기 (DRY RUN)' if DRY_RUN else '🔴 실제 적용'}")
     print(f"  텔레그램: {'ON' if SEND_TG else 'OFF'}")
-    print(f"  탐색방식: {'랜덤 서치' if FAST_MODE else '그리드 서치'}")
     if REALTIME_FILE: print(f"  리얼타임: {REALTIME_FILE.name}")
     if BACKTEST_FILE: print(f"  백테스트: {BACKTEST_FILE.name}")
     print()
@@ -1049,7 +1031,6 @@ def main():
 
     if DRY_RUN:
         print("\n💡 실제 적용하려면: python3 edge_optimizer.py --apply --tg")
-        print("💡 빠른 탐색 예시: python3 edge_optimizer.py --fast --samples=400 --seed=42")
 
 
 if __name__ == "__main__":
