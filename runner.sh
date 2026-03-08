@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT SIGHUP EXIT
 
 # 부팅 직후 시스템 준비 대기
-sleep 30
+sleep 60
 
 cd "$BASE_DIR"
 
