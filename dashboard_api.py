@@ -88,21 +88,18 @@ def _safe_attr(attr, default=None):
             return default
 
 
-def start_dashboard(monitor, rt_module=None, port=5000):
+def start_dashboard(monitor, port=5000):
     global _monitor, _rt_module
     _monitor = monitor
-    if rt_module is not None:
-        _rt_module = rt_module
     if not FLASK_OK:
         log.warning("⚠️ Flask 미설치 — 대시보드 비활성. pip install flask flask-cors")
         return
-    if _rt_module is None:
-        import importlib
-        try:
-            _rt_module = importlib.import_module("rt")
-        except Exception as e:
-            log.error(f"rt 모듈 import 실패: {e}")
-            return
+    import importlib
+    try:
+        _rt_module = importlib.import_module("rt")
+    except Exception as e:
+        log.error(f"rt 모듈 import 실패: {e}")
+        return
     app = _create_app()
     t = threading.Thread(target=lambda: app.run(
         host="0.0.0.0", port=port, debug=False, use_reloader=False
@@ -665,12 +662,49 @@ def _create_app():
             "lock_active": True,
         }
 
+        # ── [CRITICAL-HALT] 엔진 차단 상태 ──────────────────────────
+        critical_halt   = getattr(rt, "_critical_halt", False)
+        critical_counts = dict(getattr(rt, "_critical_fail_counts", {}))
+
+        # ── [RECONCILE] 마지막 대사 결과 ─────────────────────────────
+        # rt.py 로그에서 마지막 RECONCILE done 라인을 파싱
+        last_reconcile = {"status": "unknown", "ts": None, "issues": 0}
+        try:
+            import subprocess as _sp
+            _log_path = Path(__file__).parent / "logs" / "rt.log"
+            if _log_path.exists():
+                # 마지막 [RECONCILE] done 라인 추출
+                _res = _sp.run(
+                    ["grep", "[RECONCILE]", str(_log_path)],
+                    capture_output=True, text=True, timeout=2
+                )
+                _lines = [l for l in _res.stdout.strip().splitlines() if "RECONCILE" in l]
+                if _lines:
+                    _last = _lines[-1]
+                    _ts_part = _last[:19] if len(_last) > 19 else ""
+                    if "done" in _last:
+                        last_reconcile["ts"] = _ts_part
+                        last_reconcile["status"] = "ok" if "전체 일치" in _last or "✅" in _last else "issues"
+                        try:
+                            _n = [w for w in _last.split() if w.startswith("issues=")]
+                            last_reconcile["issues"] = int(_n[0].split("=")[1]) if _n else 0
+                        except Exception:
+                            last_reconcile["issues"] = 0
+                    elif "error" in _last:
+                        last_reconcile["status"] = "error"
+                        last_reconcile["ts"] = _ts_part
+        except Exception:
+            pass
+
         return {
             "data_sources": sources,
             "param_history": param_history[-20:],
             "current_params": params,
             "cache_info": cache_info,
             "uptime": datetime.now().isoformat(),
+            "critical_halt":   critical_halt,
+            "critical_counts": critical_counts,
+            "last_reconcile":  last_reconcile,
         }
 
 
@@ -778,184 +812,6 @@ def _create_app():
         except Exception as e:
             pass
         return result
-
-
-    # ══════════════════════════════════════
-    # 백테스트 API
-    # ══════════════════════════════════════
-
-    @app.route("/api/bt/results")
-    def api_bt_results():
-        """과거 백테스트 결과 목록"""
-        try:
-            import glob
-            rt = _rt_module
-            base = Path(rt.__file__).parent if rt else Path(".")
-            result_dir = base / "bt_results"
-            result_dir.mkdir(exist_ok=True)
-            files = sorted(glob.glob(str(result_dir / "bt_*.json")), reverse=True)[:20]
-            results = []
-            for f in files:
-                try:
-                    data = json.loads(Path(f).read_text(encoding="utf-8"))
-                    results.append(data)
-                except Exception:
-                    pass
-            return jsonify({"results": results})
-        except Exception as e:
-            return jsonify({"results": [], "error": str(e)})
-
-    @app.route("/api/bt/run", methods=["POST"])
-    def api_bt_run():
-        """백테스트 실행 (bt.py를 subprocess로 실행)"""
-        import subprocess
-        try:
-            rt = _rt_module
-            base = Path(rt.__file__).parent if rt else Path(".")
-            bt_path = base / "bt.py"
-            if not bt_path.exists():
-                return jsonify({"error": "bt.py 파일이 없습니다"}), 404
-
-            body = request.get_json(silent=True) or {}
-            slip  = body.get("slip",  2.0)
-            pos   = body.get("pos",   0.20)
-            start = body.get("start", "20230101")
-            end   = body.get("end",   "20260301")
-
-            cmd = [
-                "python3", str(bt_path),
-                f"--slip={slip}",
-                f"--pos={pos}",
-                f"--start={start}",
-                f"--end={end}",
-                "--json", "--save"
-            ]
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-                cwd=str(base)
-            )
-            # JSON 결과 파싱 (마지막 줄이 JSON)
-            out = proc.stdout.strip()
-            lines = [l for l in out.split("\n") if l.strip().startswith("{")]
-            if lines:
-                result = json.loads(lines[-1])
-                return jsonify({"ok": True, "result": result})
-            return jsonify({"ok": False, "error": proc.stderr[-500:] or "결과 없음"})
-        except subprocess.TimeoutExpired:
-            return jsonify({"ok": False, "error": "타임아웃 (5분 초과)"}), 408
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.route("/api/bt/download", methods=["POST"])
-    def api_bt_download():
-        """yfinance 데이터 사전 다운로드 (캐시 워밍업)"""
-        import subprocess
-        try:
-            rt = _rt_module
-            base = Path(rt.__file__).parent if rt else Path(".")
-            bt_path = base / "bt.py"
-
-            body = request.get_json(silent=True) or {}
-            start = body.get("start", "20200101")
-            end   = body.get("end",   "20260301")
-
-            # bt.py를 --json 모드로 가볍게 실행해 yfinance 캐시만 구성
-            cmd = [
-                "python3", str(bt_path),
-                f"--start={start}", f"--end={end}",
-                "--json"
-            ]
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=str(base)
-            )
-            return jsonify({"ok": True, "msg": f"{start}~{end} 데이터 다운로드 시작", "pid": proc.pid})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.route("/api/bt/apply", methods=["POST"])
-    def api_bt_apply():
-        """백테스트 파라미터를 rt.py 런타임 + 소스 파일 동시 적용"""
-        import re
-        try:
-            rt = _rt_module
-            if not rt:
-                return jsonify({"ok": False, "error": "rt 모듈 없음"}), 500
-
-            body = request.get_json(silent=True) or {}
-            slip = body.get("slip")
-            pos  = body.get("pos")
-
-            changed = {}
-
-            # ① 런타임 즉시 반영
-            if hasattr(rt, "C"):
-                if slip is not None:
-                    rt.C["SLIPPAGE_FILTER_RATIO"] = float(slip)
-                    changed["SLIPPAGE_FILTER_RATIO"] = float(slip)
-                if pos is not None:
-                    rt.C["MAX_POSITION_RATIO"] = float(pos)
-                    changed["MAX_POSITION_RATIO"] = float(pos)
-
-            # ② rt.py 소스 파일 직접 패치
-            rt_path = Path(rt.__file__) if rt else None
-            if rt_path and rt_path.exists():
-                src = rt_path.read_text(encoding="utf-8")
-                original = src
-                if slip is not None:
-                    src = re.sub(
-                        r'(SLIPPAGE_FILTER_RATIO\s*=\s*)[0-9.]+',
-                        r'\g<1>' + str(float(slip)),
-                        src
-                    )
-                if pos is not None:
-                    src = re.sub(
-                        r'(MAX_POSITION_RATIO\s*=\s*)[0-9.]+',
-                        r'\g<1>' + str(float(pos)),
-                        src
-                    )
-                if src != original:
-                    rt_path.write_text(src, encoding="utf-8")
-                    changed["source_patched"] = str(rt_path)
-                    log.info(f"[bt_apply] rt.py 소스 패치 완료: {changed}")
-
-            if changed:
-                return jsonify({"ok": True, "applied": changed, "msg": "런타임 + 소스 파일 동시 적용 완료"})
-            return jsonify({"ok": False, "error": "적용할 파라미터 없음"})
-        except Exception as e:
-            log.error(f"[bt_apply] 오류: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.route("/api/opt/run", methods=["POST"])
-    def api_opt_run():
-        """opt.py 실행 (--fast 모드)"""
-        import subprocess
-        try:
-            rt = _rt_module
-            base = Path(rt.__file__).parent if rt else Path(".")
-            opt_path = base / "opt.py"
-            if not opt_path.exists():
-                return jsonify({"error": "opt.py 없음"}), 404
-
-            body = request.get_json(silent=True) or {}
-            samples = body.get("samples", 400)
-            seed    = body.get("seed",    42)
-            do_apply = body.get("apply", False)
-
-            cmd = [
-                "python3", str(opt_path),
-                "--fast", f"--samples={samples}", f"--seed={seed}"
-            ]
-            if do_apply:
-                cmd += ["--apply", "--tg"]
-
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=str(base)
-            )
-            return jsonify({"ok": True, "msg": f"opt.py 실행 시작 (samples={samples})", "pid": proc.pid})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
 
     return app
 

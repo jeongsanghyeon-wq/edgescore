@@ -1,0 +1,20 @@
+{
+  "ts": "20260308_095003",
+  "start": "20230101",
+  "end": "20260301",
+  "slip": 2.0,
+  "pos": 0.2,
+  "alt_filter": {
+    "BULL": 2.0,
+    "SIDE": 2.5,
+    "BEAR": 3.0
+  },
+  "final_capital": 18095671,
+  "total_ret": 80.96,
+  "mkt_total": 35.01,
+  "alpha": 45.95,
+  "mdd": -0.29,
+  "win_rate": 55.56,
+  "total_trades": 27,
+  "initial_capital": 10000000
+}

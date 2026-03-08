@@ -866,6 +866,12 @@ _pending_sell_lock = threading.Lock()
 _pending_buy: set = set()
 _pending_buy_lock = threading.Lock()
 
+# ── [CRITICAL-FIX] 치명 예외 카운터 ─────────────────────────────
+_critical_fail_counts: dict = {}   # {"order": 0, "fill": 0, "balance": 0}
+_critical_fail_lock   = threading.Lock()
+_CRITICAL_FAIL_LIMIT  = 3          # 연속 N회 실패 시 알림 + 신규진입 중단
+_critical_halt        = False      # True 시 신규 매수 차단
+
 # ══════════════════════════════════════════════════
 # 네이버 금융 크롤링 — 외국인 순매수 / 전종목 거래대금
 # ══════════════════════════════════════════════════
@@ -2201,6 +2207,7 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
                 _icon = "🔵"   if kw._mock else "🟢"
                 fill = kw.get_order_fill(order_no, ticker)
                 if fill and fill.get("filled"):
+                    _critical_ok("fill")   # [CRITICAL-FIX] fill 조회 성공 → 카운터 리셋
                     cntr_qty = fill["cntr_qty"]
                     cntr_uv  = fill["cntr_uv"]
                     cntr_tm  = fill.get("cntr_tm", "")
@@ -2318,8 +2325,10 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
         if not _kw_ever_ok:
             log.error(f"[체결확인실패] {ticker} {_action} — 60초 동안 kiwoom() 재획득 실패, 상태 정리 강제 수행")
             _fail_reason = "키움 클라이언트 연결 실패 (60초 동안 재시도)"
+            _critical_fail("fill")  # [CRITICAL-FIX] 체결 조회 완전 실패 카운터
         else:
             _fail_reason = "60초 내 체결 미확인"
+            _critical_fail("fill")  # [CRITICAL-FIX] 60초 내 체결 미확인 카운터
 
         if action == "buy":
             # [BUG-FIX] timeout 시 누적 체결수량(_last_cntr_qty) 기반 3단계 정산
@@ -2480,6 +2489,137 @@ def _notify_on_fill(order_no: str, ticker: str, name: str,
     threading.Thread(target=_wait_and_notify, daemon=True).start()
 
 
+def _broker_reconcile(monitor) -> None:
+    """재시작/장 시작 후 로컬 positions와 키움 실제 잔고를 대조.
+    로컬에만 있는 종목(유령 포지션) → 경고 발송
+    브로커에만 있는 종목(누락 포지션) → 자동 추가
+    수량 불일치 → 브로커 수량 기준 자동 보정
+    """
+    _ts = datetime.now().strftime("%H:%M:%S")
+    log.info(f"[RECONCILE] start  ({_ts})")
+    try:
+        kw = kiwoom()
+        if kw is None:
+            log.warning("[RECONCILE] kiwoom() None — 건너뜀")
+            return
+
+        bal = kw.get_balance()
+        if bal is None:
+            log.warning("[RECONCILE] 잔고 조회 실패 — 건너뜀")
+            _critical_fail("balance")
+            return
+        _critical_ok("balance")
+
+        broker_pos = {}
+        for item in bal:
+            tk = item.get("ticker") or item.get("종목코드", "")
+            shares = int(item.get("shares") or item.get("보유수량") or 0)
+            bp     = float(item.get("buy_price") or item.get("평균단가") or 0)
+            nm     = item.get("name") or item.get("종목명") or tk
+            if tk and shares > 0:
+                broker_pos[tk] = {"shares": shares, "buy_price": bp, "name": nm}
+
+        local_pos  = set(monitor.positions.keys())
+        broker_set = set(broker_pos.keys())
+
+        log.info(f"[RECONCILE] broker={len(broker_pos)}  local={len(local_pos)}")
+
+        issues = []
+
+        # ① 로컬에만 있음 → 유령 포지션 경고
+        ghost = local_pos - broker_set
+        for tk in ghost:
+            nm = monitor.positions[tk].get("name", tk)
+            log.warning(f"[RECONCILE] ghost    {nm}({tk}) — 로컬에만 존재")
+            issues.append(f"  ⚠️ 유령 포지션: {nm}({tk}) — 로컬에만 있고 브로커에 없음")
+
+        # ② 브로커에만 있음 → 누락 포지션 자동 추가
+        missing = broker_set - local_pos
+        for tk in missing:
+            info = broker_pos[tk]
+            nm   = info["name"]
+            if tk in _pending_buy or tk in _pending_sell:
+                log.info(f"[RECONCILE] skip     {nm}({tk}) — pending 중, 정상")
+                continue
+            log.warning(f"[RECONCILE] missing  {nm}({tk}) {info['shares']}주 → 자동 추가")
+            issues.append(f"  🔴 누락 포지션: {nm}({tk}) {info['shares']}주 @{info['buy_price']:,.0f}원 → 자동 추가")
+            with _positions_lock:
+                monitor.positions[tk] = {
+                    "name":      nm,
+                    "shares":    info["shares"],
+                    "buy_price": info["buy_price"],
+                    "sector":    "기타",
+                    "buy_date":  date.today().isoformat(),
+                    "_reconciled": True,
+                }
+                save_positions(monitor.positions)
+
+        # ③ 수량 불일치 → 브로커 수량 기준 자동 보정
+        for tk in local_pos & broker_set:
+            local_shares  = int(monitor.positions[tk].get("shares", 0))
+            broker_shares = broker_pos[tk]["shares"]
+            nm = monitor.positions[tk].get("name", tk)
+            if abs(local_shares - broker_shares) > 0:
+                log.warning(f"[RECONCILE] mismatch {nm}({tk})  qty {local_shares} → {broker_shares}")
+                with _positions_lock:
+                    monitor.positions[tk]["shares"] = broker_shares
+                    broker_bp = broker_pos[tk].get("buy_price", 0)
+                    if broker_bp > 0:
+                        monitor.positions[tk]["buy_price"] = broker_bp
+                        log.info(f"[RECONCILE] mismatch {nm}({tk})  buy_price → {broker_bp:,.0f}원")
+                    monitor.positions[tk]["_reconciled_mismatch"] = True
+                    monitor.positions[tk]["_reconciled_at"] = datetime.now().isoformat()
+                    save_positions(monitor.positions)
+                issues.append(
+                    f"  🔧 수량 자동 보정: {nm}({tk}) 로컬 {local_shares}주 → 브로커 {broker_shares}주"
+                    + (f" / 평균단가 {broker_bp:,.0f}원" if broker_bp > 0 else "")
+                )
+            else:
+                log.info(f"[RECONCILE] ok       {nm}({tk})  {local_shares}주 일치")
+
+        # ④ 결과 발송
+        if issues:
+            msg = ("🔍 <b>[잔고 대사]</b> 불일치 발견\n"
+                   "━━━━━━━━━━━━━━━━━━\n" +
+                   "\n".join(issues) + "\n\n"
+                   "⚠️ 실계좌를 직접 확인하고 필요 시 수동 정정해주세요.")
+            tg(msg)
+            log.info(f"[RECONCILE] done   issues={len(issues)}")
+        else:
+            log.info("[RECONCILE] done   ✅ 전체 일치")
+
+    except Exception as e:
+        log.error(f"[RECONCILE] error  {e}")
+
+def _critical_fail(key: str, monitor=None) -> bool:
+    """치명 오류 카운터 증가. 임계치 초과 시 텔레그램 알림 + 신규진입 중단.
+    반환값: True = 차단 상태, False = 아직 허용
+    key: "order" | "fill" | "balance"
+    """
+    global _critical_halt
+    with _critical_fail_lock:
+        _critical_fail_counts[key] = _critical_fail_counts.get(key, 0) + 1
+        cnt = _critical_fail_counts[key]
+    if cnt >= _CRITICAL_FAIL_LIMIT and not _critical_halt:
+        _critical_halt = True
+        log.error(f"[CRITICAL] {key} 연속 {cnt}회 실패 → 신규 매수 차단")
+        try:
+            tg(f"🚨 <b>[시스템 경고]</b> {key} 오류가 {cnt}회 연속 발생했습니다.\n"
+               f"신규 매수가 자동으로 차단됐습니다.\n"
+               f"보유 종목 손절/청산은 정상 작동합니다.\n"
+               f"로그 확인 후 /비상정지해제 로 복구하세요.")
+        except Exception:
+            pass
+    return _critical_halt
+
+
+def _critical_ok(key: str):
+    """성공 시 해당 키 카운터 리셋"""
+    with _critical_fail_lock:
+        if _critical_fail_counts.get(key, 0) > 0:
+            _critical_fail_counts[key] = 0
+
+
 def _recover_pending_on_startup(monitor) -> None:
     """재시작 시 미체결/pending 주문 상태를 실계좌 기준으로 복구.
 
@@ -2501,6 +2641,11 @@ def _recover_pending_on_startup(monitor) -> None:
 
         # ① 실계좌 미체결 주문 목록 조회
         live_orders = kw.get_pending_orders()  # [{order_no, ticker, action, ...}]
+        if live_orders is None:
+            log.warning("[재시작복구] get_pending_orders() None — 미체결 복구 건너뜀")
+            _critical_fail("fill")  # [CRITICAL-FIX] 미체결 조회 실패 카운터
+            return
+        _critical_ok("fill")  # [CRITICAL-FIX] 미체결 조회 성공
         live_by_ticker = {}
         for o in live_orders:
             live_by_ticker.setdefault(o["ticker"], []).append(o)
@@ -2842,11 +2987,13 @@ def _start_orphan_watcher(
 
                 if fill.get("is_final", False):
                     log.info(f"[{_mode_str}] {name}({ticker}) {action} — 최종체결 확인, 추적 종료")
+                    _critical_ok("fill")  # [CRITICAL-FIX] 최종체결 확인 → fill 카운터 리셋
                     _release_pending(action, ticker, name, monitor, is_final=True, prev_qty=_prev_qty)
                     return
 
             except Exception as e:
                 log.warning(f"[{_mode_str}] {name}({ticker}) 오류: {e}")
+                _critical_fail("fill")  # [CRITICAL-FIX] orphan watcher 조회 오류 카운터
 
     threading.Thread(target=_watcher, daemon=True, name=f"orphan-{ticker}").start()
 
@@ -3188,6 +3335,8 @@ class TelegramCommander:
             "trading_mock":       self._trading_mock,
             "check_connection":   self._check_connection,
             "emergency_stop":     self._emergency_stop,
+            "critical_reset":     self._critical_reset,
+            "비상정지해제":          self._critical_reset,
         }
         if cmd in dispatch:
             dispatch[cmd]()
@@ -3577,6 +3726,7 @@ class TelegramCommander:
                     _new_position["_restore_pos"] = (
                         {k: v for k, v in existing.items()} if is_add and existing else None
                     )
+                    _critical_ok("order")  # [CRITICAL-FIX] 주문 성공 → 카운터 리셋
                     tg(f"📨 [{_mode}] 매수주문 접수 → 체결 대기 중...\n"
                        f"종목: {name} | {shares:,}주 | {buy_price:,}원")
                     _notify_on_fill(
@@ -3598,6 +3748,7 @@ class TelegramCommander:
                     )
                 else:
                     _pending_buy.discard(ticker)  # [2순위-FIX] 주문 실패 → 선점 즉시 해제
+                    _critical_fail("order")       # [CRITICAL-FIX] 주문 실패 카운터
                     tg(f"⚠️ [{_mode}] 매수주문 실패: {_res.get('error','')}\n"
                        f"종목: {name}\n"
                        f"❗ 포지션/로그 저장 스킵 (재시도 후 직접 확인 권장)")
@@ -5000,6 +5151,14 @@ class TelegramCommander:
             [[{"text": "🏠 메인 메뉴", "callback_data": "menu"}]]
         )
 
+    def _critical_reset(self):
+        """치명 오류 차단 해제 — /비상정지해제"""
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod._critical_halt = False
+        _mod._critical_fail_counts.clear()
+        tg("✅ <b>치명 오류 차단 해제</b>\n━━━━━━━━━━━━━━━━━━\n신규 매수 스캔이 재개됩니다.")
+
     # ════════════════════════════════════════════
     # 유니버스 추가·제거 (텍스트 전용)
     # ════════════════════════════════════════════
@@ -5712,6 +5871,11 @@ class EdgeMonitor:
         if "09:00" <= _now_t < "09:05" and not force_notify:
             log.debug(f"[장초버퍼] {_now_t} 매수 스캔 스킵 (09:00~09:05 매매 차단)")
             return
+        # [CRITICAL-FIX] 치명 오류 누적 시 신규 매수 스캔 중단
+        if _critical_halt:
+            log.warning("[CRITICAL-HALT] 신규 매수 스캔 차단 중 (/비상정지해제 로 복구)")
+            return
+
         now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows         = []
         regime_emoji = {"BULL":"📈","SIDE":"➡️","BEAR":"📉"}.get(
@@ -6921,6 +7085,14 @@ class EdgeMonitor:
         threading.Thread(target=_run, daemon=True).start()
     # ── 아침 전략 보고 ────────────────────────────
     def morning_report(self):
+        # ── [RECONCILE] 장 시작 후 브로커 잔고 대사 ─────────────────────
+        # 재시작 시 대사와 목적이 다름: 전날 장마감 이후 권리락·액면분할·
+        # 상장폐지 등 키움 서버 측 수량 변동을 잡기 위한 일일 1회 대사
+        try:
+            _broker_reconcile(self)
+        except Exception as _e_rec:
+            log.warning(f"[morning reconcile] 오류: {_e_rec}")
+
         # ㊱ 서킷브레이커 매일 해제 + 해제 알림
         if getattr(self, '_circuit_active', False):
             self._circuit_active = False   # ✅ 매일 아침 서킷브레이커 자동 해제
@@ -7094,8 +7266,21 @@ class EdgeMonitor:
 # 실행 진입점
 # ══════════════════════════════════════════════════
 if __name__ == "__main__":
+    import signal as _signal
+
+    # ── [SIGTERM-FIX] 명시적 SIGTERM 핸들러 등록 ────────────────────
+    # Python 기본 SIGTERM은 finally 블록 실행 보장 없음
+    # runner.sh graceful shutdown과 완전히 맞물리도록 명시 처리
+    _shutdown_requested = False
+    def _sigterm_handler(signum, frame):
+        global _shutdown_requested
+        _shutdown_requested = True
+        log.info("[SIGTERM] 종료 신호 수신 — 정상 종료 절차 시작")
+        raise SystemExit(0)   # finally 블록 실행 보장
+    _signal.signal(_signal.SIGTERM, _sigterm_handler)
+
     log.info("=" * 55)
-    log.info("  🚀 EQS V1.0 (Edge Quant Signal) 가동")
+    log.info("  🚀 EQS V1.1 (Edge Quant Signal) 가동")
     log.info("=" * 55)
 
     # [3순위-FIX] 실계좌 모드에서 EMERGENCY_STOP=True면 시작 차단
@@ -7113,6 +7298,11 @@ if __name__ == "__main__":
     # [35차-FIX] 재시작 시 미체결/pending 상태 복구
     # positions에 pending=True 종목 → 실계좌 미체결 조회 → _pending_buy/_pending_sell 복원 + watcher 재기동
     _recover_pending_on_startup(monitor)
+
+    # ── [BROKER-RECONCILE] 브로커 잔고 기준 포지션 대사 ──────────────
+    # pending 복구 완료 후 실행 (pending 종목 스킵하여 오탐 방지)
+    _broker_reconcile(monitor)
+
     try:
         _mode = "mock" if (_kw_start and getattr(_kw_start, "_mock", True)) else "live"
         save_runtime_snapshot(monitor=monitor, mode=_mode, emergency_stop=EMERGENCY_STOP)

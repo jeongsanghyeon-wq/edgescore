@@ -263,7 +263,7 @@ export default function Dashboard(){
           <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(3,1fr)",gap:mobile?8:10,marginBottom:8}}>
             {[{l:"평가금",v:`₩${fmt(sm.total_eval)}`,s:`원금 ₩${fmt(sm.total_invested)}`,c:"#3b82f6"},
               {l:"손익",v:`₩${fmt(sm.total_pnl)}`,s:pct(sm.total_ret||0),c:(sm.total_pnl||0)>=0?"#22c55e":"#ef4444"},
-              {l:"가용현금(추정)",v:`₩${fmt(sm.available_cash)}`,s:`실예수금 ₩${fmt(sm.deposit_actual??account?.deposit??0)}`,c:"#f59e0b"}].map((c,i)=>
+              {l:"가용현금",v:`₩${fmt(sm.available_cash)}`,s:`총자산 ₩${fmt(sm.capital)}`,c:"#f59e0b"}].map((c,i)=>
               <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>
                 <div style={{fontSize:mobile?15:18,fontWeight:700,color:c.c,marginTop:1}}>{c.v}</div>
@@ -271,7 +271,7 @@ export default function Dashboard(){
               </div>)}
           </div>
           <div style={{display:"grid",gridTemplateColumns:mobile?"1fr 1fr":"repeat(2,1fr)",gap:mobile?8:10,marginBottom:12}}>
-            {[{l:"하한선",v:`₩${fmt(sm.floor)}`,s:`여유 ₩${fmt(sm.floor_remaining)} (총자산 ₩${fmt(sm.total_asset||sm.total_eval)})`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
+            {[{l:"하한선",v:`₩${fmt(sm.floor)}`,s:`여유 ₩${fmt(sm.floor_remaining)}`,c:(sm.floor_remaining||0)>0?"#22c55e":"#ef4444"},
               {l:"보유",v:`${sm.count||0}개`,s:`트레일링 ${sm.trail_active_count||0}`,c:"#8b5cf6"}].map((c,i)=>
               <div key={i} style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:mobile?"10px":"12px 14px",borderLeft:`3px solid ${c.c}`}}>
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>{c.l}</div>
@@ -401,7 +401,36 @@ export default function Dashboard(){
               :<div style={{color:"#64748b",textAlign:"center",padding:16}}>로딩...</div>}</div></div></>}
 
         {/* ═══ 시스템 ═══ */}
-        {tab==="system"&&system&&<><div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
+        {tab==="system"&&system&&<>
+
+          {/* ── ENGINE HALTED 배너 ── */}
+          {system.critical_halt&&<div style={{background:"#7f1d1d",border:"1px solid #ef4444",borderRadius:8,padding:"10px 14px",marginBottom:12,display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:18}}>🚨</span>
+            <div>
+              <div style={{fontWeight:700,color:"#fca5a5",fontSize:13}}>ENGINE HALTED — 신규 매수 차단 중</div>
+              <div style={{fontSize:10,color:"#fca5a5",marginTop:2}}>
+                {Object.entries(system.critical_counts||{}).filter(([,v])=>v>0).map(([k,v])=>`${k}: ${v}회 실패`).join("  /  ")||"오류 누적"}
+              </div>
+              <div style={{fontSize:10,color:"#fca5a5aa",marginTop:2}}>텔레그램에서 /비상정지해제 로 복구하세요</div>
+            </div>
+          </div>}
+
+          {/* ── RECONCILE 상태 카드 ── */}
+          <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:"8px 12px",marginBottom:12,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:11,color:"#94a3b8"}}>🔍 마지막 잔고 대사</span>
+            <span style={{fontSize:11,fontWeight:600,color:
+              system.last_reconcile?.status==="ok"?"#22c55e":
+              system.last_reconcile?.status==="issues"?"#f59e0b":
+              system.last_reconcile?.status==="error"?"#ef4444":"#64748b"}}>
+              {system.last_reconcile?.status==="ok"&&"✅ 전체 일치"}
+              {system.last_reconcile?.status==="issues"&&`⚠️ ${system.last_reconcile.issues}건 수정됨`}
+              {system.last_reconcile?.status==="error"&&"❌ 오류"}
+              {system.last_reconcile?.status==="unknown"&&"⏳ 미확인"}
+              {system.last_reconcile?.ts&&<span style={{color:"#475569",marginLeft:6,fontWeight:400}}>{system.last_reconcile.ts.slice(11,19)}</span>}
+            </span>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 1fr",gap:12}}>
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>📡 데이터 소스</div>
             {system.active_source&&<div style={{marginBottom:6,padding:"4px 8px",background:"#22c55e22",border:"1px solid #22c55e44",borderRadius:4,fontSize:10,color:"#22c55e"}}>🟢 현재 사용: <b>{system.active_source}</b></div>}
@@ -410,7 +439,7 @@ export default function Dashboard(){
           <div style={{background:"#111827",border:"1px solid #1e293b",borderRadius:8,padding:12}}>
             <div style={{fontSize:11,fontWeight:700,marginBottom:6}}>⚙️ 파라미터</div>
             {system.current_params&&Object.entries(system.current_params).map(([k,v],i)=>v!=null&&<div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e293b",fontSize:10}}>
-              <span style={{color:"#94a3b8"}}>{k}</span><span style={{fontWeight:600}}>{typeof v==="number"?v.toFixed?.(4)??v:String(v)}</span></div>)}</div></div></>}
+              <span style={{color:"#94a3b8"}}>{k}</span><span style={{fontWeight:600}}>{typeof v==="number"?v.toFixed?.(4)??v:String(v)}</span></div>)}</div></div></div></>}
 
         {/* ═══ 체결내역 ═══ */}
         {tab==="trades"&&<>
@@ -441,10 +470,10 @@ export default function Dashboard(){
               <th style={{padding:"6px 4px",textAlign:"right"}}>손익</th>
             </tr></thead>
             <tbody>{trades.slice(0,50).map((t,i)=>{
-              const isBuy=t.action==="buy"||t.action==="BUY";
+              const isBuy=t.action==="BUY";
               const pnl=t.pnl||0;
               return <tr key={i} style={{borderBottom:"1px solid #1e293b11",background:i%2?"#0f172a33":"transparent"}}>
-                <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.created_at||t.timestamp||"").slice(11,16)}</td>
+                <td style={{padding:"5px 4px",color:"#64748b"}}>{(t.timestamp||"").slice(11,16)}</td>
                 <td style={{padding:"5px 4px",fontWeight:600}}>{t.name||t.ticker}</td>
                 <td style={{padding:"5px 4px",textAlign:"center"}}><span style={{background:isBuy?"#22c55e22":"#ef444422",color:isBuy?"#22c55e":"#ef4444",padding:"2px 6px",borderRadius:4,fontWeight:700,fontSize:10}}>{isBuy?"매수":"매도"}</span></td>
                 <td style={{padding:"5px 4px",textAlign:"right"}}>{fmt(t.shares)}주</td>
