@@ -1,0 +1,10 @@
+{
+  "runtime_snapshot": {
+    "ts": "2026-03-08T09:02:01",
+    "mode": "mock",
+    "positions": 0,
+    "universe": 10,
+    "regime": "SIDE",
+    "emergency_stop": false
+  }
+}

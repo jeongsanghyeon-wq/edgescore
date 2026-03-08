@@ -1,18 +1,10 @@
 """
-EQS V1.1 (Edge Quant Signal) — Dashboard API Server
+Edge Score v39.9 — Dashboard API Server v1.8
 =============================================================
-EQS V1.0 → EQS V1.1 변경사항:
+v1.0 → v1.5 변경사항:
   [1] API 캐시 (3초) — 데이터소스 부하 감소 + 네이버 차단 방지
   [2] 스레드 안전성 — _monitor 접근 시 Lock + 스냅샷(deepcopy)
   [3] 텔레그램 알림 — 캐시 히트율 이상 시 알림
-
-EQS V1.1 수정사항:
-  [BUG-FIX] api_portfolio summary에 available_cash 키 추가
-            (총자본 - 평가금) → Dashboard 가용현금 패널 항상 ₩0 버그 수정
-
-EQS V1.1-rc 수정사항:
-  [BUG-FIX] _cached() 데코레이터 ttl 파라미터 미지원 → TypeError 크래시 수정
-            api_account(@_cached("account", ttl=_CACHE_TTL_ACCOUNT)) 정상 동작
 
 사용법: rt.py main에서
   from dashboard_api import start_dashboard
@@ -42,57 +34,20 @@ log = logging.getLogger("dashboard")
 _monitor = None
 _rt_module = None
 
-def _get_db_path():
-    """TRADE_DB_FILE: rt_module 상수 우선, fallback은 스크립트 기준 절대경로"""
-    if _rt_module and hasattr(_rt_module, "TRADE_DB_FILE"):
-        return _rt_module.TRADE_DB_FILE
-    return Path(__file__).parent / "trade_history.db"
-
-def _get_alerts_path():
-    """ALERTS_FILE: rt_module 상수 우선, fallback은 스크립트 기준 절대경로"""
-    if _rt_module and hasattr(_rt_module, "ALERTS_FILE"):
-        return _rt_module.ALERTS_FILE
-    return Path(__file__).parent / "alerts_today.json"
-
 # ══════════════════════════════════════════
 # [개선1] API 캐시 — 동일 엔드포인트 3초 내 재요청 시 캐시 반환
 # ══════════════════════════════════════════
 _cache = {}
 _CACHE_TTL = 3
-_CACHE_TTL_ACCOUNT = 30   # [EQS V1.1] api_account 전용 30초 캐시 (키움 API 과호출 방지)
-
-# [BUG-FIX-2] deposit 공유 캐시 — api_portfolio / api_risk / api_account가 각자
-# get_deposit()을 호출하면 대시보드 5초 폴링 기준 분당 최대 ~40회 키움 API 호출 발생
-# → 30초 TTL 공유 캐시로 단일화: 모든 엔드포인트가 같은 값 재사용
-_deposit_cache: dict = {"value": 0, "ts": 0.0}
-_DEPOSIT_CACHE_TTL = 30  # 초
-
-def _get_deposit_cached(rt) -> int:
-    """deposit 공유 캐시 — 30초 TTL, 모든 API 엔드포인트 공유"""
-    now = _time.time()
-    if now - _deposit_cache["ts"] < _DEPOSIT_CACHE_TTL:
-        return _deposit_cache["value"]
-    try:
-        kw = rt.kiwoom() if hasattr(rt, "kiwoom") else None
-        if kw:
-            dep = kw.get_deposit()
-            _deposit_cache["value"] = dep
-            _deposit_cache["ts"]    = now
-            return dep
-    except Exception:
-        pass
-    return _deposit_cache["value"]   # 실패 시 이전 값 반환
 
 
-def _cached(endpoint_key, ttl=None):
-    # [EQS V1.1 BUG-FIX] ttl 파라미터 지원 추가 — api_account의 @_cached("account", ttl=_CACHE_TTL_ACCOUNT) TypeError 수정
-    _ttl = ttl if ttl is not None else _CACHE_TTL
+def _cached(endpoint_key):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             now = _time.time()
             cached = _cache.get(endpoint_key)
-            if cached and (now - cached["ts"]) < _ttl:
+            if cached and (now - cached["ts"]) < _CACHE_TTL:
                 return jsonify(cached["data"])
             result = fn(*args, **kwargs)
             if isinstance(result, dict):
@@ -133,33 +88,24 @@ def _safe_attr(attr, default=None):
             return default
 
 
-def start_dashboard(monitor, rt_module=None, port=5000):
+def start_dashboard(monitor, port=5000):
     global _monitor, _rt_module
     _monitor = monitor
     if not FLASK_OK:
         log.warning("⚠️ Flask 미설치 — 대시보드 비활성. pip install flask flask-cors")
         return
-    # [BUG-FIX-B] importlib.import_module("rt") 이중 로드 방지
-    # python rt.py 실행 시 "rt"와 "__main__"이 별개 모듈 → C/캐시/kiwoom 싱글턴 분리 위험
-    # rt.py에서 sys.modules["__main__"]을 직접 전달받아 동일 인스턴스 공유
-    if rt_module is not None:
-        _rt_module = rt_module
-    else:
-        # 폴백: 직접 import 시도 (단독 실행 또는 테스트 목적)
-        import importlib, sys as _sys
-        _rt_module = _sys.modules.get("rt") or _sys.modules.get("__main__")
-        if _rt_module is None:
-            try:
-                _rt_module = importlib.import_module("rt")
-            except Exception as e:
-                log.error(f"rt 모듈 로드 실패: {e}")
-                return
+    import importlib
+    try:
+        _rt_module = importlib.import_module("rt")
+    except Exception as e:
+        log.error(f"rt 모듈 import 실패: {e}")
+        return
     app = _create_app()
     t = threading.Thread(target=lambda: app.run(
         host="0.0.0.0", port=port, debug=False, use_reloader=False
     ), daemon=True)
     t.start()
-    log.info(f"📊 대시보드 API EQS V1.1 서버 시작: http://0.0.0.0:{port}")
+    log.info(f"📊 대시보드 API v1.8 서버 시작: http://0.0.0.0:{port}")
     log.info(f"   캐시 TTL: {_CACHE_TTL}초 | Lock: 활성 | AbortController: 프론트 적용")
 
 
@@ -169,7 +115,7 @@ def _create_app():
 
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "version": "EQS V1.1",
+        return jsonify({"status": "ok", "version": "v1.8",
                         "cache_ttl": _CACHE_TTL, "timestamp": datetime.now().isoformat()})
 
     @app.route("/api/status")
@@ -177,7 +123,7 @@ def _create_app():
     def api_status():
         C = _rt_module.C
         return {
-            "version": "EQS V1.1", "regime": _safe_attr("regime", "SIDE"),
+            "version": "v39.9", "regime": _safe_attr("regime", "SIDE"),
             "circuit_active": _safe_attr("_circuit_active", False),
             "market_open": _rt_module.is_market_hour(),
             "today_alerts": _safe_attr("today_alerts", 0),
@@ -206,9 +152,7 @@ def _create_app():
                 df_sl = rt.get_ohlcv(ticker, days=30)
                 atr = rt.calc_atr(df_sl) if df_sl is not None else cp * 0.02
                 dyn_sl = rt.calc_dynamic_sl(atr, cp, ticker, _safe_attr("regime", "SIDE"))
-                # [EQS V1.1 BUG-FIX] 손절가 표시를 실제 트리거와 동일하게 매수가 기준으로
-                _sl_base = buy_p if buy_p > 0 else cp
-                sl_price = round(_sl_base * (1 + dyn_sl), -1)
+                sl_price = round(cp * (1 + dyn_sl), -1)
                 df_edge = rt.get_ohlcv(ticker, days=60)
                 edge = 0
                 if df_edge is not None:
@@ -236,11 +180,6 @@ def _create_app():
         total_eval = sum(h["current_price"] * h["shares"] for h in holdings)
         capital = C.get("TOTAL_CAPITAL", 10_000_000)
         floor = capital * C.get("CAPITAL_FLOOR_RATIO", 0.70)
-        # [BUG-FIX-D2] 실제 예수금(deposit) 조회 → 총자산 = 주식평가 + 실예수금
-        # [BUG-FIX-2] 공유 캐시 _get_deposit_cached() 사용 (분당 ~40회 → 2회/분 수준으로 감소)
-        _deposit_actual = _get_deposit_cached(rt)
-        _total_asset = total_eval + _deposit_actual   # 실제 총자산 (주식평가 + 예수금)
-
         return {
             "holdings": holdings,
             "summary": {
@@ -248,12 +187,7 @@ def _create_app():
                 "total_pnl": round(total_eval - total_inv),
                 "total_ret": round((total_eval - total_inv) / total_inv, 4) if total_inv > 0 else 0,
                 "capital": capital, "floor": floor,
-                # [BUG-FIX-D2] floor_remaining: 총자산(주식+예수금) 기준으로 계산
-                # 이전: total_eval만 → 예수금 무시로 여유자금 과소 표시
-                "floor_remaining": round(max(0, _total_asset - floor)),
-                "available_cash": round(max(0, capital - total_eval)),   # 이론적 여유자금 (추정)
-                "deposit_actual": _deposit_actual,                        # 실제 키움 예수금
-                "total_asset": round(_total_asset),                       # 실제 총자산 (주식+예수금)
+                "floor_remaining": round(max(0, total_eval - floor)),
                 "count": len(holdings),
                 "trail_active_count": sum(1 for h in holdings if h["trail_active"]),
             }
@@ -303,7 +237,7 @@ def _create_app():
     @app.route("/api/alerts")
     @_cached("alerts")
     def api_alerts():
-        alert_file = _get_alerts_path()  # [BUG-FIX] rt_module 상수 우선
+        alert_file = Path("alerts_today.json")
         alerts = []
         if alert_file.exists():
             try:
@@ -436,8 +370,7 @@ def _create_app():
                 "current_price": round(cp), "ret": round(ret, 4),
                 "edge": round(edge * 100), "hold_days": hold_days,
                 "action": action, "reasons": reasons,
-                # [EQS V1.1 BUG-FIX] 매수가 기준 손절가 표시 (실제 트리거와 동일)
-                "sl_price": round((buy_p if buy_p > 0 else cp) * (1 + dyn_sl), -1),
+                "sl_price": round(cp * (1 + dyn_sl), -1),
                 "trail_active": trail,
             })
         except Exception as e:
@@ -535,17 +468,11 @@ def _create_app():
         total_eval = sum(h["value"] for h in holdings)
         capital = C.get("TOTAL_CAPITAL", 10_000_000)
         floor = capital * C.get("CAPITAL_FLOOR_RATIO", 0.70)
-        # [BUG-FIX-D2] risk gauge: 실제 총자산 = 주식평가 + 실예수금 기준
-        # [BUG-FIX-2] 공유 캐시 _get_deposit_cached() 사용 (api_portfolio와 동일 값 재사용)
-        _dep_risk = _get_deposit_cached(rt)
-        _total_asset_risk = total_eval + _dep_risk
         gauge = {
-            "current": _total_asset_risk, "capital": capital, "floor": floor,
-            "pct": round(_total_asset_risk / capital, 4) if capital > 0 else 0,
+            "current": total_eval, "capital": capital, "floor": floor,
+            "pct": round(total_eval / capital, 4) if capital > 0 else 0,
             "floor_pct": C.get("CAPITAL_FLOOR_RATIO", 0.70),
-            "danger": _total_asset_risk < floor * 1.1,
-            "deposit": _dep_risk,           # 실예수금 (별도 표시용)
-            "eval_only": total_eval,        # 주식평가금 (참고용)
+            "danger": total_eval < floor * 1.1,
         }
 
         price_data = {}
@@ -623,7 +550,7 @@ def _create_app():
     @_cached("sentiment")
     def api_sentiment():
         C = _rt_module.C
-        alert_file = _get_alerts_path()  # [BUG-FIX] rt_module 상수 우선
+        alert_file = Path("alerts_today.json")
         alerts = []
         if alert_file.exists():
             try:
@@ -752,7 +679,7 @@ def _create_app():
         today = date.today().isoformat()
         trades = []
         try:
-            db_path = _get_db_path()  # [BUG-FIX] rt_module 상수 우선
+            db_path = Path("trade_history.db")
             if db_path.exists():
                 import sqlite3 as _sq
                 conn = _sq.connect(str(db_path))
@@ -777,7 +704,7 @@ def _create_app():
         wins = 0
         sells = []
         try:
-            db_path = _get_db_path()  # [BUG-FIX] rt_module 상수 우선
+            db_path = Path("trade_history.db")
             if db_path.exists():
                 import sqlite3 as _sq
                 conn = _sq.connect(str(db_path))
@@ -818,7 +745,6 @@ def _create_app():
 
     # ── ⑥⑦ 투자 모드 + 예수금 ────────────────────────────
     @app.route("/api/account")
-    @_cached("account", ttl=_CACHE_TTL_ACCOUNT)   # [EQS V1.1] 30초 캐시
     def api_account():
         rt = _rt_module
         result = {
@@ -837,10 +763,6 @@ def _create_app():
                 result["host"]      = kw._host
                 try:
                     dep = kw.get_deposit()
-                    # [BUG-FIX-2] api_account에서 조회한 실값으로 공유 캐시도 갱신
-                    import time as _t_dep
-                    _deposit_cache["value"] = dep
-                    _deposit_cache["ts"]    = _t_dep.time()
                     result["deposit"]     = dep
                     result["deposit_str"] = f"{dep:,}원"
                 except Exception:
@@ -854,23 +776,181 @@ def _create_app():
             pass
         return result
 
+
+    # ══════════════════════════════════════
+    # 백테스트 API
+    # ══════════════════════════════════════
+
+    @app.route("/api/bt/results")
+    def api_bt_results():
+        """과거 백테스트 결과 목록"""
+        try:
+            import glob
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            result_dir = base / "bt_results"
+            result_dir.mkdir(exist_ok=True)
+            files = sorted(glob.glob(str(result_dir / "bt_*.json")), reverse=True)[:20]
+            results = []
+            for f in files:
+                try:
+                    data = json.loads(Path(f).read_text(encoding="utf-8"))
+                    results.append(data)
+                except Exception:
+                    pass
+            return jsonify({"results": results})
+        except Exception as e:
+            return jsonify({"results": [], "error": str(e)})
+
+    @app.route("/api/bt/run", methods=["POST"])
+    def api_bt_run():
+        """백테스트 실행 (bt.py를 subprocess로 실행)"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            bt_path = base / "bt.py"
+            if not bt_path.exists():
+                return jsonify({"error": "bt.py 파일이 없습니다"}), 404
+
+            body = request.get_json(silent=True) or {}
+            slip  = body.get("slip",  2.0)
+            pos   = body.get("pos",   0.20)
+            start = body.get("start", "20230101")
+            end   = body.get("end",   "20260301")
+
+            cmd = [
+                "python3", str(bt_path),
+                f"--slip={slip}",
+                f"--pos={pos}",
+                f"--start={start}",
+                f"--end={end}",
+                "--json", "--save"
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+                cwd=str(base)
+            )
+            # JSON 결과 파싱 (마지막 줄이 JSON)
+            out = proc.stdout.strip()
+            lines = [l for l in out.split("\n") if l.strip().startswith("{")]
+            if lines:
+                result = json.loads(lines[-1])
+                return jsonify({"ok": True, "result": result})
+            return jsonify({"ok": False, "error": proc.stderr[-500:] or "결과 없음"})
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "타임아웃 (5분 초과)"}), 408
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bt/download", methods=["POST"])
+    def api_bt_download():
+        """yfinance 데이터 사전 다운로드 (캐시 워밍업)"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            bt_path = base / "bt.py"
+
+            body = request.get_json(silent=True) or {}
+            start = body.get("start", "20200101")
+            end   = body.get("end",   "20260301")
+
+            # bt.py를 --json 모드로 가볍게 실행해 yfinance 캐시만 구성
+            cmd = [
+                "python3", str(bt_path),
+                f"--start={start}", f"--end={end}",
+                "--json"
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=str(base)
+            )
+            return jsonify({"ok": True, "msg": f"{start}~{end} 데이터 다운로드 시작", "pid": proc.pid})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bt/apply", methods=["POST"])
+    def api_bt_apply():
+        """백테스트 파라미터를 rt.py 설정에 적용 (런타임 즉시 반영)"""
+        try:
+            rt = _rt_module
+            if not rt:
+                return jsonify({"ok": False, "error": "rt 모듈 없음"}), 500
+
+            body = request.get_json(silent=True) or {}
+            slip = body.get("slip")
+            pos  = body.get("pos")
+
+            if not hasattr(rt, "C"):
+                return jsonify({"ok": False, "error": "rt.C 없음"}), 500
+
+            changed = {}
+            if slip is not None:
+                rt.C["SLIPPAGE_FILTER_RATIO"] = float(slip)
+                changed["SLIPPAGE_FILTER_RATIO"] = float(slip)
+            if pos is not None:
+                rt.C["MAX_POSITION_RATIO"] = float(pos)
+                changed["MAX_POSITION_RATIO"] = float(pos)
+
+            if changed:
+                log.info(f"[bt_apply] 파라미터 적용: {changed}")
+                return jsonify({"ok": True, "applied": changed})
+            return jsonify({"ok": False, "error": "적용할 파라미터 없음"})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/opt/run", methods=["POST"])
+    def api_opt_run():
+        """opt.py 실행 (--fast 모드)"""
+        import subprocess
+        try:
+            rt = _rt_module
+            base = Path(rt.__file__).parent if rt else Path(".")
+            opt_path = base / "opt.py"
+            if not opt_path.exists():
+                return jsonify({"error": "opt.py 없음"}), 404
+
+            body = request.get_json(silent=True) or {}
+            samples = body.get("samples", 400)
+            seed    = body.get("seed",    42)
+            do_apply = body.get("apply", False)
+
+            cmd = [
+                "python3", str(opt_path),
+                "--fast", f"--samples={samples}", f"--seed={seed}"
+            ]
+            if do_apply:
+                cmd += ["--apply", "--tg"]
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=str(base)
+            )
+            return jsonify({"ok": True, "msg": f"opt.py 실행 시작 (samples={samples})", "pid": proc.pid})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     return app
 
 
 # ── 유틸 ────────────────────────────────────
 def _get_sector(ticker):
-    """섹터 조회 — rt.SECTOR_MAP_RT 기준으로 위임 (EQS V1.1: dashboard 독립 맵 제거, 불일치 해소)"""
-    try:
-        if _rt_module is not None and hasattr(_rt_module, "get_sector_for_ticker_rt"):
-            return _rt_module.get_sector_for_ticker_rt(ticker)
-    except Exception:
-        pass
-    # fallback: rt 미로드 시 기본값
-    return "기타"
+    SECTOR_MAP = {
+        "005930": "반도체", "000660": "반도체", "042700": "반도체",
+        "005380": "자동차", "012330": "자동차",
+        "012450": "방산", "047810": "방산", "079550": "방산",
+        "010950": "정유", "096770": "정유", "267250": "정유",
+        "035420": "IT", "035720": "IT",
+        "068270": "바이오", "207940": "바이오",
+        "105560": "금융", "055550": "금융",
+        "006400": "2차전지", "373220": "2차전지",
+    }
+    return SECTOR_MAP.get(ticker, "기타")
 
 
 def log_alert(icon, msg, alert_type="info", responded=False):
-    alert_file = _get_alerts_path()  # [BUG-FIX] rt_module 상수 우선
+    alert_file = Path("alerts_today.json")
     try:
         alerts = json.loads(alert_file.read_text(encoding="utf-8")) if alert_file.exists() else []
     except:

@@ -158,7 +158,7 @@ INITIAL_CAPITAL     = 10_000_000
 KELLY_FRACTION      = 0.25
 BEAR_SIZE_MULT      = 0.5
 HIGH_CORR_SIZE_MULT = 0.7
-MAX_POSITION_RATIO  = 0.30
+MAX_POSITION_RATIO  = 0.20   # 0.30 → 0.20 (동시 보유 종목 수 확대)
 
 # ⑱ 포트폴리오 총 비중 제한
 EXPOSURE_CAP = {"BULL": 1.00, "SIDE": 0.70, "BEAR": 0.40}
@@ -191,7 +191,7 @@ TRAIL_TIGHTEN_MULT   = 0.7    # +25% 이상 구간 추가 축소 배수
 TAKE_PROFIT_FIXED    = 0.15   # 트레일링 미발동 구간 고정 익절
 
 # ㉑ 슬리피지 진입 금지 필터
-SLIPPAGE_FILTER_RATIO = 1.5   # 3.0 → 1.5 (매매빈도 개선)
+SLIPPAGE_FILTER_RATIO = 2.0   # 3.0 → 2.0 (매매빈도/현실성 균형)
 
 # ㉘ 기회비용 현실화 (한국 기준금리 3.5% ÷ 250 거래일)
 ALT_OPPORTUNITY_COST = 0.00014  # 기존 0.0001 → 0.00014 (연 3.5%)
@@ -212,9 +212,9 @@ ALT_FILTER_RATIO     = 3.5    # 기본값 (하위호환용, 실제 적용은 ㉚
 
 # ㉚ 국면 연동 동적 ALT_FILTER_RATIO
 ALT_FILTER_BY_REGIME = {
-    "BULL": 1.5,   # 추세장: 완화
-    "SIDE": 2.0,   # 횡보장: 완화
-    "BEAR": 2.5,   # 하락장: 완화 (기존 4.0)
+    "BULL": 2.0,   # 추세장
+    "SIDE": 2.5,   # 횡보장
+    "BEAR": 3.0,   # 하락장
 }
 
 # ㉛ 교체 마찰 비용 (Hold Friction Cost)
@@ -2683,13 +2683,76 @@ def run_scheduler():
 # 메인
 # ══════════════════════════════════════════════════════
 
-def main():
-    if "--scheduler" in sys.argv: run_scheduler(); return
+def _parse_args():
+    """CLI 인자 파싱 — 대시보드 및 직접 실행 모두 지원"""
+    import argparse
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--slip",    type=float, default=None)
+    p.add_argument("--pos",     type=float, default=None)
+    p.add_argument("--start",   type=str,   default=None)
+    p.add_argument("--end",     type=str,   default=None)
+    p.add_argument("--json",    action="store_true")   # JSON 결과만 출력
+    p.add_argument("--save",    action="store_true")   # bt_results/ 에 저장
+    p.add_argument("--scheduler", action="store_true")
+    args, _ = p.parse_known_args()
+    return args
 
-    print("\n" + "="*62)
-    print("  📊 EQS V1.2 백테스트 (Edge Quant Signal) (코스피200 동적 유니버스)")
-    print("="*62)
-    print(f"  기간: {START_DATE} ~ {END_DATE}")
+
+def _apply_args(args):
+    """CLI 인자로 전역 파라미터 오버라이드"""
+    global START_DATE, END_DATE, SLIPPAGE_FILTER_RATIO, MAX_POSITION_RATIO
+    global ALT_FILTER_BY_REGIME
+    if args.start: START_DATE = args.start
+    if args.end:   END_DATE   = args.end
+    if args.slip:
+        SLIPPAGE_FILTER_RATIO = args.slip
+        ALT_FILTER_BY_REGIME = {
+            "BULL": round(args.slip,      1),
+            "SIDE": round(args.slip+0.5,  1),
+            "BEAR": round(args.slip+1.0,  1),
+        }
+    if args.pos:   MAX_POSITION_RATIO = args.pos
+
+
+def _save_bt_result(port_pnl, args):
+    """백테스트 결과를 bt_results/ 폴더에 JSON으로 저장"""
+    from datetime import datetime as _dt
+    out_dir = Path(__file__).parent / "bt_results"
+    out_dir.mkdir(exist_ok=True)
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    slip = SLIPPAGE_FILTER_RATIO
+    pos  = MAX_POSITION_RATIO
+    fname = out_dir / f"bt_{ts}_slip{slip}_pos{pos}.json"
+    result = {
+        "ts":         ts,
+        "start":      START_DATE,
+        "end":        END_DATE,
+        "slip":       slip,
+        "pos":        pos,
+        "alt_filter": ALT_FILTER_BY_REGIME,
+        "final_capital":  round(port_pnl.get("final_capital", 0)),
+        "total_ret":      round(port_pnl.get("total_ret", 0) * 100, 2),
+        "mkt_total":      round(port_pnl.get("mkt_total", 0) * 100, 2),
+        "alpha":          round(port_pnl.get("alpha",     0) * 100, 2),
+        "mdd":            round(port_pnl.get("mdd",       0) * 100, 2),
+        "win_rate":       round(port_pnl.get("win_rate",  0) * 100, 2),
+        "total_trades":   port_pnl.get("total_trades", 0),
+        "initial_capital": INITIAL_CAPITAL,
+    }
+    fname.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(fname), result
+
+
+def main():
+    args = _parse_args()
+    if args.scheduler: run_scheduler(); return
+    _apply_args(args)
+
+    if not args.json:
+        print("\n" + "="*62)
+        print("  📊 EQS V1.2 백테스트 (Edge Quant Signal) (코스피200 동적 유니버스)")
+        print("="*62)
+        print(f"  기간: {START_DATE} ~ {END_DATE}")
     print(f"  ①~㉙ v26.0 전 기능 유지")
     print(f"  ㉚ ALT_FILTER 국면 연동  "
           f"BULL={ALT_FILTER_BY_REGIME['BULL']} / "
@@ -2714,8 +2777,8 @@ def main():
     print(f"{'='*62}")
     port_pnl = calc_portfolio_pnl(all_res, all_res[0]["regime_ser"], risk["is_high_corr"])
 
-    print(f"\n  [포트폴리오 성과]")
-    print(f"  초기: {INITIAL_CAPITAL:,}원 → 최종: {port_pnl['final_capital']:,.0f}원")
+    if not args.json: print(f"\n  [포트폴리오 성과]")
+    if not args.json: print(f"  초기: {INITIAL_CAPITAL:,}원 → 최종: {port_pnl['final_capital']:,.0f}원")
     print(f"  전략: {port_pnl['total_ret']:+.1%} | 코스피: {port_pnl['mkt_total']:+.1%} | "
           f"알파: {port_pnl['alpha']:+.1%}")
     print(f"  MDD: {port_pnl['mdd']:.1%} | 승률: {port_pnl['win_rate']:.1%} | "
@@ -2755,11 +2818,20 @@ def main():
               f"{r['sl_mean']:>7.1%}  ATR×{tm:<5}  "
               f"{r['filter_block_rate']:>7.1%}  {bep_str:>8}")
 
-    plot_results(all_res, port_pnl)
+    if not args.json: plot_results(all_res, port_pnl)
 
-    print(f"\n{'='*62}")
-    print("  엑셀 리포트 생성 중...")
-    build_excel_report(all_res, port_pnl, risk, "eqs_v1_1_report.xlsx")
+    if not args.json:
+        print(f"\n{'='*62}")
+        print("  엑셀 리포트 생성 중...")
+        build_excel_report(all_res, port_pnl, risk, "eqs_v1_1_report.xlsx")
+
+    if args.save or args.json:
+        _fpath, _result = _save_bt_result(port_pnl, args)
+        if args.json:
+            print(json.dumps(_result, ensure_ascii=False))
+            return
+        else:
+            print(f"  💾 결과 저장: {_fpath}")
 
     print(f"\n{'='*62}")
     print("  ✅ EQS V1.2 백테스트 완료")
